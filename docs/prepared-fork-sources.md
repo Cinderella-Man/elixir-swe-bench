@@ -34,7 +34,7 @@ Build or reuse the exact prepared runtime, then inspect its committed workspace 
 
 Review the new immutable bundle against the visible contract. Existing source migrations preserve tickets, grading semantics, reference/check patches and legacy contract format unless a separately diagnosed correction requires changing them. Export fresh schema-v2 admission evidence where applicable.
 
-Complete three fresh control rounds and two fresh ordinary Astra runs under the [curation policy](case-curation-loop.md). Historical successes and diagnostic replays stay tied to their original releases. They are not fresh blind runs of a changed version.
+Complete three fresh control rounds and two fresh ordinary Opus runs under the [curation policy](case-curation-loop.md). Historical successes and diagnostic replays stay tied to their original releases. They are not fresh blind runs of a changed version.
 
 Any explicit change to the required run count follows the workflow's [user-override policy](case-curation-loop.md#validation-scope-and-user-overrides). Reusable branches, a migrated source manifest and completed validation are separate audit states; see [source-screening lessons](curation-lessons.md#screen-the-exact-source-before-preparing-it).
 

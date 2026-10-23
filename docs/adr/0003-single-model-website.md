@@ -7,3 +7,5 @@ Each run preserves its model metadata, settings, results, logs and patches. Rest
 Endpoint discovery records reported properties without requiring manual artifact pins. Missing and unverified properties remain visible. An alias alone does not verify the exact model artifact.
 
 The benchmark system is Elixir; the coding agent is Pi, installed with a pinned Node runtime inside each problem's Docker image. Pi receives the problem prompt and owns its conversation and tools. An I/O bridge keeps the workspace offline while Elixir forwards model requests, enforces budgets, records evidence and grades the resulting patch in fresh containers.
+
+Amended by [ADR 0010](0010-run-subscription-claude-through-claude-code-harness.md): subscription Claude models run through a Claude Code harness instead of Pi.

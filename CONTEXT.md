@@ -22,9 +22,9 @@
 
 **Attempt measurement**: Opt-in elapsed attempt time and model-request time from a named, explicitly authorized performance environment. Generated-token accounting remains available without timing. Model-request throughput includes prompt processing and response transfer.
 
-**Run**: An evaluation of one model profile across a frozen selection of cases, using fixed inputs, budgets and one declared seed.
+**Run**: An evaluation of one model profile through one harness across a frozen selection of cases, using fixed inputs and the budgets and seed that harness supports.
 
-**Published result**: Outcomes for the current admitted cases from one completed run, with matching case fixture hashes, model identity and recorded evaluation conditions. Rejected cases are omitted. Each published result represents one run, not an aggregate of repeated runs; rows may have different effective settings.
+**Published result**: Outcomes for the current admitted cases from one completed run, with matching case fixture hashes, model identity, harness and recorded evaluation conditions. Rejected cases are omitted. Each published result represents one run, not an aggregate of repeated runs; rows may have different effective settings.
 
 **Attempt**: One agent's investigation, edits, tool calls and submission for a case. A run records one scored attempt per case and retains interrupted work separately.
 
@@ -46,9 +46,11 @@
 
 **Generation budget**: The cumulative tokens generated during an attempt, including reasoning and tool syntax.
 
-**Agent**: The pinned Pi coding agent running inside a case workspace. Pi owns the model conversation and built-in tools; Elixir launches it and grades its changes.
+**Harness**: The coding-agent program, tool set and fixed instructions through which a model makes attempts. Pi and Claude Code are harnesses. Each run uses one harness; comparing runs across harnesses confounds the model with the harness.
 
-**Model transport**: The restricted connection between an agent and the configured model, enforcing budgets and accounting while keeping endpoint credentials outside the workspace.
+**Agent**: The pinned harness instance working on one attempt. A Pi agent runs inside the case workspace; a Claude Code agent works from outside it through tools confined to that workspace. The agent owns the model conversation; Elixir provides the workspace and grades its changes.
+
+**Model transport**: The restricted connection between a Pi agent and the configured model, enforcing budgets and accounting while keeping endpoint credentials outside the workspace.
 
 **Grader**: The independent executable checks applied to a submission in fresh workspaces.
 

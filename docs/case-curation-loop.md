@@ -2,7 +2,7 @@
 
 Use this workflow when asked to add cases, finish a candidate, or change an existing case's source or preparation. Work on one candidate at a time, validate it, park it, then continue only within the requested scope. Finish a batch with all approved cases restored so the merge contains the changes and their evidence.
 
-**“Run against Astra” means run the actual benchmark with `gpt-6-astra` as the LLM solver through the ordinary Pi runner.** Fixture qualification without a model, a curator-written solution, and an Astra subagent are not those solver runs.
+**“Run against Opus” means run the actual benchmark with Opus 5.5 at extra-high effort (`claude-opus-5-5`, `xhigh`) as the solver through the [Claude Code harness](adr/0010-run-subscription-claude-through-claude-code-harness.md).** It is the only validator for new cases; curation sessions also run on Opus 5.5. Fixture qualification without a model, a curator-written solution, and a subagent the curator briefs by hand are not those solver runs. Earlier Astra validations through the Pi runner keep their evidence, but Astra runs no longer validate new cases. The harness is not implemented yet; until it is, new-case validation cannot run.
 
 Before selecting a researched candidate or freezing its checks, use [curation diagnostics and lessons](curation-lessons.md) to check source-pair drift and preservation risks. Return to that guide for reporter discrepancies, runtime/evidence mismatches or surprising solver results.
 
@@ -57,7 +57,7 @@ Export schema-v2 bundles with `Eab.Candidates.export/2` to `cases/<case-id>/`, i
 
 **Ready:** independent review is recorded, all three rounds match the current ensured runtime and qualification identity, source reconstruction and prepared image tree verify, and `Eab.Candidates.verify_admission!(candidate_id)` succeeds on schema-v2 bundles. A source migration preserves an existing legacy contract's format and semantics; it still needs the same manual evidence gates.
 
-## 4. Run the benchmark with Astra twice
+## 4. Run the benchmark with Opus twice
 
 ### Validation scope and user overrides
 
@@ -67,9 +67,7 @@ When the user narrows scope during execution, block queued future launches befor
 
 ### Launch and review
 
-Use the existing benchmark connection and ordinary **Run benchmark** flow. The established validation settings are `gpt-6-astra`, high reasoning effort, a 262,144 generated-token response-boundary soft threshold, compaction disabled, and no automatic retries. Reuse these unless the user requests another policy; record effective settings and verify the model is available through the benchmark's own connection.
-
-The same flow can be launched through the controller's existing APIs: select the signed-in, plan-enabled account from `Eab.ChatGPTAuth.accounts/0`, find `gpt-6-astra` in `Eab.OpenAI.catalog/1`, build its endpoint with `Eab.OpenAI.endpoint/2`, then call `Eab.Runs.start(endpoint, "", %{"max_tokens" => 262144, "reasoning_effort" => "high"})`. Use the intended saved account if more than one is available. Keep credentials and account identifiers out of committed evidence.
+Start an ordinary **Run benchmark** on the website with **Claude Code** as the model source and `claude-opus-5-5` at `xhigh` effort, then drive it with `/solve-run` from the dedicated solver session (see [ADR 0010](adr/0010-run-subscription-claude-through-claude-code-harness.md)). The harness declares, without enforcing, the 262,144 generated-token soft threshold, disables compaction where Claude Code allows, and makes no automatic retries. Record the effective settings, harness identity and resolved model the controller reads from the transcript. Keep account identifiers out of committed evidence.
 
 Before each launch, verify the current authorized scope, singleton active inventory, admission, controller idleness and disabled timing observer described below. Record the returned run ID immediately. Wait for grading and cleanup, then review the sealed patch before the next launch. An official pass alone must not automatically start the next attempt while a preservation concern remains unchecked. Start the second run through the ordinary fresh-run path with the same frozen inputs/settings; **Resume is not a second independent attempt**.
 
@@ -81,7 +79,7 @@ Retain every attempt. Diagnose graded failures against the visible contract and 
 
 ### Local timing observer
 
-Apply the [shared-machine constraint](../AGENTS.md#shared-machine-constraint): local correctness and model task-success runs are allowed with bounded resources; speed measurement is not.
+Apply the [shared-machine constraint](../AGENTS.md#shared-machine-constraint): local correctness and model task-success runs are allowed with bounded resources; speed measurement is not. Claude Code reports a subagent's elapsed time when it finishes; do not store it.
 
 Inspect the current `Eab.Measurement` implementation before launch. It currently records `attempt_ms` automatically, so leaving the default observer active is incompatible with this machine's rule. The [Operately 1205 completion](../verification/case-curation-2026-10-18/operately-pr-1205/README.md#completion-on-current-main--2026-10-20) records the working approach and retains the [disabled observer source](../verification/case-curation-2026-10-18/operately-pr-1205/validation-measurement.ex).
 
