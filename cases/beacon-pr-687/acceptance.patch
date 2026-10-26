@@ -1,0 +1,341 @@
+diff --git a/test/benchmark/crawler_files_test.exs b/test/benchmark/crawler_files_test.exs
+new file mode 100644
+index 0000000..23497db
+--- /dev/null
++++ b/test/benchmark/crawler_files_test.exs
+@@ -0,0 +1,281 @@
++defmodule Beacon.Benchmark.CrawlerFilesTest do
++  use Beacon.Web.ConnCase, async: false
++
++  require Record
++  import Ecto.Query, only: [from: 2]
++
++  alias Beacon.BeaconTest.Repo
++  alias Beacon.Content.Page
++
++  Record.defrecordp(:xml_element, :xmlElement, Record.extract(:xmlElement, from_lib: "xmerl/include/xmerl.hrl"))
++  Record.defrecordp(:xml_text, :xmlText, Record.extract(:xmlText, from_lib: "xmerl/include/xmerl.hrl"))
++
++  @sitemap_ns "http://www.sitemaps.org/schemas/sitemap/0.9"
++
++  # Sites mounted by Beacon.BeaconTest.Router in this suite:
++  #   :my_site    "/"              Beacon.BeaconTest.Endpoint  http://localhost:4000
++  #   :not_booted "/other"         Beacon.BeaconTest.Endpoint
++  #   :booted     "/nested/site"   Beacon.BeaconTest.Endpoint
++  #   :s3_site    "/nested/media"  Beacon.BeaconTest.Endpoint
++  #   :host_test  "/" on host site_b.com, Beacon.BeaconTest.EndpointSite  http://site_b.com:4000
++  # Other running sites are not mounted by their router, or use a router without Beacon.Router.
++
++  test "each site serves its own published pages at its mount path" do
++    my_site = layout(:my_site)
++    other = layout(:not_booted)
++    media = layout(:s3_site)
++    host = layout(:host_test)
++
++    publish(:my_site, my_site, "/")
++    publish(:my_site, my_site, "/about")
++    publish(:my_site, my_site, "/blog/first-post")
++    publish(:not_booted, other, "/")
++    publish(:not_booted, other, "/contact")
++    publish(:s3_site, media, "/gallery")
++    publish(:host_test, host, "/welcome")
++
++    assert sitemap_locs("/sitemap.xml") ==
++             Enum.sort(["http://localhost:4000", "http://localhost:4000/about", "http://localhost:4000/blog/first-post"])
++
++    assert sitemap_locs("/other/sitemap.xml") == ["http://localhost:4000/other", "http://localhost:4000/other/contact"]
++    assert sitemap_locs("/nested/media/sitemap.xml") == ["http://localhost:4000/nested/media/gallery"]
++    assert sitemap_locs("http://site_b.com/sitemap.xml") == ["http://site_b.com:4000/welcome"]
++  end
++
++  test "sitemap entries reflect the published version of each page and its last update" do
++    layout = layout(:my_site)
++
++    news = publish(:my_site, layout, "/news", updated_at: ~U[2024-05-06 07:08:09Z])
++    publish(:my_site, layout, "/events", updated_at: ~U[2023-01-02 03:04:05Z])
++    publish(:my_site, layout, "/about")
++
++    # a draft change to a published page is not part of the sitemap until it is published
++    {:ok, _draft} = Beacon.Content.update_page(news, %{"path" => "/news-renamed", "title" => "renamed"})
++
++    # never published
++    beacon_page_fixture(site: :my_site, layout_id: layout.id, path: "/draft", title: "draft")
++
++    # published, then unpublished
++    retired = publish(:my_site, layout, "/retired")
++    {:ok, _} = Beacon.Content.unpublish_page(retired)
++
++    entries = sitemap_entries("/sitemap.xml")
++
++    assert Enum.map(entries, & &1.loc) |> Enum.sort() ==
++             ["http://localhost:4000/about", "http://localhost:4000/events", "http://localhost:4000/news"]
++
++    lastmods = Map.new(entries, &{&1.loc, &1.lastmod})
++    assert_lastmod(lastmods["http://localhost:4000/news"], ~U[2024-05-06 07:08:09Z])
++    assert_lastmod(lastmods["http://localhost:4000/events"], ~U[2023-01-02 03:04:05Z])
++    assert {:ok, _, _} = parse_lastmod(lastmods["http://localhost:4000/about"])
++  end
++
++  test "sitemap lists every published page of a site however many it has" do
++    layout = layout(:not_booted)
++    paths = for n <- 1..25, do: "/p-#{String.pad_leading(to_string(n), 2, "0")}"
++    Enum.each(paths, &publish(:not_booted, layout, &1))
++
++    assert sitemap_locs("/other/sitemap.xml") == Enum.map(paths, &("http://localhost:4000/other" <> &1))
++  end
++
++  test "sitemap stays well-formed XML when a page path contains XML special characters" do
++    layout = layout(:my_site)
++    publish(:my_site, layout, "/q&a")
++    publish(:my_site, layout, "/a<b")
++
++    assert sitemap_locs("/sitemap.xml") == ["http://localhost:4000/a<b", "http://localhost:4000/q&a"]
++  end
++
++  test "a site without published pages serves an empty sitemap" do
++    # a draft only: nothing is published on :s3_site
++    beacon_page_fixture(site: :s3_site, layout_id: layout(:s3_site).id, path: "/unpublished", title: "unpublished")
++
++    assert sitemap_entries("/nested/media/sitemap.xml") == []
++  end
++
++  test "robots.txt allows crawling and points at the site's own sitemap" do
++    for {url, sitemap} <- [
++          {"/robots.txt", "http://localhost:4000/sitemap.xml"},
++          {"/other/robots.txt", "http://localhost:4000/other/sitemap.xml"},
++          {"/nested/media/robots.txt", "http://localhost:4000/nested/media/sitemap.xml"},
++          {"http://site_b.com/robots.txt", "http://site_b.com:4000/sitemap.xml"}
++        ] do
++      conn = request!(url)
++      assert conn.status == 200, "expected GET #{url} to respond 200, got #{conn.status}"
++      assert content_type(conn) =~ ~r{^text/plain\b}, "expected GET #{url} to be text/plain, got #{inspect(content_type(conn))}"
++
++      fields =
++        conn.resp_body
++        |> String.split(["\r\n", "\n"])
++        |> Enum.map(&(&1 |> String.split("#", parts: 2) |> hd() |> String.trim()))
++        |> Enum.reject(&(&1 == ""))
++        |> Enum.map(fn line ->
++          case String.split(line, ":", parts: 2) do
++            [field, value] -> {String.downcase(String.trim(field)), String.trim(value)}
++            [other] -> flunk("unexpected robots.txt line #{inspect(other)} from GET #{url}")
++          end
++        end)
++
++      assert {"user-agent", "*"} in fields, "expected a User-agent: * group in GET #{url}:\n#{conn.resp_body}"
++      assert for({"sitemap", value} <- fields, do: value) == [sitemap], "unexpected Sitemap lines in GET #{url}:\n#{conn.resp_body}"
++      assert for({"disallow", value} <- fields, value != "", do: value) == [], "robots.txt must not disallow anything:\n#{conn.resp_body}"
++    end
++  end
++
++  test "the sitemap index lists the sitemap of every mounted site in URL order" do
++    assert Code.ensure_loaded?(Beacon.Router) and macro_exported?(Beacon.Router, :beacon_sitemap_index, 1),
++           "expected Beacon.Router to provide the beacon_sitemap_index/1 router macro"
++
++    expected = [
++      "http://localhost:4000/nested/media/sitemap.xml",
++      "http://localhost:4000/nested/site/sitemap.xml",
++      "http://localhost:4000/other/sitemap.xml",
++      "http://localhost:4000/sitemap.xml",
++      "http://site_b.com:4000/sitemap.xml"
++    ]
++
++    for url <- ["/sitemap_index.xml", "/seo/all-sitemaps.xml"] do
++      conn = request!(url)
++      assert conn.status == 200, "expected GET #{url} to respond 200, got #{conn.status}"
++      assert_xml_content_type(conn, url)
++
++      root = parse_xml!(conn.resp_body, url)
++      assert expanded_name(root) == {@sitemap_ns, "sitemapindex"}
++
++      locs =
++        for sitemap <- child_elements(root) do
++          assert expanded_name(sitemap) == {@sitemap_ns, "sitemap"}
++          child_text(sitemap, "loc")
++        end
++
++      assert locs == expected, "unexpected sitemap index from GET #{url}"
++    end
++  end
++
++  test "pages and existing site routes keep working beside the crawler files" do
++    my_site = layout(:my_site)
++    other = layout(:not_booted)
++
++    publish(:my_site, my_site, "/about", template: "<main><p>about my_site</p></main>")
++    publish(:my_site, my_site, "/sitemap", template: "<main><p>a page named sitemap</p></main>")
++    publish(:my_site, my_site, "/robots", template: "<main><p>a page named robots</p></main>")
++    publish(:not_booted, other, "/contact", template: "<main><p>contact other</p></main>")
++
++    for {url, text} <- [
++          {"/about", "about my_site"},
++          {"/sitemap", "a page named sitemap"},
++          {"/robots", "a page named robots"},
++          {"/other/contact", "contact other"}
++        ] do
++      conn = request!(url)
++      assert conn.status == 200, "expected GET #{url} to respond 200, got #{conn.status}"
++      assert conn.resp_body =~ text
++    end
++
++    for prefix <- ["", "/other", "/nested/site", "/nested/media"] do
++      conn = request!(prefix <> "/__beacon_check__")
++      assert conn.status == 200, "expected the #{prefix}/__beacon_check__ route to keep responding"
++    end
++  end
++
++  ## Helpers
++
++  defp layout(site) do
++    beacon_published_layout_fixture(site: site, template: "<header>#{site}</header><%= @inner_content %>")
++  end
++
++  defp publish(site, layout, path, opts \\ []) do
++    template = Keyword.get(opts, :template, "<main><h1>#{site}</h1></main>")
++    page = beacon_page_fixture(site: site, layout_id: layout.id, path: path, title: "#{site} #{path}", template: template)
++
++    page =
++      case Keyword.fetch(opts, :updated_at) do
++        {:ok, updated_at} ->
++          {1, _} = Repo.update_all(from(p in Page, where: p.id == ^page.id), set: [updated_at: updated_at])
++          Repo.get!(Page, page.id)
++
++        :error ->
++          page
++      end
++
++    {:ok, page} = Beacon.Content.publish_page(page)
++    page
++  end
++
++  defp request!(url) do
++    get(build_conn(), url)
++  rescue
++    error -> flunk("GET #{url} raised #{inspect(error.__struct__)}: #{Exception.message(error)}")
++  end
++
++  defp content_type(conn) do
++    conn |> Plug.Conn.get_resp_header("content-type") |> List.first() |> to_string()
++  end
++
++  defp assert_xml_content_type(conn, url) do
++    assert content_type(conn) =~ ~r{^(text|application)/xml\b},
++           "expected GET #{url} to be served as XML, got #{inspect(content_type(conn))}"
++  end
++
++  # Entries of a urlset, with loc normalized for comparison: percent-decoded and without a trailing slash.
++  defp sitemap_entries(url) do
++    conn = request!(url)
++    assert conn.status == 200, "expected GET #{url} to respond 200, got #{conn.status}"
++    assert_xml_content_type(conn, url)
++
++    root = parse_xml!(conn.resp_body, url)
++    assert expanded_name(root) == {@sitemap_ns, "urlset"}, "expected a sitemap urlset from GET #{url}"
++
++    for entry <- child_elements(root) do
++      assert expanded_name(entry) == {@sitemap_ns, "url"}
++      lastmod = child_text(entry, "lastmod")
++      assert {:ok, _, _} = parse_lastmod(lastmod), "expected an ISO 8601 date-time lastmod, got #{inspect(lastmod)}"
++      %{loc: normalize(child_text(entry, "loc")), lastmod: lastmod}
++    end
++  end
++
++  defp sitemap_locs(url), do: url |> sitemap_entries() |> Enum.map(& &1.loc) |> Enum.sort()
++
++  defp normalize(loc) when is_binary(loc), do: loc |> URI.decode() |> String.trim_trailing("/")
++  defp normalize(loc), do: loc
++
++  defp parse_lastmod(lastmod) when is_binary(lastmod), do: DateTime.from_iso8601(lastmod)
++  defp parse_lastmod(lastmod), do: {:error, lastmod}
++
++  defp assert_lastmod(lastmod, expected) do
++    assert {:ok, datetime, _offset} = parse_lastmod(lastmod)
++    assert DateTime.compare(datetime, expected) == :eq, "expected lastmod #{inspect(lastmod)} to be #{DateTime.to_iso8601(expected)}"
++  end
++
++  defp parse_xml!(body, url) do
++    {root, _rest} = :xmerl_scan.string(:erlang.binary_to_list(String.trim_leading(body)), namespace_conformant: true, quiet: true)
++    root
++  catch
++    kind, reason -> flunk("expected well-formed XML from GET #{url} (#{inspect(kind)} #{inspect(reason, limit: 5)}):\n#{body}")
++  end
++
++  defp expanded_name(element) do
++    case xml_element(element, :expanded_name) do
++      {namespace, local} -> {to_string(namespace), to_string(local)}
++      local -> {"", to_string(local)}
++    end
++  end
++
++  defp child_elements(element) do
++    for child <- xml_element(element, :content), Record.is_record(child, :xmlElement), do: child
++  end
++
++  defp child_text(element, local) do
++    case for(child <- child_elements(element), expanded_name(child) == {@sitemap_ns, local}, do: child) do
++      [child] ->
++        child
++        |> xml_element(:content)
++        |> Enum.filter(&Record.is_record(&1, :xmlText))
++        |> Enum.map_join(&to_string(xml_text(&1, :value)))
++        |> String.trim()
++
++      other ->
++        flunk("expected exactly one <#{local}> in a sitemap entry, found #{length(other)}")
++    end
++  end
++end
+diff --git a/test/support/routers.ex b/test/support/routers.ex
+index a23befc..5edbcc4 100644
+--- a/test/support/routers.ex
++++ b/test/support/routers.ex
+@@ -47,6 +47,26 @@ defmodule Beacon.BeaconTest.Router do
+     plug :put_secure_browser_headers
+   end
+ 
++  # Benchmark acceptance fixture. The sitemap index routes are declared only when
++  # Beacon.Router provides beacon_sitemap_index/1, so this router still compiles
++  # without it and the acceptance tests report the missing index as a failure.
++  if Code.ensure_loaded?(Beacon.Router) and macro_exported?(Beacon.Router, :beacon_sitemap_index, 1) do
++    scope "/" do
++      pipe_through :browser
++      Beacon.Router.beacon_sitemap_index("/sitemap_index.xml")
++    end
++
++    scope "/seo" do
++      pipe_through :browser
++      Beacon.Router.beacon_sitemap_index("/all-sitemaps.xml")
++    end
++  end
++
++  scope host: "site_b.com" do
++    pipe_through :browser
++    beacon_site "/", site: :host_test
++  end
++
+   scope "/nested" do
+     pipe_through :browser
+     beacon_site "/site", site: :booted
+diff --git a/test/test_helper.exs b/test/test_helper.exs
+index dbe4280..c49e37c 100644
+--- a/test/test_helper.exs
++++ b/test/test_helper.exs
+@@ -2,6 +2,18 @@ Application.ensure_all_started(:postgrex)
+ 
+ Beacon.BeaconTest.Repo.start_link()
+ 
++# Benchmark acceptance fixture: the :host_test site's endpoint is served from its
++# own host, so its URLs differ from the sites served by Beacon.BeaconTest.Endpoint.
++Application.put_env(:beacon, Beacon.BeaconTest.EndpointSite,
++  url: [host: "site_b.com", port: 4000],
++  secret_key_base: "dVxFbSNspBVvkHPN5m6FE6iqNtMnhrmPNw7mO57CJ6beUADllH0ux3nhAI1ic65X",
++  live_view: [signing_salt: "LKBurgGF"],
++  render_errors: [view: Beacon.BeaconTest.ErrorView],
++  pubsub_server: Beacon.BeaconTest.PubSub,
++  check_origin: false,
++  debug_errors: true
++)
++
+ Supervisor.start_link(
+   [
+     {Phoenix.PubSub, name: Beacon.BeaconTest.PubSub},
