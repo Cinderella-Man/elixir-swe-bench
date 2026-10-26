@@ -93,6 +93,17 @@ defmodule Eab.SeriesTest do
       put_in(base, ["model", "profile", "model_path"], "/x/Swift-27B-Q4_K_M-00001-of-00002.gguf")
 
     assert Series.id(sharded) == Series.id(base)
+
+    # The desktop app updates Claude Code between runs; the kit and prompt still pin a series.
+    claude = fn version ->
+      Map.put(base, "harness", %{
+        "name" => "claude_code",
+        "kit_sha256" => "x",
+        "claude_code_version" => version
+      })
+    end
+
+    assert Series.id(claude.("2.1.308")) == Series.id(claude.("2.1.311"))
   end
 
   test "each seed counts once, errored and validation runs leave it open" do

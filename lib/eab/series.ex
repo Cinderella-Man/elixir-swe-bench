@@ -2,8 +2,9 @@ defmodule Eab.Series do
   @moduledoc """
   Run series (ADR 0011): up to three ordinary runs of one model artifact and quantization
   through one harness on one case set. Runs join when their setup matches; hardware,
-  endpoint, model file path, server build, slot count, seed and benchmark code version
-  may differ. Each seed counts once: the first run with a final score fills it.
+  endpoint, model file path, server build, slot count, seed, benchmark code version and
+  Claude Code program version may differ. Each seed counts once: the first run with a final
+  score fills it.
   """
   alias Eab.{Cache, ModelIdentity, Runner}
 
@@ -56,11 +57,9 @@ defmodule Eab.Series do
 
   defp harness(run) do
     case run["harness"] do
+      # The desktop app updates Claude Code itself; each run records its version.
       %{"name" => "claude_code"} = harness ->
-        Map.take(
-          harness,
-          ~w(name agent kit_sha256 preamble_sha256 tools_sha256 claude_code_version)
-        )
+        Map.take(harness, ~w(name agent kit_sha256 preamble_sha256 tools_sha256))
 
       _ ->
         agent = get_in(run, ["protocol", "agent"]) || %{}
@@ -182,10 +181,7 @@ defmodule Eab.Series do
     vram + (resource["service_ram_bytes"] || resource["ram_rss_bytes"] || 0)
   end
 
-  @doc """
-  Checks a run about to start as a contribution to a published series. Everything but the
-  Claude Code version must match now; that version is checked at publication.
-  """
+  @doc "Checks a run about to start as a contribution to a published series."
   def contribution!(run, series_id) do
     record = Eab.Results.series!(series_id)
 
@@ -200,7 +196,7 @@ defmodule Eab.Series do
 
     differences =
       for field <- Enum.sort(Map.keys(expected)),
-          strip(field, expected[field]) != strip(field, actual[field]),
+          expected[field] != actual[field],
           do: field
 
     if differences != [],
@@ -224,11 +220,6 @@ defmodule Eab.Series do
         :ok
     end
   end
-
-  defp strip("harness", harness) when is_map(harness),
-    do: Map.delete(harness, "claude_code_version")
-
-  defp strip(_, value), do: value
 
   @doc "The setup as published; the benchmark, cases and fixtures are top-level fields."
   def public_setup(setup), do: Map.drop(setup, ~w(cases case_fixtures benchmark))
