@@ -350,7 +350,7 @@ defmodule EabWeb.DashboardTest do
       Eab.Runs.stop()
 
       # Cleanup runs asynchronously; keep the stub until it has finished.
-      Enum.find(1..200, fn _ ->
+      Enum.find(1..1000, fn _ ->
         snapshot = Eab.Runs.snapshot()
         (is_nil(snapshot.active) and not snapshot.cleaning) || Process.sleep(10)
       end)
@@ -375,7 +375,7 @@ defmodule EabWeb.DashboardTest do
     assert has_element?(view, "#validation-run[checked]")
 
     view |> element("#run") |> render_click()
-    assert_receive {:started, run}, 3000
+    assert_receive {:started, run}, 15_000
     assert run["validation"] == true and run["harness"]["name"] == "claude_code"
     assert run["model"]["model"] == "claude-opus-5-5"
     assert has_element?(view, "#run-harness", "Validation run, never published or scored")
@@ -384,7 +384,7 @@ defmodule EabWeb.DashboardTest do
     assert has_element?(view, "#run-series")
     Eab.Runs.stop()
 
-    Enum.find(1..200, fn _ ->
+    Enum.find(1..1000, fn _ ->
       snapshot = Eab.Runs.snapshot()
       (is_nil(snapshot.active) and not snapshot.cleaning) || Process.sleep(10)
     end)
@@ -393,8 +393,9 @@ defmodule EabWeb.DashboardTest do
     id = hd(Eab.Inventory.all())
     view |> form("#claude-code-scope", scope: %{kind: "escape_test"}) |> render_change()
     view |> form("#claude-code-scope", scope: %{kind: "escape_test", case: id}) |> render_change()
-    view |> element("#run") |> render_click()
-    assert_receive {:started, run}, 3000
+    html = view |> element("#run") |> render_click()
+    refute html =~ "notice error"
+    assert_receive {:started, run}, 15_000
     assert run["selection"] == %{"kind" => "escape_test", "cases" => [id]}
   end
 

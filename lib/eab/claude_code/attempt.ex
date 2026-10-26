@@ -157,13 +157,17 @@ defmodule Eab.ClaudeCode.Attempt do
       state.key
     )
 
+    # Recorded before any check, so a failed attempt still names its version and models.
+    observed = Transcript.observed(entries)
+    Store.write("#{state.prefix}/agent-progress.json", progress(observed, state), state.key)
+    version!(state.box.run_id, observed["claude_code_version"])
+
     summary =
       Transcript.check!(entries, state.prompt, state.endpoint["model"],
         effort: state.endpoint["profile"]["effort"],
         final: event["last_assistant_message"]
       )
 
-    version!(state.box.run_id, summary["claude_code_version"])
     outcome = summary["outcome"]
 
     Activity.note(
@@ -216,11 +220,25 @@ defmodule Eab.ClaudeCode.Attempt do
       "claude_code" =>
         Map.take(
           summary,
-          ~w(claude_code_version agent_id resolved_models resolved_efforts compactions attachments over_declared_budget)
+          ~w(claude_code_version entrypoint agent_id resolved_models resolved_efforts safety_stops compactions attachments over_declared_budget final_report)
         )
         |> Map.put("agent_id", summary["agent_id"] || event["agent_id"])
         |> Map.put("tool_calls", state.tools)
     })
+  end
+
+  defp progress(observed, state) do
+    %{
+      "calls" => observed["calls"],
+      "generated_tokens" => observed["generated_tokens"],
+      "usage" => observed["usage"],
+      "claude_code" =>
+        observed
+        |> Map.take(
+          ~w(claude_code_version entrypoint agent_id resolved_models resolved_efforts safety_stops)
+        )
+        |> Map.put("tool_calls", state.tools)
+    }
   end
 
   # A run has one Claude Code version; the first attempt fixes it.

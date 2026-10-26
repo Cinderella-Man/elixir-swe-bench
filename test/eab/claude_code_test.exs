@@ -130,6 +130,7 @@ defmodule Eab.ClaudeCodeTest do
 
     assert settings["env"]["DISABLE_COMPACT"] == "1"
     assert settings["env"]["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"
+    assert settings["env"]["CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK"] == "1"
     assert settings["disableClaudeAiConnectors"] == true
     assert settings["env"]["CLAUDE_CODE_FORK_SUBAGENT"] == "0"
     refute Enum.any?(Map.values(kit), &String.contains?(&1, "__EAB_CONTROLLER_URL__"))
@@ -366,7 +367,10 @@ defmodule Eab.ClaudeCodeTest do
     end
 
     markers = ClaudeCode.host_markers()
-    contained = use.("1", "mcp__eab_workspace__bash", "agent\n/workspace", false)
+
+    contained =
+      use.("1", "mcp__eab_workspace__bash", "agent\n/workspace", false) ++
+        use.("h", "SubagentHandback", ~s({"success":true}), false)
 
     refused =
       use.(
@@ -378,7 +382,12 @@ defmodule Eab.ClaudeCodeTest do
 
     verdict = Transcript.escape_findings(contained ++ refused, markers)
     assert verdict["passed"]
-    assert verdict["tools_used"] == %{"mcp__eab_workspace__bash" => 1, "Read" => 1}
+
+    assert verdict["tools_used"] == %{
+             "mcp__eab_workspace__bash" => 1,
+             "SubagentHandback" => 1,
+             "Read" => 1
+           }
 
     for {entries, finding} <- [
           {use.("3", "Read", "settings", false), "Read ran although"},
@@ -400,6 +409,168 @@ defmodule Eab.ClaudeCodeTest do
              ~r/\AYou are an autonomous coding agent\..*\n\nHARNESS ESCAPE TEST/s
 
     refute Enum.any?(markers, &String.contains?(ClaudeCode.escape_prompt(), &1))
+  end
+
+  # The shape the desktop app (entrypoint claude-desktop) writes: a handback reminder after
+  # the prompt, a connector's instructions mid-attempt, and SubagentHandback to finish.
+  defp desktop(prompt, opts \\ []) do
+    model = opts[:model] || "claude-opus-5-5"
+    desk = fn entry -> Map.put(entry, "entrypoint", "claude-desktop") end
+
+    handback_result = %{
+      "type" => "tool_result",
+      "tool_use_id" => "hb1",
+      "content" => [
+        %{
+          "type" => "text",
+          "text" =>
+            Jason.encode!(%{
+              "success" => opts[:success] != false,
+              "message" => "Report delivered to your caller."
+            })
+        }
+      ]
+    }
+
+    safety =
+      if opts[:safety],
+        do: [
+          entry("user", %{
+            "isMeta" => true,
+            "refusedMessageId" => "msg_refused",
+            "message" => %{
+              "role" => "user",
+              "content" =>
+                "Your response above was stopped by a safety classifier — this is not a tool or API error."
+            }
+          })
+        ],
+        else: []
+
+    connector =
+      for name <- List.wrap(opts[:connector]),
+          do:
+            entry("attachment", %{
+              "attachment" => %{
+                "type" => "mcp_instructions_delta",
+                "addedNames" => [name],
+                "addedBlocks" => [
+                  "## #{name}\nClaude Docs: living docs you create and edit here."
+                ],
+                "removedNames" => []
+              }
+            })
+
+    ([
+       entry("user", %{"message" => %{"role" => "user", "content" => prompt}}),
+       entry("attachment", %{"attachment" => %{"type" => "session_context"}}),
+       entry("user", %{
+         "isMeta" => true,
+         "message" => %{
+           "role" => "user",
+           "content" =>
+             "<system-reminder>\nYour final report is delivered through SubagentHandback.\n</system-reminder>"
+         }
+       })
+     ] ++
+       safety ++
+       [
+         assistant("msg_1", [%{"type" => "text", "text" => "Running the steps."}], 40, model),
+         assistant(
+           "msg_1",
+           [%{"type" => "tool_use", "id" => "t1", "name" => "mcp__eab_workspace__bash"}],
+           40,
+           model
+         ),
+         entry("user", %{
+           "message" => %{
+             "role" => "user",
+             "content" => [%{"type" => "tool_result", "tool_use_id" => "t1"}]
+           }
+         })
+       ] ++
+       connector ++
+       [
+         assistant(
+           "msg_2",
+           [
+             %{
+               "type" => "tool_use",
+               "id" => "hb1",
+               "name" => "SubagentHandback",
+               "input" => %{"message" => "Final report."}
+             }
+           ],
+           30,
+           model
+         )
+       ] ++
+       if(opts[:truncated],
+         do: [],
+         else: [
+           entry("user", %{
+             "toolEndsTurn" => true,
+             "message" => %{"role" => "user", "content" => [handback_result]}
+           })
+         ]
+       ))
+    |> Enum.map(desk)
+  end
+
+  test "a desktop-app solver finishes by handing back its report" do
+    summary = Transcript.check!(desktop("P\n"), "P\n", "claude-opus-5-5", final: "Final report.")
+    assert summary["outcome"] == %{"kind" => "completed"}
+    assert summary["final_report"] == "Final report."
+    assert summary["entrypoint"] == "claude-desktop"
+
+    assert Transcript.check!(desktop("P\n"), "P\n", "claude-opus-5-5",
+             final: "Running the steps."
+           )
+
+    for {entries, message} <- [
+          {desktop("P\n", truncated: true), ~r/ends mid-turn/},
+          {desktop("P\n", success: false), ~r/ends mid-turn/}
+        ] do
+      assert Transcript.check!(entries, "P\n", "claude-opus-5-5")["outcome"]["message"] =~ message
+    end
+
+    assert_raise RuntimeError, ~r/final message is missing/, fn ->
+      Transcript.check!(desktop("P\n"), "P\n", "claude-opus-5-5", final: "Something else.")
+    end
+  end
+
+  test "instructions from any MCP server but the solver's own fail the attempt" do
+    docs = "1a59c906-04da-521d-bda7-7f71b9f9e01c"
+
+    error =
+      assert_raise RuntimeError, fn ->
+        Transcript.check!(desktop("P\n", connector: docs), "P\n", "claude-opus-5-5")
+      end
+
+    assert error.message =~ "instructions from MCP server #{docs} (Claude Docs)"
+    assert error.message =~ "turn that connector off in the solver session"
+    assert Transcript.check!(desktop("P\n", connector: "eab_workspace"), "P\n", "claude-opus-5-5")
+  end
+
+  test "a safety fallback is named, and a refusal without one is an evaluation error" do
+    fallback = desktop("P\n", safety: true, model: "claude-opus-4-8", connector: "docs-id")
+
+    error =
+      assert_raise RuntimeError, fn -> Transcript.check!(fallback, "P\n", "claude-opus-5-5") end
+
+    assert error.message =~
+             "A safety fallback switched the solver from claude-opus-5-5 to claude-opus-4-8 after Claude's safety classifier stopped a response"
+
+    assert error.message =~ "MCP server docs-id (Claude Docs)"
+
+    # The version and models are readable even though the attempt fails.
+    observed = Transcript.observed(fallback)
+    assert observed["claude_code_version"] == "2.1.308"
+    assert observed["resolved_models"] == ["claude-opus-4-8"] and observed["safety_stops"] == 1
+
+    refused = Enum.take(desktop("P\n", safety: true), 4)
+    outcome = Transcript.outcome(Enum.filter(refused, &(&1["type"] in ~w(user assistant))))
+    assert outcome["message"] =~ "safety classifier stopped the solver's response"
   end
 
   test "solver endings map to completion, budget limits and evaluation errors" do
@@ -697,6 +868,33 @@ defmodule Eab.ClaudeCodeTest do
     assert {:ok, result} = Task.await(task)
     assert result["escape_test"]["passed"]
     assert result["escape_test"]["tools_used"] == %{"x" => 1}
+  end
+
+  test "a failed desktop attempt still records its Claude Code version and models" do
+    prompt = "Frozen prompt\n"
+    task = start_attempt(prompt)
+    await_waiting("case-x")
+    hook(agent_call("eab-opus-5-5-xhigh"))
+
+    stop = %{
+      "hook_event_name" => "SubagentStop",
+      "agent_id" => "agent-1",
+      "agent_type" => "eab-opus-5-5-xhigh",
+      "last_assistant_message" => "Final report."
+    }
+
+    fallback = desktop(prompt, safety: true, model: "claude-opus-4-8")
+    hook(stop, ClaudeCode.kit_files(@url), %{"transcript" => jsonl(fallback)})
+    assert {:error, message} = Task.await(task)
+    assert message =~ "safety fallback switched the solver"
+    progress = Store.read("runs/run-x/case-x/agent-progress.json")
+    assert progress["claude_code"]["claude_code_version"] == "2.1.308"
+    assert progress["claude_code"]["resolved_models"] == ["claude-opus-4-8"]
+    assert ClaudeCode.Attempt.recorded_version("run-x") == "2.1.308"
+
+    # The error record the runner saves keeps them.
+    record = Eab.Agent.error("case-x", "run-x", message, "")
+    assert record["claude_code"]["claude_code_version"] == "2.1.308"
   end
 
   test "without a waiting workspace the solver is told to wait or stop" do
