@@ -91,7 +91,8 @@ defmodule Eab.ClaudeCode.Broker do
       state.active ->
         {:reply,
          {:deny,
-          "A solver is already working on #{state.active.case}. Wait for it to finish before calling the Agent tool again."},
+          "A solver is already working on #{state.active.case}. Wait for it to finish before calling the Agent tool again. " <>
+            "If no solver is running because it failed to start, tell the user to stop and resume the run on the benchmark website, then stop."},
          state}
 
       state.waiting ->
