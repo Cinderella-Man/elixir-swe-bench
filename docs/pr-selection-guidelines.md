@@ -50,7 +50,17 @@ Prefer tests at the actual boundary affected by the ticket. For a UI/server chan
 
 For repairs, start with one sentence containing the observed problem, essential triggering context, and “fix it” or its equivalent. Add only facts needed to distinguish reasonable outcomes: an edition, input example, reproduction action or compatibility rule. There is no hard sentence limit. Leave root-cause investigation to the solver; do not leave it to guess product decisions.
 
-For bounded features and objective refactors, use a concise requirements brief when the repository cannot supply the missing decisions. State observable outcomes, relevant error/state rules, authorization and compatibility constraints. Several sentences or a short list can be appropriate. This is the frozen result of clarification during curation; it does not measure a model's ability to interview a user. Record whether the case uses a short maintenance report or a clarified implementation brief, and show the distinction in corpus summaries.
+For objective refactors, use a concise requirements brief when the repository cannot supply the missing decisions. State observable outcomes, relevant error/state rules, authorization and compatibility constraints. Several sentences or a short list can be appropriate. This is the frozen result of clarification during curation; it does not measure a model's ability to interview a user. Record whether the case uses a short maintenance report or a clarified implementation brief, and show the distinction in corpus summaries.
+
+For features, write a grilled spec in `ticket.md` ([ADR 0013](adr/0013-specify-feature-cases-with-grilled-specs.md)). It is what a developer would hold after a clarifying interview:
+- the goal;
+- every decided behaviour, with examples;
+- edge cases and error behaviour;
+- scope and non-goals;
+- compatibility constraints;
+- the public interface the feature exposes (module and function names, routes, configuration keys).
+
+Keep `grading.requirements` to a short list of key outcomes mapped to checks. A feature may extend its upstream PR into a fuller, coherent feature when the extension follows the project's style and passes its full existing suite. Record the curator extension separately from the upstream PR in provenance.
 
 Illustrative task shapes, not admitted cases:
 
@@ -60,7 +70,7 @@ Illustrative task shapes, not admitted cases:
 | Feature | “Let me cancel a queued export from its status page.” | A user action, job state and cancellation behavior must agree. |
 | Refactor | “Move report delivery behind a `Delivery.send/1` interface so callers no longer depend on the SMTP adapter; keep delivery behavior unchanged.” | The requested interface and dependency boundary are explicit and testable. |
 
-Do not include suspected root causes, solution steps, target filenames, reference code or an upstream PR number in the solver's ticket. Public API names or structural constraints belong there only when they are the requested outcome, as in the refactor example. Defer a feature while material product choices are unresolved; once settled, state them in the brief rather than hiding them in acceptance tests.
+Do not include suspected root causes, solution steps, target filenames, reference code or an upstream PR number in the solver's ticket. Public API names or structural constraints belong there only when they are the requested outcome, as in the refactor example or a feature's public interface. Defer a feature while material product choices are unresolved; once settled, state them in the brief rather than hiding them in acceptance tests.
 
 For the rejected CSV case, “Keep the CSV columns unchanged; leave unavailable values blank” would disclose the missing policy without revealing the repair. That is a proposed new version, not a retrospective reinterpretation of its failed attempts.
 

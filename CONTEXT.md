@@ -8,6 +8,12 @@
 
 **Benchmark release**: A frozen, versioned selection of qualified case definitions used for comparable model evaluations.
 
+**Feature spec**: The solver's ticket for a feature case. It records the decisions a clarifying interview would settle: behaviour, edge cases, scope, non-goals and the public interface, with no implementation recipe.
+_Avoid_: grilled ticket, requirements brief, minimal ticket
+
+**Curator extension**: Implementation and checks a curator adds beyond an upstream PR to make a coherent feature case. Provenance records it separately from the upstream change.
+_Avoid_: enrichment, synthetic PR
+
 **Reference solution**: An accepted upstream implementation used to qualify a case's checks. Submissions may use another implementation that satisfies the stated contract.
 
 **Reference repair**: A reference solution for a bug-fix case; also the historical name used by the original repair-only inventory.
@@ -24,7 +30,10 @@
 
 **Run**: An evaluation of one model profile through one harness across a frozen selection of cases, using fixed inputs and the budgets and seed that harness supports.
 
-**Published result**: Outcomes for the current admitted cases from one completed run, with matching case fixture hashes, model identity, harness and recorded evaluation conditions. Rejected cases are omitted. Each published result represents one run, not an aggregate of repeated runs; rows may have different effective settings.
+**Run series**: Up to three runs of one model artifact and quantization through one harness on one benchmark release, with the same server type, chat template, sampling defaults and effective settings apart from seed. Runs differ in seed where the endpoint supports seeds and may come from different people, machines, server builds and benchmark code versions. Its score is the mean of its runs' final scores; it is complete once three runs have final scores.
+_Avoid_: repeats, trial set, epochs
+
+**Published result**: Outcomes for the current admitted cases from one run series, with matching case fixture hashes, model identity, harness and recorded evaluation conditions. Rejected cases are omitted. Each published result is one run series, not a single run: its score is the mean of the runs it has so far, it states how many of the three required runs that is, and each case shows how many of those runs passed. Rows may have different effective settings.
 
 **Attempt**: One agent's investigation, edits, tool calls and submission for a case. A run records one scored attempt per case and retains interrupted work separately.
 
@@ -61,6 +70,8 @@
 **Prompt sufficiency review**: Review that each scored obligation follows from the task description and project information available to the solver. A private grading preference is not a task requirement.
 
 **Solvability validation**: Evidence that a model can complete a case using only solver-visible information under recorded conditions. This complements fixture qualification and prompt sufficiency review without certifying exhaustive correctness.
+
+**Validation run**: A run of the validator model whose outcomes decide which cases stay in a release. It is never published or scored, because its passes are what kept the cases.
 
 **Case outcome**: A completed pass or fail from the grader. Infrastructure and accounting errors remain errors.
 
