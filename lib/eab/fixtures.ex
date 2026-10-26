@@ -200,6 +200,7 @@ defmodule Eab.Fixtures do
     source_receipt = Source.snapshot(repo, source, emit, expected_tree: provenance["broken_tree"])
 
     apply_environment(id, source)
+    force_add = force_add_list(source, dest)
 
     previous = Enum.find(Cache.records("projects"), &(&1["id"] == Cache.key(inputs)))
     saved = if previous, do: previous["artifact"], else: %{}
@@ -209,7 +210,7 @@ defmodule Eab.Fixtures do
       if spec["runtime"]["node_image"],
         do: pin(saved["node_image"] || spec["runtime"]["node_image"])
 
-    File.write!(Path.join(dest, "Dockerfile"), dockerfile(spec, base, node))
+    File.write!(Path.join(dest, "Dockerfile"), dockerfile(spec, base, node, force_add: force_add))
 
     # Resolve the *installed* toolchain, not just its base image. Package updates
     # after Docker cache eviction must not inherit incompatible native objects.
@@ -223,7 +224,13 @@ defmodule Eab.Fixtures do
       do: emit.("Seeding #{id} from pristine build of #{seed["case"]} at #{seed["revision"]}"),
       else: emit.("No compatible build seed for #{id}; package download caches remain available")
 
-    recipe = dockerfile(spec, base, node, toolchain: toolchain_tag, seed: seed && seed["tag"])
+    recipe =
+      dockerfile(spec, base, node,
+        toolchain: toolchain_tag,
+        seed: seed && seed["tag"],
+        force_add: force_add
+      )
+
     File.write!(Path.join(dest, "Dockerfile"), recipe)
     tag = "elixir-agent-benchmark:project-#{Cache.key(inputs)}"
     image = build(dest, tag, "fixture")
@@ -288,6 +295,34 @@ defmodule Eab.Fixtures do
     Command.run!("docker", ["pull", "--quiet", image], timeout: 1200)
     [info] = Command.run!("docker", ["image", "inspect", image]) |> Jason.decode!()
     List.first(info["RepoDigests"] || []) || raise "Image has no immutable digest"
+  end
+
+  # Upstream projects may force-add files their .gitignore excludes. The workspace
+  # commit must still hold the exact pinned tree, so those paths are added by name.
+  defp force_add_list(source, dest) do
+    git_dir = Path.join(dest, "force-add.git")
+    git = ["-c", "core.excludesFile=/dev/null", "--git-dir=#{git_dir}"]
+
+    try do
+      Command.run!("git", git ++ ["init", "--quiet"])
+
+      paths =
+        Command.run!(
+          "git",
+          git ++
+            ["--work-tree=#{source}", "ls-files", "--others", "--ignored", "--exclude-standard"] ++
+            ["-z"],
+          limit: 4_000_000
+        )
+        |> String.split(<<0>>, trim: true)
+
+      if paths != [],
+        do: File.write!(Path.join(dest, "force-add.txt"), Enum.map(paths, &[&1, 0]))
+
+      paths != []
+    after
+      File.rm_rf!(git_dir)
+    end
   end
 
   defp hex_install(image) do
@@ -388,8 +423,17 @@ defmodule Eab.Fixtures do
           setup_commands(runtime),
           &("RUN " <> &1)
         ) ++
+        if(opts[:force_add],
+          do: ["COPY --chown=agent:agent force-add.txt /opt/eab-force-add.txt"],
+          else: []
+        ) ++
         [
-          "RUN rm -rf .git && git init && git config user.name Benchmark && git config user.email benchmark@localhost && git add . && git commit -m 'Initial task workspace'",
+          "RUN rm -rf .git && git init && git config user.name Benchmark && git config user.email benchmark@localhost && git add . && " <>
+            if(opts[:force_add],
+              do:
+                "GIT_LITERAL_PATHSPECS=1 git add -f --pathspec-from-file=/opt/eab-force-add.txt --pathspec-file-nul && ",
+              else: ""
+            ) <> "git commit -m 'Initial task workspace'",
           "FROM toolchain AS fixture",
           "COPY --from=prepared --chown=agent:agent /workspace/ /workspace/",
           "COPY --from=prepared --chown=agent:agent /opt/eab-seed/ /opt/eab-seed/",

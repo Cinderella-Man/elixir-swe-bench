@@ -182,6 +182,19 @@ defmodule Eab.FixturesTest do
     refute older =~ "mix local.hex"
   end
 
+  test "the workspace commit force-adds tracked files that .gitignore excludes" do
+    spec = %{"runtime" => %{"image" => "hexpm/elixir:1.18.4-erlang-27.3.4@sha256:abc"}}
+    plain = Fixtures.dockerfile(spec, "base")
+    forced = Fixtures.dockerfile(spec, "base", nil, force_add: true)
+
+    assert plain =~ "git add . && git commit -m 'Initial task workspace'"
+    refute plain =~ "force-add"
+    assert forced =~ "COPY --chown=agent:agent force-add.txt /opt/eab-force-add.txt"
+
+    assert forced =~
+             "git add . && GIT_LITERAL_PATHSPECS=1 git add -f --pathspec-from-file=/opt/eab-force-add.txt --pathspec-file-nul && git commit"
+  end
+
   test "recipes reconcile seeds before compilation and export an independent fixture" do
     for id <- Inventory.all() do
       spec = Inventory.spec(id)
