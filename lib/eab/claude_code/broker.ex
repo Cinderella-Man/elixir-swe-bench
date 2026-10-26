@@ -114,7 +114,7 @@ defmodule Eab.ClaudeCode.Broker do
 
     case state.active do
       %{agent: ^agent_type, worker: worker} = active ->
-        send(worker, {:eab_finished, event["agent_id"], transcript, error})
+        send(worker, {:eab_finished, event, transcript, error})
         Process.demonitor(active.monitor, [:flush])
         {:reply, :ok, %{state | active: nil}}
 

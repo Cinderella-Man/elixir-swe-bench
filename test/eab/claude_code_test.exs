@@ -110,6 +110,8 @@ defmodule Eab.ClaudeCodeTest do
       assert String.split(tools, ", ") ==
                Enum.map(~w(read bash edit write), &"mcp__eab_workspace__#{&1}")
 
+      # Claude Code 2.1.308 only connects inline agent MCP servers given as a YAML list.
+      assert frontmatter =~ "\nmcpServers:\n  - eab_workspace:\n      type: http\n"
       assert frontmatter =~ "url: #{@url}/claude-code/mcp"
     end
 
@@ -127,6 +129,8 @@ defmodule Eab.ClaudeCodeTest do
         do: assert(rule in deny)
 
     assert settings["env"]["DISABLE_COMPACT"] == "1"
+    assert settings["env"]["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"
+    assert settings["disableClaudeAiConnectors"] == true
     assert settings["env"]["CLAUDE_CODE_FORK_SUBAGENT"] == "0"
     refute Enum.any?(Map.values(kit), &String.contains?(&1, "__EAB_CONTROLLER_URL__"))
     assert Map.has_key?(kit, ".claude/commands/solve-run.md")
@@ -257,6 +261,89 @@ defmodule Eab.ClaudeCodeTest do
     assert_raise RuntimeError, ~r/line 2/, fn -> Transcript.parse("{}\nnot json\n") end
     stored = Transcript.without_timing(transcript(prompt))
     refute stored =~ "timestamp" or stored =~ "durationMs"
+  end
+
+  # The record layout Claude Code 2.1.308 writes for a subagent: the prompt first, then
+  # context attachments, the request shape and blobs, then streamed response records.
+  defp recorded(prompt, reminder, effort \\ "max") do
+    blob = fn role, content, extra ->
+      Map.merge(
+        %{
+          "type" => "api-request-blob",
+          "message" => Map.merge(%{"role" => role, "content" => content}, extra)
+        },
+        %{"agentId" => "a1"}
+      )
+    end
+
+    [
+      entry("user", %{"message" => %{"role" => "user", "content" => prompt}, "promptId" => "p"}),
+      entry("attachment", %{"attachment" => %{"type" => "model"}}),
+      entry("attachment", %{"attachment" => %{"type" => "session_context"}}),
+      entry("api-request-shape", %{"shape" => %{"system" => [%{"type" => "text", "text" => "x"}]}}),
+      blob.(
+        "user",
+        [%{"type" => "text", "text" => reminder}, %{"type" => "text", "text" => prompt}],
+        %{}
+      ),
+      blob.("system", [%{"type" => "text", "text" => "# Environment"}], %{
+        "output_config" => %{"effort" => effort}
+      }),
+      entry("api-request", %{"params" => %{"model" => "claude-opus-5-5"}}),
+      assistant("msg_1", [%{"type" => "thinking", "thinking" => ""}], 900),
+      assistant(
+        "msg_1",
+        [%{"type" => "tool_use", "id" => "t1", "name" => "mcp__eab_workspace__bash"}],
+        900
+      ),
+      entry("user", %{"message" => %{"role" => "user", "content" => [%{"type" => "tool_result"}]}}),
+      entry("attachment", %{"attachment" => %{"type" => "total_tokens_reminder"}}),
+      assistant("msg_2", [%{"type" => "text", "text" => "Final summary."}], 50),
+      entry("attachment", %{
+        "attachment" => %{"type" => "hook_success", "hookEvent" => "SubagentStop"}
+      })
+    ]
+  end
+
+  test "Claude Code 2.1.308's recorded requests prove the effort and expose leaked context" do
+    reminder =
+      "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# userEmail\nThe user's email address is u@example.com.\n</system-reminder>\n"
+
+    opts = [effort: "max", final: "Final summary."]
+    summary = Transcript.check!(recorded("P\n", reminder), "P\n", "claude-opus-5-5", opts)
+    assert summary["outcome"] == %{"kind" => "completed"}
+    assert summary["resolved_efforts"] == ["max"]
+    assert summary["calls"] == 2 and summary["generated_tokens"] == 950
+    assert summary["attachments"]["total_tokens_reminder"] == 1
+
+    assert_raise RuntimeError, ~r/effort xhigh instead of max/, fn ->
+      Transcript.check!(recorded("P\n", reminder, "xhigh"), "P\n", "claude-opus-5-5", opts)
+    end
+
+    assert_raise RuntimeError, ~r/final message is missing/, fn ->
+      Transcript.check!(recorded("P\n", reminder), "P\n", "claude-opus-5-5", final: "Other.")
+    end
+
+    leaked =
+      String.replace(
+        reminder,
+        "</system-reminder>",
+        "# gitStatus\nCurrent branch: main\n</system-reminder>"
+      )
+
+    assert_raise RuntimeError, ~r/project instructions or Git status/, fn ->
+      Transcript.check!(recorded("P\n", leaked), "P\n", "claude-opus-5-5", opts)
+    end
+
+    instructions =
+      String.replace(reminder, "# userEmail", "# claudeMd\nAlways run mix test.\n# userEmail")
+
+    assert_raise RuntimeError, ~r/project instructions/, fn ->
+      Transcript.check!(recorded("P\n", instructions), "P\n", "claude-opus-5-5", opts)
+    end
+
+    empty = String.replace(reminder, "# userEmail", "# claudeMd\n\n# userEmail")
+    assert Transcript.check!(recorded("P\n", empty), "P\n", "claude-opus-5-5", opts)
   end
 
   test "solver endings map to completion, budget limits and evaluation errors" do
@@ -463,7 +550,8 @@ defmodule Eab.ClaudeCodeTest do
       "hook_event_name" => "SubagentStop",
       "agent_id" => "agent-1",
       "agent_type" => "eab-opus-5-5-xhigh",
-      "agent_transcript_path" => "/home/user/.claude/x.jsonl"
+      "agent_transcript_path" => "/home/user/.claude/x.jsonl",
+      "last_assistant_message" => "Done."
     }
 
     assert hook(stop, ClaudeCode.kit_files(@url), %{"transcript" => jsonl(transcript(prompt))}) ==

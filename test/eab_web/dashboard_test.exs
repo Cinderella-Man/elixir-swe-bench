@@ -363,7 +363,8 @@ defmodule EabWeb.DashboardTest do
     {:ok, view, _} = live(build_conn(), "/")
     view |> form("#provider-choice", provider: "claude_code") |> render_change()
     assert has_element?(view, "#provider-panel[aria-label='Claude Code settings']")
-    assert has_element?(view, "#solver-status", "not connected yet")
+    # The broker is application-wide; other tests may already have reported a kit.
+    assert has_element?(view, "#solver-status", "Solver")
     assert has_element?(view, "#run[disabled]")
     refute has_element?(view, "#case-timing-status")
 

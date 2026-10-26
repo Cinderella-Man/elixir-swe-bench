@@ -4,8 +4,9 @@ defmodule Eab.ClaudeCode.Transcript do
   unknown shapes fail closed: the parser is updated, never the check skipped. Usage is
   best effort. Timing fields are removed before the transcript is stored.
   """
-  # Records that carry model input or output. Anything else before the prompt is ignored
-  # only if it is bookkeeping; an attachment or message before it fails the prompt check.
+  # Records that carry model input or output. Request bookkeeping before the prompt is
+  # ignored; an attachment or message before it fails the prompt check. Claude Code 2.1.308
+  # writes the prompt first and its context attachments and request records after it.
   @context ~w(user assistant attachment)
   @timing ~w(timestamp durationMs totalDurationMs duration_ms ttftMs elapsedMs startedAt completedAt)
 
@@ -27,8 +28,11 @@ defmodule Eab.ClaudeCode.Transcript do
     end
   end
 
-  @doc "Validates the transcript against the frozen prompt and model and summarizes it."
-  def check!(entries, prompt, model) do
+  @doc """
+  Validates the transcript against the frozen prompt, model and effort and summarizes it.
+  `final` is SubagentStop's `last_assistant_message`; the transcript must contain it.
+  """
+  def check!(entries, prompt, model, opts \\ []) do
     context = Enum.filter(entries, &(&1["type"] in @context))
 
     case context do
@@ -61,9 +65,29 @@ defmodule Eab.ClaudeCode.Transcript do
         _ -> raise "Solver transcript mixes Claude Code versions #{Enum.join(versions, ", ")}"
       end
 
+    efforts = efforts(entries)
+
+    if opts[:effort] && Enum.any?(efforts, &(&1 != opts[:effort])),
+      do:
+        raise(
+          "Solver requests used effort #{Enum.join(efforts, ", ")} instead of #{opts[:effort]}"
+        )
+
+    context!(entries)
+
+    if is_binary(opts[:final]) and
+         not Enum.any?(assistants, fn entry ->
+           Enum.any?(
+             List.wrap(get_in(entry, ["message", "content"])),
+             &(&1["text"] == opts[:final])
+           )
+         end),
+       do: raise("Solver transcript is incomplete: its final message is missing")
+
     usage = usage(assistants)
 
     Map.merge(usage, %{
+      "resolved_efforts" => efforts,
       "claude_code_version" => version,
       "agent_id" => Enum.find_value(entries, & &1["agentId"]),
       "model" => model,
@@ -75,8 +99,34 @@ defmodule Eab.ClaudeCode.Transcript do
         |> Enum.filter(&(&1["type"] == "attachment"))
         |> Enum.map(&(get_in(&1, ["attachment", "type"]) || "unknown"))
         |> Enum.frequencies(),
-      "outcome" => outcome(context)
+      "outcome" => entries |> Enum.filter(&(&1["type"] in ~w(user assistant))) |> outcome()
     })
+  end
+
+  # The recorded API requests carry the effort Claude Code actually sent.
+  defp efforts(entries) do
+    for %{"type" => "api-request-blob", "message" => %{"role" => "system"} = message} <- entries,
+        effort = get_in(message, ["output_config", "effort"]),
+        uniq: true,
+        do: effort
+  end
+
+  # Claude Code prepends a context reminder to the first request. In a solver folder it
+  # may name the user and date; project instructions or Git status mean the folder leaked.
+  defp context!(entries) do
+    for %{"type" => "api-request-blob", "message" => %{"role" => "user", "content" => content}} <-
+          entries,
+        is_list(content),
+        %{"type" => "text", "text" => text} <- content,
+        String.starts_with?(text, "<system-reminder>"),
+        Regex.match?(
+          ~r/^# (gitStatus|attachedProject)$|^# claudeMd\n(?!\s*(#|<\/system-reminder>))/m,
+          text
+        ) do
+      raise "Solver context included project instructions or Git status"
+    end
+
+    :ok
   end
 
   defp content_text(%{"message" => %{"content" => content}}) when is_binary(content), do: content

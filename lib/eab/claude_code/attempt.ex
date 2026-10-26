@@ -58,8 +58,8 @@ defmodule Eab.ClaudeCode.Attempt do
         send(from, {ref, tool(state, name, arguments)})
         loop(state)
 
-      {:eab_finished, agent_id, transcript, error} ->
-        finish(state, agent_id, transcript, error)
+      {:eab_finished, event, transcript, error} ->
+        finish(state, event, transcript, error)
     end
   end
 
@@ -144,7 +144,7 @@ defmodule Eab.ClaudeCode.Attempt do
     end
   end
 
-  defp finish(state, agent_id, transcript, error) do
+  defp finish(state, event, transcript, error) do
     unless is_binary(transcript),
       do: raise("The solver transcript did not reach the controller: #{error || "missing"}")
 
@@ -156,7 +156,12 @@ defmodule Eab.ClaudeCode.Attempt do
       state.key
     )
 
-    summary = Transcript.check!(entries, state.prompt, state.endpoint["model"])
+    summary =
+      Transcript.check!(entries, state.prompt, state.endpoint["model"],
+        effort: state.endpoint["profile"]["effort"],
+        final: event["last_assistant_message"]
+      )
+
     version!(state.box.run_id, summary["claude_code_version"])
     outcome = summary["outcome"]
 
@@ -193,9 +198,9 @@ defmodule Eab.ClaudeCode.Attempt do
       "claude_code" =>
         Map.take(
           summary,
-          ~w(claude_code_version agent_id resolved_models compactions attachments over_declared_budget)
+          ~w(claude_code_version agent_id resolved_models resolved_efforts compactions attachments over_declared_budget)
         )
-        |> Map.put("agent_id", summary["agent_id"] || agent_id)
+        |> Map.put("agent_id", summary["agent_id"] || event["agent_id"])
         |> Map.put("tool_calls", state.tools)
     }
   end
