@@ -97,7 +97,7 @@ defmodule Eab.Command do
       result =
         case opts[:exchange] do
           {state, handler} -> exchange_collect(port, monitor, os_pid, "", state, handler)
-          nil -> collect(port, monitor, os_pid, limit, "", "", 0)
+          nil -> collect(port, monitor, os_pid, limit, !opts[:quiet], "", "", 0)
         end
 
       Activity.note("Process exited with code #{result["returncode"]}")
@@ -207,10 +207,10 @@ defmodule Eab.Command do
 
   def await_scope(scope), do: await_owner({:scope, scope})
 
-  defp collect(port, monitor, os_pid, limit, head, tail, size) do
+  defp collect(port, monitor, os_pid, limit, echo, head, tail, size) do
     receive do
       {^port, {:data, data}} ->
-        Activity.output({:command, self()}, data)
+        if echo, do: Activity.output({:command, self()}, data)
         needed = max(div(limit, 2) - byte_size(head), 0)
         take = min(needed, byte_size(data))
         <<first::binary-size(^take), rest::binary>> = data
@@ -223,7 +223,7 @@ defmodule Eab.Command do
             min(byte_size(tail), div(limit, 2))
           )
 
-        collect(port, monitor, os_pid, limit, head <> first, tail, size + byte_size(data))
+        collect(port, monitor, os_pid, limit, echo, head <> first, tail, size + byte_size(data))
 
       {^port, {:exit_status, code}} ->
         Activity.flush({:command, self()})

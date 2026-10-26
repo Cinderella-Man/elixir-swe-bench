@@ -96,6 +96,8 @@ defmodule Eab.Sandbox do
         "-d",
         "--name",
         box.name,
+        # Reaps orphaned processes, which would otherwise count against the pids limit.
+        "--init",
         "--network=#{network}",
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges",
@@ -134,7 +136,8 @@ defmodule Eab.Sandbox do
         command
       ],
       timeout: timeout + 15,
-      limit: opts[:limit] || 20_000
+      limit: opts[:limit] || 20_000,
+      quiet: opts[:quiet]
     )
   end
 
@@ -164,8 +167,14 @@ defmodule Eab.Sandbox do
     end
   end
 
+  # Agents snapshot the patch after every tool call; echoing it would repeat the
+  # whole diff in the activity log each time.
   def patch(box) do
-    command!(box, "git add -A && git diff --cached --binary HEAD", limit: 1_048_576, timeout: 60)
+    command!(box, "git add -A && git diff --cached --binary HEAD",
+      limit: 1_048_576,
+      timeout: 60,
+      quiet: true
+    )
   end
 
   def formatter(box) do

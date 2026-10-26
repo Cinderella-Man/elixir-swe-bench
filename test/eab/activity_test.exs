@@ -44,6 +44,18 @@ defmodule Eab.ActivityTest do
     end
   end
 
+  test "quiet command output stays out of the activity log", %{id: id, path: path} do
+    result =
+      Activity.with_case(id, "case", "", fn ->
+        Command.run("sh", ["-c", "printf 'whole %s\\n' patch"], quiet: true)
+      end)
+
+    assert result["output"] == "whole patch\n"
+    log = File.read!(path)
+    assert log =~ "Process exited with code 0"
+    refute log =~ "whole patch"
+  end
+
   test "partial Pi results are shown once and split credentials stay redacted", %{
     id: id,
     path: path
