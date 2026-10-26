@@ -56,6 +56,76 @@ defmodule Eab.GraderTest do
            ) == []
   end
 
+  test "trusted formatter records survive progress dots written between them" do
+    Code.require_file(Eab.Inventory.path("priv/fixtures/grade_formatter.exs"))
+
+    failed = %ExUnit.Test{
+      module: Example,
+      name: :"test a",
+      state: {:failed, [{:error, %RuntimeError{message: "boom"}, []}]},
+      tags: %{}
+    }
+
+    excluded = %ExUnit.Test{
+      module: Example,
+      name: :"test b",
+      state: {:excluded, "due to ee_only filter"},
+      tags: %{ee_only: true}
+    }
+
+    # Loaded at runtime from the fixture, like the grader does.
+    formatter = Module.concat(ElixirAgentBenchmark, TrustedFormatter)
+
+    writes =
+      writes(fn ->
+        for test <- [failed, excluded], do: formatter.handle_cast({:test_finished, test}, 0)
+        formatter.handle_cast({:suite_finished, %{}}, 2)
+      end)
+
+    # ExUnit's own formatter prints progress dots between any two writes.
+    output = Enum.join(writes, "..")
+    raw = %{"returncode" => 2, "output" => output, "output_truncated" => false}
+    parsed = Grader.parse(raw, ["ee_only"])
+
+    assert parsed["completed"]
+    assert parsed["failure_phases"] == %{"Elixir.Example::test a" => "test"}
+    assert parsed["failure_types"] == %{"Elixir.Example::test a" => ["Elixir.RuntimeError"]}
+    assert parsed["exclusion_tags"] == %{"Elixir.Example::test b" => ["ee_only"]}
+  end
+
+  defp writes(fun) do
+    leader = spawn_link(fn -> collect_writes([]) end)
+    previous = Process.group_leader()
+    Process.group_leader(self(), leader)
+
+    try do
+      fun.()
+    after
+      Process.group_leader(self(), previous)
+    end
+
+    send(leader, {:writes, self()})
+
+    receive do
+      {:writes, writes} -> writes
+    end
+  end
+
+  defp collect_writes(acc) do
+    receive do
+      {:io_request, from, ref, {:put_chars, _encoding, chars}} ->
+        send(from, {:io_reply, ref, :ok})
+        collect_writes([IO.chardata_to_string(chars) | acc])
+
+      {:io_request, from, ref, {:put_chars, _encoding, module, function, args}} ->
+        send(from, {:io_reply, ref, :ok})
+        collect_writes([IO.chardata_to_string(apply(module, function, args)) | acc])
+
+      {:writes, to} ->
+        send(to, {:writes, Enum.reverse(acc)})
+    end
+  end
+
   test "new test files join explicit test selections and bare mix test stays broad" do
     assert Grader.test_command("mix test test/original_test.exs", ["test/new_test.exs"]) =~
              "test/new_test.exs"

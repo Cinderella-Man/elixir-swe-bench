@@ -14,6 +14,8 @@ defmodule ElixirAgentBenchmark.TrustedFormatter do
       end
 
     identity = Atom.to_string(test.module) <> "::" <> Atom.to_string(test.name)
+    # Every record starts on a fresh line: ExUnit's own formatter can print
+    # progress dots between any two writes.
     IO.puts("\nEAB_TEST:" <> state <> ":" <> Base.encode64(identity))
 
     if state == "excluded" do
@@ -24,7 +26,7 @@ defmodule ElixirAgentBenchmark.TrustedFormatter do
         |> Enum.sort()
         |> Enum.join(",")
 
-      IO.puts("EAB_EXCLUDED_TAGS:" <> Base.encode64(identity) <> ":" <> Base.encode64(tags))
+      IO.puts("\nEAB_EXCLUDED_TAGS:" <> Base.encode64(identity) <> ":" <> Base.encode64(tags))
     end
 
     if state == "failed" do
@@ -33,8 +35,8 @@ defmodule ElixirAgentBenchmark.TrustedFormatter do
       types = Enum.map_join(failures, ",", &failure_type/1)
       phase = if Enum.any?(failures, &setup_failure?/1), do: "setup", else: "test"
 
-      IO.puts("EAB_FAILURE_TYPES:" <> Base.encode64(identity) <> ":" <> Base.encode64(types))
-      IO.puts("EAB_FAILURE_PHASE:" <> Base.encode64(identity) <> ":" <> phase)
+      IO.puts("\nEAB_FAILURE_TYPES:" <> Base.encode64(identity) <> ":" <> Base.encode64(types))
+      IO.puts("\nEAB_FAILURE_PHASE:" <> Base.encode64(identity) <> ":" <> phase)
     end
     {:noreply, count + 1}
   end
