@@ -50,13 +50,22 @@ defmodule Eab.Agent do
       try do
         result =
           if claude_code do
+            # An escape test swaps the task for the frozen probe; nothing else changes.
+            escape =
+              get_in(Store.read("runs/#{run_id}/run.json") || %{}, ["selection", "kind"]) ==
+                "escape_test"
+
             ClaudeCode.Attempt.run(
               box,
               endpoint,
               key,
               prefix,
-              ClaudeCode.prompt(instructions, prompt),
-              emit
+              if(escape,
+                do: ClaudeCode.escape_prompt(),
+                else: ClaudeCode.prompt(instructions, prompt)
+              ),
+              emit,
+              escape_test: escape
             )
           else
             Pi.run(box, endpoint, key, settings, prefix, prompt, instructions, emit)

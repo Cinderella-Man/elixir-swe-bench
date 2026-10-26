@@ -12,7 +12,7 @@ Claude subscription models run through a Claude Code harness instead of Pi ([ADR
 
 Claude Code still adds context the agent file cannot remove, so these are declared harness differences: its default subagent system prompt (identity and answer-style notes), an environment section naming the solver folder, its scratchpad and the host platform, the model name, the date, the signed-in user's email, and periodic token-count reminders. The kit disables the advisor tool, claude.ai connectors, forks, built-in agents, web tools and skills. Claude Code runs the solver as a background subagent.
 
-Validation runs ([ADR 0012](adr/0012-rebuild-release-and-validate-with-unpublished-opus-runs.md)) are ordinary Claude Code runs marked on the website before they start. They decide which cases stay in a release and are never published, scored into a series or used for comparison points.
+Validation runs ([ADR 0012](adr/0012-rebuild-release-and-validate-with-unpublished-opus-runs.md)) are ordinary Claude Code runs marked on the website before they start. They decide which cases stay in a release and are never published, scored into a series or used for comparison points. The single-case escape test and dry attempt that check the harness before scored runs are unscored validation runs too.
 
 Qualification requires the broken state to fail behaviorally, the reference repair to pass, an early-exit bypass to fail, and a declared incomplete repair to fail behaviorally. Qualification receipts are tied to current grading code, runtime and fixture identities. Source-only inspection cannot establish fixture qualification.
 

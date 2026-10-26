@@ -127,7 +127,7 @@ defmodule Eab.Evidence do
     summary =
       Map.take(
         record,
-        ~w(case status calls generated_tokens stop_reason error generation experiment_id interrupted_stage measurement usage claude_code)
+        ~w(case status calls generated_tokens stop_reason error generation experiment_id interrupted_stage measurement usage claude_code escape_test)
       )
 
     summary = Map.put(summary, "verdict", verdict(record))

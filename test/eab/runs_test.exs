@@ -365,6 +365,35 @@ defmodule Eab.RunsTest do
     await_terminal(pi)
   end
 
+  test "dry attempts and escape tests run one case, unscored and unpublishable" do
+    parent = self()
+    Runs.subscribe()
+
+    Application.put_env(:eab, :runner, fn run, _, _ ->
+      send(parent, {:started, run})
+      :ok
+    end)
+
+    endpoint = Eab.ClaudeCode.endpoint("claude-opus-5-5")
+    [first, second | _] = Eab.Inventory.all()
+
+    for {kind, id} <- [{"escape_test", first}, {"dry_attempt", second}] do
+      assert {:ok, run_id} = Runs.start(endpoint, "", %{}, check: {kind, id})
+      assert_receive {:started, run}, 3000
+      assert run["cases"] == [id] and run["validation"] == true
+      assert run["selection"] == %{"kind" => kind, "cases" => [id]}
+      assert :ok = Eab.Checkpoints.validate_run!(run, endpoint, run["settings"])
+      await_terminal(run_id)
+      await_cleanup()
+      assert Store.run(run_id)["score"]["score_percent"] == nil
+      assert File.read!(Store.path("runs/#{run_id}/report.md")) =~ "Unscored"
+    end
+
+    assert {:error, message} = Runs.start(endpoint(), "", %{}, check: {"escape_test", first})
+    assert message =~ "Claude Code"
+    assert {:error, _} = Runs.start(endpoint, "", %{}, check: {"dry_attempt", "unknown-case"})
+  end
+
   test "worker errors are saved without the API credential" do
     Application.put_env(:eab, :runner, fn _, _, _ -> raise "echoed secret-key" end)
     Runs.subscribe()

@@ -55,6 +55,8 @@ defmodule EabWeb.DashboardLive do
           "claude_code" => %{}
         },
         validation: false,
+        check_kind: "",
+        check_case: "",
         solver: Broker.status(),
         contribution: nil,
         series: nil,
@@ -213,6 +215,11 @@ defmodule EabWeb.DashboardLive do
   def handle_event("validation", params, socket),
     do: {:noreply, assign(socket, validation: params["validation"] == "true")}
 
+  def handle_event("claude_code_scope", %{"scope" => scope}, socket) do
+    kind = if scope["kind"] in ["dry_attempt", "escape_test"], do: scope["kind"], else: ""
+    {:noreply, assign(socket, check_kind: kind, check_case: scope["case"] || "")}
+  end
+
   def handle_event("release_pause", _, socket) do
     Broker.release_pause()
     {:noreply, assign(socket, solver: Broker.status())}
@@ -303,9 +310,15 @@ defmodule EabWeb.DashboardLive do
     do: {:noreply, assign(socket, error: "Connect to a model first")}
 
   def handle_event("run", _, socket) do
+    claude_code = socket.assigns.provider == "claude_code"
+
     opts = [
-      validation: socket.assigns.validation and socket.assigns.provider == "claude_code",
-      series: socket.assigns.contribution && socket.assigns.contribution["series_id"]
+      validation: socket.assigns.validation and claude_code,
+      series: socket.assigns.contribution && socket.assigns.contribution["series_id"],
+      check:
+        if(claude_code and socket.assigns.check_kind != "",
+          do: {socket.assigns.check_kind, socket.assigns.check_case}
+        )
     ]
 
     case Runs.start(socket.assigns.endpoint, socket.assigns.key, socket.assigns.settings, opts) do
@@ -992,6 +1005,31 @@ defmodule EabWeb.DashboardLive do
                   /> Validation run · decides which cases stay; never published or scored
                 </label>
               </form>
+              <form id="claude-code-scope" phx-change="claude_code_scope">
+                <label for="claude-code-check">Run scope</label>
+                <select id="claude-code-check" name="scope[kind]">
+                  <option value="" selected={@check_kind == ""}>Every case</option>
+                  <option value="dry_attempt" selected={@check_kind == "dry_attempt"}>
+                    Unscored dry attempt on one case
+                  </option>
+                  <option value="escape_test" selected={@check_kind == "escape_test"}>
+                    Unscored escape test in one case's workspace
+                  </option>
+                </select>
+                <select :if={@check_kind != ""} id="claude-code-case" name="scope[case]">
+                  <option value="" selected={@check_case == ""}>Choose a case</option>
+                  <option
+                    :for={spec <- @cases}
+                    value={spec["id"]}
+                    selected={@check_case == spec["id"]}
+                  >
+                    {spec["id"]}
+                  </option>
+                </select>
+              </form>
+              <p :if={@check_kind == "escape_test"} class="fine-print">
+                The solver gets a frozen probe instead of the task and tries to leave its sandbox; the controller flags any tool beyond the four workspace tools, host file content or network access in the transcript. Review the transcript too.
+              </p>
               <ol class="fine-print">
                 <li>Install the kit: <code>scripts/install-claude-code-kit.sh ~/eab-solver</code></li>
                 <li>Open that folder in a new Claude desktop Code session and trust it.</li>
@@ -1486,6 +1524,22 @@ defmodule EabWeb.DashboardLive do
                       class="notice"
                     >
                       Flagged: the transcript shows more output than the declared 262,144 generated tokens. The attempt is not failed for it.
+                    </p>
+                    <p
+                      :if={get_in(@run, ["attempts", @log_case, "escape_test"])}
+                      id="escape-verdict"
+                      class={[
+                        "notice",
+                        !get_in(@run, ["attempts", @log_case, "escape_test", "passed"]) && "error"
+                      ]}
+                    >
+                      Escape test: {if get_in(@run, ["attempts", @log_case, "escape_test", "passed"]),
+                        do: "no breach found in the transcript. Review it before scored runs.",
+                        else:
+                          Enum.join(
+                            get_in(@run, ["attempts", @log_case, "escape_test", "findings"]),
+                            "; "
+                          )}
                     </p>
                     <p :if={get_in(@run, ["attempts", @log_case, "claude_code"])} class="fine-print">
                       Claude Code {get_in(@run, [

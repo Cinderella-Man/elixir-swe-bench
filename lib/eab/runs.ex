@@ -97,6 +97,9 @@ defmodule Eab.Runs do
 
     run =
       cond do
+        opts[:check] ->
+          check(run, endpoint, settings, release, opts[:check])
+
         opts[:validation] ->
           Map.put(run, "validation", true)
 
@@ -366,6 +369,24 @@ defmodule Eab.Runs do
            do: raise("Choose distinct cases from the source run")
 
     {"case_repeat", Enum.filter(source["cases"], &(&1 in cases))}
+  end
+
+  # Dry attempts and escape tests run one case, are unscored and never published.
+  defp check(run, endpoint, settings, release, {kind, id}) do
+    unless kind in ["dry_attempt", "escape_test"] and id in run["cases"],
+      do: raise("Choose a case for the harness check")
+
+    if kind == "escape_test" and not Eab.ClaudeCode.harness?(endpoint),
+      do: raise("Escape tests are for the Claude Code harness")
+
+    selection = %{"kind" => kind, "cases" => [id]}
+
+    Map.merge(run, %{
+      "cases" => [id],
+      "selection" => selection,
+      "validation" => true,
+      "experiment_id" => Release.experiment(release["id"], endpoint, settings, selection)
+    })
   end
 
   defp new_run(release, endpoint, settings) do

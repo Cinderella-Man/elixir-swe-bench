@@ -96,6 +96,12 @@ defmodule Eab.Report do
   defp scope(%{"selection" => %{"kind" => "case_repeat", "source_run" => id}}),
     do: "Selected-case repeat of " <> id
 
+  defp scope(%{"selection" => %{"kind" => "dry_attempt", "cases" => [id]}}),
+    do: "Unscored dry attempt on " <> id
+
+  defp scope(%{"selection" => %{"kind" => "escape_test", "cases" => [id]}}),
+    do: "Unscored escape test in the workspace of " <> id
+
   defp scope(_), do: "Full inventory"
 
   defp memory(%{"memory" => memory}) when is_map(memory) do

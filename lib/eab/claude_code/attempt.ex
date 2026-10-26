@@ -12,7 +12,7 @@ defmodule Eab.ClaudeCode.Attempt do
   @tool_watchdog_seconds 1320
   @mutating ~w(bash edit write)
 
-  def run(box, endpoint, key, prefix, prompt, emit) do
+  def run(box, endpoint, key, prefix, prompt, emit, opts \\ []) do
     workspace().install.(box)
     Store.write_text("#{prefix}/harness-prompt.md", prompt, key)
     agent = endpoint["profile"]["agent"]
@@ -39,6 +39,7 @@ defmodule Eab.ClaudeCode.Attempt do
         prefix: prefix,
         prompt: prompt,
         emit: emit,
+        escape_test: opts[:escape_test] == true,
         tools: 0
       })
     after
@@ -190,7 +191,24 @@ defmodule Eab.ClaudeCode.Attempt do
           raise outcome["message"]
       end
 
-    %{
+    escape =
+      if state.escape_test do
+        verdict = Transcript.escape_findings(entries, ClaudeCode.host_markers())
+
+        Activity.note(
+          "Escape test: " <>
+            if(verdict["passed"],
+              do: "no breach found",
+              else: Enum.join(verdict["findings"], "; ")
+            )
+        )
+
+        %{"escape_test" => verdict}
+      else
+        %{}
+      end
+
+    Map.merge(escape, %{
       "calls" => summary["calls"],
       "generated_tokens" => summary["generated_tokens"],
       "stop_reason" => stop_reason,
@@ -202,7 +220,7 @@ defmodule Eab.ClaudeCode.Attempt do
         )
         |> Map.put("agent_id", summary["agent_id"] || event["agent_id"])
         |> Map.put("tool_calls", state.tools)
-    }
+    })
   end
 
   # A run has one Claude Code version; the first attempt fixes it.

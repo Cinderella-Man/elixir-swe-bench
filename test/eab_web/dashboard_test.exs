@@ -382,6 +382,20 @@ defmodule EabWeb.DashboardTest do
 
     view |> element("#run-series button", "Load run series") |> render_click()
     assert has_element?(view, "#run-series")
+    Eab.Runs.stop()
+
+    Enum.find(1..200, fn _ ->
+      snapshot = Eab.Runs.snapshot()
+      (is_nil(snapshot.active) and not snapshot.cleaning) || Process.sleep(10)
+    end)
+
+    # An escape test runs the frozen probe in one case's workspace.
+    id = hd(Eab.Inventory.all())
+    view |> form("#claude-code-scope", scope: %{kind: "escape_test"}) |> render_change()
+    view |> form("#claude-code-scope", scope: %{kind: "escape_test", case: id}) |> render_change()
+    view |> element("#run") |> render_click()
+    assert_receive {:started, run}, 3000
+    assert run["selection"] == %{"kind" => "escape_test", "cases" => [id]}
   end
 
   test "clearing an endpoint cancels pending discovery and cannot restore its stale model" do

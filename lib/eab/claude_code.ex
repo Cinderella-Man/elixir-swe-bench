@@ -103,6 +103,12 @@ defmodule Eab.ClaudeCode do
   @doc "The frozen preamble, then Pi's exact instructions, then the ticket."
   def prompt(instructions, ticket), do: preamble() <> "\n\n" <> instructions <> "\n" <> ticket
 
+  @doc "The frozen preamble, then the escape-test probe (ADR 0010's check before scored runs)."
+  def escape_prompt, do: preamble() <> "\n\n" <> File.read!(path("escape-test.md"))
+
+  @doc "Text found only in host-side kit files; a solver tool result containing it escaped."
+  def host_markers, do: ["FINISH_WAIT_SECONDS = 300", "CLAUDE_CODE_DISABLE_ADVISOR_TOOL"]
+
   def tools, do: Inventory.read_json(path("tools.json"))
 
   def path(relative), do: Inventory.path("priv/claude_code/" <> relative)
