@@ -1,0 +1,1347 @@
+diff --git a/lib/pinchflat/downloading/downloading_helpers.ex b/lib/pinchflat/downloading/downloading_helpers.ex
+index eae187c..90b8d73 100644
+--- a/lib/pinchflat/downloading/downloading_helpers.ex
++++ b/lib/pinchflat/downloading/downloading_helpers.ex
+@@ -39,6 +39,37 @@ defmodule Pinchflat.Downloading.DownloadingHelpers do
+     :ok
+   end
+ 
++  @doc """
++  Starts forced download tasks for all of a source's _failed_ media items. Failed media items
++  are those whose most recent download attempt failed (ie: they have a `last_error`) and whose
++  download hasn't been prevented. See `MediaQuery.failed`.
++
++  Downloads are forced (like the media item's "Force Download" action) so they're attempted
++  even if the media item isn't pending anymore (eg: it was partially recovered or previously
++  downloaded). The recorded error is _not_ cleared here - it's cleared once a download succeeds
++  or replaced if it fails again.
++
++  Jobs are not enqueued if the source is set to not download media. Jobs that are already
++  enqueued for a media item won't be duplicated.
++
++  Returns :ok
++  """
++  def enqueue_failed_download_tasks(source, job_opts \\ [])
++
++  def enqueue_failed_download_tasks(%Source{download_media: true} = source, job_opts) do
++    source
++    |> Media.list_failed_media_items_for()
++    |> Enum.each(fn media_item ->
++      Logger.info("Retrying failed download for media item ##{media_item.id} (#{media_item.media_id})")
++
++      MediaDownloadWorker.kickoff_with_task(media_item, %{force: true}, job_opts)
++    end)
++  end
++
++  def enqueue_failed_download_tasks(%Source{download_media: false}, _job_opts) do
++    :ok
++  end
++
+   @doc """
+   Deletes ALL pending tasks for a source's media items.
+ 
+diff --git a/lib/pinchflat/downloading/media_download_worker.ex b/lib/pinchflat/downloading/media_download_worker.ex
+index 6ed5787..3a8c95e 100644
+--- a/lib/pinchflat/downloading/media_download_worker.ex
++++ b/lib/pinchflat/downloading/media_download_worker.ex
+@@ -13,11 +13,16 @@ defmodule Pinchflat.Downloading.MediaDownloadWorker do
+   alias Pinchflat.Tasks
+   alias Pinchflat.Repo
+   alias Pinchflat.Media
++  alias Pinchflat.Media.MediaItem
++  alias Pinchflat.Utils.StringUtils
+   alias Pinchflat.Media.FileSyncing
+   alias Pinchflat.Downloading.MediaDownloader
+ 
+   alias Pinchflat.Lifecycle.UserScripts.CommandRunner, as: UserScriptRunner
+ 
++  @unsuitable_for_download_message "This media isn't ready to be downloaded yet. " <>
++                                     "It may be an upcoming, active or still-processing live stream"
++
+   @doc """
+   Starts the media_item media download worker and creates a task for the media_item.
+ 
+@@ -97,7 +102,9 @@ defmodule Pinchflat.Downloading.MediaDownloadWorker do
+         {:ok, updated_media_item} =
+           Media.update_media_item(downloaded_media_item, %{
+             media_size_bytes: compute_media_filesize(downloaded_media_item),
+-            media_redownloaded_at: get_redownloaded_at(is_quality_upgrade)
++            media_redownloaded_at: get_redownloaded_at(is_quality_upgrade),
++            # A successful download clears out any previously recorded failure
++            last_error: nil
+           })
+ 
+         :ok = FileSyncing.delete_outdated_files(media_item, updated_media_item)
+@@ -105,17 +112,67 @@ defmodule Pinchflat.Downloading.MediaDownloadWorker do
+ 
+         :ok
+ 
+-      {:recovered, _} ->
++      # The media item may have been updated with the details of what was downloaded,
++      # but the download itself still failed so it's recorded as such
++      {:recovered, message} ->
++        record_download_error(media_item, message)
++
+         {:error, :retry}
+ 
+       {:error, :unsuitable_for_download} ->
++        record_download_error(media_item, @unsuitable_for_download_message)
++
+         {:ok, :non_retry}
+ 
+       {:error, message} ->
++        record_download_error(media_item, message)
++
+         action_on_error(message)
+     end
+   end
+ 
++  # Records the reason a download attempt failed on the media item. Only the latest
++  # reason is kept. This is purely informational so it must never change the outcome
++  # of the job - any problem while recording is logged and otherwise ignored.
++  defp record_download_error(media_item, message) do
++    last_error = readable_error(message)
++
++    # Re-fetching since the download attempt may have updated the record in the meantime
++    # (eg: when recovering from an error) and only `last_error` should be changed here
++    case Repo.get(MediaItem, media_item.id) do
++      nil ->
++        :ok
++
++      current_media_item ->
++        case Media.update_media_item(current_media_item, %{last_error: last_error}) do
++          {:ok, _} ->
++            :ok
++
++          {:error, changeset} ->
++            Logger.error("Unable to record download error for media item ##{media_item.id}: #{inspect(changeset)}")
++
++            :ok
++        end
++    end
++  rescue
++    e ->
++      Logger.error("Unable to record download error for media item ##{media_item.id}: #{Exception.message(e)}")
++
++      :ok
++  end
++
++  # yt-dlp's error messages are stored exactly as reported. Anything else is converted
++  # to a readable string so that a failure always has a non-empty reason
++  defp readable_error(message) when is_binary(message) do
++    if String.valid?(message) && String.trim(message) != "" do
++      message
++    else
++      "Unknown error: #{inspect(message)}"
++    end
++  end
++
++  defp readable_error(message), do: StringUtils.wrap_string(message)
++
+   defp compute_media_filesize(media_item) do
+     case File.stat(media_item.media_filepath) do
+       {:ok, %{size: size}} -> size
+@@ -135,7 +192,7 @@ defmodule Pinchflat.Downloading.MediaDownloadWorker do
+       "This video is available to this channel's members"
+     ]
+ 
+-    if String.contains?(to_string(message), non_retryable_errors) do
++    if String.contains?(error_to_string(message), non_retryable_errors) do
+       Logger.error("yt-dlp download will not be retried: #{inspect(message)}")
+ 
+       {:ok, :non_retry}
+@@ -144,6 +201,16 @@ defmodule Pinchflat.Downloading.MediaDownloadWorker do
+     end
+   end
+ 
++  # Checking the contents of an error must never blow up, even for terms
++  # that don't implement `String.Chars` (eg: tuples or maps)
++  defp error_to_string(message) when is_binary(message), do: message
++
++  defp error_to_string(message) do
++    to_string(message)
++  rescue
++    _ -> inspect(message)
++  end
++
+   # NOTE: I like this pattern of using the default value so that I don't have to
+   # define it in config.exs (and friends). Consider using this elsewhere.
+   defp run_user_script(event, media_item) do
+diff --git a/lib/pinchflat/downloading/media_downloader.ex b/lib/pinchflat/downloading/media_downloader.ex
+index 1103abc..5f608f6 100644
+--- a/lib/pinchflat/downloading/media_downloader.ex
++++ b/lib/pinchflat/downloading/media_downloader.ex
+@@ -47,7 +47,7 @@ defmodule Pinchflat.Downloading.MediaDownloader do
+       {:error, message, _exit_code} ->
+         Logger.error("yt-dlp download error for media item ##{media_with_preloads.id}: #{inspect(message)}")
+ 
+-        if String.contains?(to_string(message), recoverable_errors()) do
++        if String.contains?(error_to_string(message), recoverable_errors()) do
+           attempt_update_media_item(media_with_preloads, output_filepath)
+ 
+           {:recovered, message}
+@@ -128,4 +128,15 @@ defmodule Pinchflat.Downloading.MediaDownloader do
+       "Unable to communicate with SponsorBlock"
+     ]
+   end
++
++  # yt-dlp errors are usually strings, but that isn't guaranteed. This makes sure that
++  # checking the contents of an error never blows up, even for terms that don't
++  # implement `String.Chars` (eg: tuples or maps)
++  defp error_to_string(message) when is_binary(message), do: message
++
++  defp error_to_string(message) do
++    to_string(message)
++  rescue
++    _ -> inspect(message)
++  end
+ end
+diff --git a/lib/pinchflat/media/media.ex b/lib/pinchflat/media/media.ex
+index e1d8d7d..e6f3801 100644
+--- a/lib/pinchflat/media/media.ex
++++ b/lib/pinchflat/media/media.ex
+@@ -66,6 +66,19 @@ defmodule Pinchflat.Media do
+     |> Repo.all()
+   end
+ 
++  @doc """
++  Returns a list of failed media_items for a given source, where failed means
++  that the media_item's most recent download attempt failed (ie: it has a `last_error`)
++  and its download hasn't been prevented. See `MediaQuery.failed`.
++
++  Returns [%MediaItem{}, ...].
++  """
++  def list_failed_media_items_for(%Source{} = source) do
++    MediaQuery.new()
++    |> where(^dynamic(^MediaQuery.for_source(source) and ^MediaQuery.failed()))
++    |> Repo.all()
++  end
++
+   @doc """
+   For a given media_item, tells you if it is pending download. This is defined as
+   the media_item satisfying `MediaQuery.pending` which you should really check out.
+diff --git a/lib/pinchflat/media/media_item.ex b/lib/pinchflat/media/media_item.ex
+index 8eeb97e..9e7bd8d 100644
+--- a/lib/pinchflat/media/media_item.ex
++++ b/lib/pinchflat/media/media_item.ex
+@@ -44,7 +44,10 @@ defmodule Pinchflat.Media.MediaItem do
+     :prevent_download,
+     :prevent_culling,
+     :culled_at,
+-    :media_redownloaded_at
++    :media_redownloaded_at,
++    # The reason the most recent download attempt failed. `nil` means that
++    # there is no recorded failure (eg: never attempted or the last attempt succeeded)
++    :last_error
+   ]
+   # Pretty much all the fields captured at index are required.
+   @required_fields ~w(
+@@ -91,6 +94,7 @@ defmodule Pinchflat.Media.MediaItem do
+     field :prevent_download, :boolean, default: false
+     field :prevent_culling, :boolean, default: false
+     field :culled_at, :utc_datetime
++    field :last_error, :string
+ 
+     field :matching_search_term, :string, virtual: true
+ 
+diff --git a/lib/pinchflat/media/media_query.ex b/lib/pinchflat/media/media_query.ex
+index 840e82c..b35da59 100644
+--- a/lib/pinchflat/media/media_query.ex
++++ b/lib/pinchflat/media/media_query.ex
+@@ -34,6 +34,7 @@ defmodule Pinchflat.Media.MediaQuery do
+   def download_prevented, do: dynamic([mi], mi.prevent_download == true)
+   def culling_prevented, do: dynamic([mi], mi.prevent_culling == true)
+   def redownloaded, do: dynamic([mi], not is_nil(mi.media_redownloaded_at))
++  def download_failed, do: dynamic([mi], not is_nil(mi.last_error))
+   def upload_date_matches(other_date), do: dynamic([mi], fragment("date(?) = date(?)", mi.uploaded_at, ^other_date))
+ 
+   def upload_date_after_source_cutoff do
+@@ -136,6 +137,16 @@ defmodule Pinchflat.Media.MediaQuery do
+     )
+   end
+ 
++  # Media items whose most recent download attempt failed, excluding those whose
++  # download has been prevented (those are considered manually ignored instead)
++  def failed do
++    dynamic(
++      [mi],
++      ^download_failed() and
++        not (^download_prevented())
++    )
++  end
++
+   def upgradeable do
+     dynamic(
+       [mi, source],
+diff --git a/lib/pinchflat/utils/string_utils.ex b/lib/pinchflat/utils/string_utils.ex
+index 49328b2..0dd39aa 100644
+--- a/lib/pinchflat/utils/string_utils.ex
++++ b/lib/pinchflat/utils/string_utils.ex
+@@ -35,4 +35,14 @@ defmodule Pinchflat.Utils.StringUtils do
+   def double_brace(string) do
+     "{{ #{string} }}"
+   end
++
++  @doc """
++  Ensures that the given value is a string. Strings are returned as-is and
++  any other term is converted to its printed (`inspect`ed) representation.
++  Useful for working with error messages whose types can vary.
++
++  Returns binary()
++  """
++  def wrap_string(value) when is_binary(value), do: value
++  def wrap_string(value), do: inspect(value)
+ end
+diff --git a/lib/pinchflat_web/components/custom_components/text_components.ex b/lib/pinchflat_web/components/custom_components/text_components.ex
+index 2145bae..e4a73eb 100644
+--- a/lib/pinchflat_web/components/custom_components/text_components.ex
++++ b/lib/pinchflat_web/components/custom_components/text_components.ex
+@@ -127,6 +127,27 @@ defmodule PinchflatWeb.CustomComponents.TextComponents do
+     """
+   end
+ 
++  @doc """
++  Renders an error indicator icon for a media item's most recent download error.
++  The full (escaped) error is available as the indicator's tooltip and as
++  screen-reader text. Renders nothing if there is no error.
++
++  ## Examples
++
++      <.media_error_indicator error={media_item.last_error} />
++  """
++  attr :error, :string, default: nil
++  attr :class, :string, default: ""
++
++  def media_error_indicator(assigns) do
++    ~H"""
++    <span :if={@error} class={["inline-flex shrink-0 items-center cursor-help", @class]} title={@error} data-media-error>
++      <CoreComponents.icon name="hero-exclamation-circle-solid" class="h-5 w-5 text-danger" />
++      <span class="sr-only">{@error}</span>
++    </span>
++    """
++  end
++
+   @doc """
+   Renders a human-readable byte size
+   """
+diff --git a/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex b/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex
+index a8b812a..914ea4e 100644
+--- a/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex
++++ b/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex
+@@ -25,6 +25,16 @@
+ 
+       <:tab title="Media" id="media">
+         <div class="flex flex-col gap-10 dark:text-white">
++          <section
++            :if={@media_item.last_error}
++            id="media-item-last-error"
++            class="mt-6 rounded-sm border-l-6 border-danger bg-danger bg-opacity-[15%] px-5 py-4"
++          >
++            <h3 class="flex items-center font-bold text-xl">
++              <.icon name="hero-exclamation-circle-solid" class="mr-2 h-6 w-6 text-danger" /> Last Error
++            </h3>
++            <p class="mt-2 whitespace-pre-wrap break-words font-mono text-sm">{@media_item.last_error}</p>
++          </section>
+           <%= if media_file_exists?(@media_item) do %>
+             <section class="grid grid-cols-1 xl:gap-6 mt-6">
+               <div>
+diff --git a/lib/pinchflat_web/controllers/pages/page_html/history_table_live.ex b/lib/pinchflat_web/controllers/pages/page_html/history_table_live.ex
+index d2cab17..5cc7c01 100644
+--- a/lib/pinchflat_web/controllers/pages/page_html/history_table_live.ex
++++ b/lib/pinchflat_web/controllers/pages/page_html/history_table_live.ex
+@@ -28,10 +28,15 @@ defmodule Pinchflat.Pages.HistoryTableLive do
+       </span>
+       <div class="max-w-full overflow-x-auto">
+         <.table rows={@records} table_class="text-white">
+-          <:col :let={media_item} label="Title" class="truncate max-w-xs">
+-            <.subtle_link href={~p"/sources/#{media_item.source_id}/media/#{media_item}"}>
+-              {media_item.title}
+-            </.subtle_link>
++          <:col :let={media_item} label="Title" class="max-w-xs">
++            <section class="flex items-center gap-1.5">
++              <.media_error_indicator error={media_item.last_error} />
++              <span class="truncate">
++                <.subtle_link href={~p"/sources/#{media_item.source_id}/media/#{media_item}"}>
++                  {media_item.title}
++                </.subtle_link>
++              </span>
++            </section>
+           </:col>
+           <:col :let={media_item} label="Upload Date">
+             {DateTime.to_date(media_item.uploaded_at)}
+diff --git a/lib/pinchflat_web/controllers/sources/source_controller.ex b/lib/pinchflat_web/controllers/sources/source_controller.ex
+index 678618b..fa0be3f 100644
+--- a/lib/pinchflat_web/controllers/sources/source_controller.ex
++++ b/lib/pinchflat_web/controllers/sources/source_controller.ex
+@@ -132,6 +132,22 @@ defmodule PinchflatWeb.Sources.SourceController do
+     )
+   end
+ 
++  def retry_failed_downloads(conn, %{"source_id" => id}) do
++    source = Sources.get_source!(id)
++    :ok = DownloadingHelpers.enqueue_failed_download_tasks(source)
++
++    message =
++      if source.download_media do
++        "Retrying failed downloads."
++      else
++        "This source is set to not download media so no downloads were retried."
++      end
++
++    conn
++    |> put_flash(:info, message)
++    |> redirect(to: ~p"/sources/#{source}")
++  end
++
+   def force_index(conn, %{"source_id" => id}) do
+     wrap_forced_action(
+       conn,
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/actions_dropdown.html.heex b/lib/pinchflat_web/controllers/sources/source_html/actions_dropdown.html.heex
+index ac00877..7cd8619 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/actions_dropdown.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/actions_dropdown.html.heex
+@@ -50,6 +50,15 @@
+       Redownload Existing
+     </.link>
+   </:option>
++  <:option :if={@source.download_media}>
++    <.link
++      href={~p"/sources/#{@source}/retry_failed_downloads"}
++      method="post"
++      data-confirm="Are you sure you want to retry downloading all media items whose last download failed? This forces a download of each of them and may overwrite existing files."
++    >
++      Retry Failed Downloads
++    </.link>
++  </:option>
+   <:option>
+     <.link
+       href={~p"/sources/#{@source}/force_index"}
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/media_item_table_live.ex b/lib/pinchflat_web/controllers/sources/source_html/media_item_table_live.ex
+index bbcf681..e36d031 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/media_item_table_live.ex
++++ b/lib/pinchflat_web/controllers/sources/source_html/media_item_table_live.ex
+@@ -46,14 +46,22 @@ defmodule PinchflatWeb.Sources.MediaItemTableLive do
+         </div>
+       </header>
+       <.table rows={@records} table_class="text-white">
+-        <:col :let={media_item} label="Title" class="truncate max-w-xs">
+-          <.subtle_link href={~p"/sources/#{@source.id}/media/#{media_item.id}"}>
+-            {media_item.title}
+-          </.subtle_link>
++        <:col :let={media_item} label="Title" class="max-w-xs">
++          <section class="flex items-center gap-1.5">
++            <.media_error_indicator error={media_item.last_error} />
++            <span class="truncate">
++              <.subtle_link href={~p"/sources/#{@source.id}/media/#{media_item.id}"}>
++                {media_item.title}
++              </.subtle_link>
++            </span>
++          </section>
+         </:col>
+         <:col :let={media_item} :if={@media_state == "other"} label="Manually Ignored?">
+           <.icon name={if media_item.prevent_download, do: "hero-check", else: "hero-x-mark"} />
+         </:col>
++        <:col :let={media_item} :if={@media_state == "failed"} label="Reason" class="max-w-xs">
++          <p class="truncate" title={media_item.last_error}>{media_item.last_error}</p>
++        </:col>
+         <:col :let={media_item} label="Upload Date">
+           {DateTime.to_date(media_item.uploaded_at)}
+         </:col>
+@@ -185,6 +193,13 @@ defmodule PinchflatWeb.Sources.MediaItemTableLive do
+     |> where(^dynamic(^MediaQuery.for_source(source) and ^MediaQuery.downloaded()))
+   end
+ 
++  # Failed media is listed in addition to whichever of the other states it belongs to
++  defp generate_base_query(source, "failed") do
++    MediaQuery.new()
++    |> select(^select_fields())
++    |> where(^dynamic(^MediaQuery.for_source(source) and ^MediaQuery.failed()))
++  end
++
+   defp generate_base_query(source, "other") do
+     MediaQuery.new()
+     |> select(^select_fields())
+@@ -205,6 +220,6 @@ defmodule PinchflatWeb.Sources.MediaItemTableLive do
+ 
+   # Selecting only what we need GREATLY speeds up queries on large tables
+   defp select_fields do
+-    [:id, :title, :uploaded_at, :prevent_download]
++    [:id, :title, :uploaded_at, :prevent_download, :last_error]
+   end
+ end
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/show.html.heex b/lib/pinchflat_web/controllers/sources/source_html/show.html.heex
+index 855b52e..b4e744e 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/show.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/show.html.heex
+@@ -57,6 +57,13 @@
+           session: %{"source_id" => @source.id, "media_state" => "other"}
+         )}
+       </:tab>
++      <:tab title="Failed" id="failed">
++        {live_render(
++          @conn,
++          PinchflatWeb.Sources.MediaItemTableLive,
++          session: %{"source_id" => @source.id, "media_state" => "failed"}
++        )}
++      </:tab>
+       <:tab title="Tasks" id="tasks">
+         <%= if match?([_|_], @pending_tasks) do %>
+           <.table rows={@pending_tasks} table_class="text-black dark:text-white">
+diff --git a/lib/pinchflat_web/router.ex b/lib/pinchflat_web/router.ex
+index bdbb17e..572c466 100644
+--- a/lib/pinchflat_web/router.ex
++++ b/lib/pinchflat_web/router.ex
+@@ -54,6 +54,7 @@ defmodule PinchflatWeb.Router do
+     resources "/sources", Sources.SourceController do
+       post "/force_download_pending", Sources.SourceController, :force_download_pending
+       post "/force_redownload", Sources.SourceController, :force_redownload
++      post "/retry_failed_downloads", Sources.SourceController, :retry_failed_downloads
+       post "/force_index", Sources.SourceController, :force_index
+       post "/force_metadata_refresh", Sources.SourceController, :force_metadata_refresh
+       post "/sync_files_on_disk", Sources.SourceController, :sync_files_on_disk
+diff --git a/priv/repo/migrations/20250201000000_add_last_error_to_media_items.exs b/priv/repo/migrations/20250201000000_add_last_error_to_media_items.exs
+new file mode 100644
+index 0000000..0396738
+--- /dev/null
++++ b/priv/repo/migrations/20250201000000_add_last_error_to_media_items.exs
+@@ -0,0 +1,9 @@
++defmodule Pinchflat.Repo.Migrations.AddLastErrorToMediaItems do
++  use Ecto.Migration
++
++  def change do
++    alter table(:media_items) do
++      add :last_error, :text
++    end
++  end
++end
+diff --git a/test/pinchflat/downloading/downloading_helpers_test.exs b/test/pinchflat/downloading/downloading_helpers_test.exs
+index cc2f62a..6f43a39 100644
+--- a/test/pinchflat/downloading/downloading_helpers_test.exs
++++ b/test/pinchflat/downloading/downloading_helpers_test.exs
+@@ -65,6 +65,74 @@ defmodule Pinchflat.Downloading.DownloadingHelpersTest do
+     end
+   end
+ 
++  describe "enqueue_failed_download_tasks/1" do
++    test "enqueues a forced download job for each failed media item" do
++      source = source_fixture()
++      failed_pending = media_item_fixture(source_id: source.id, media_filepath: nil, last_error: "error 1")
++
++      failed_downloaded =
++        media_item_fixture(source_id: source.id, last_error: "Unable to communicate with SponsorBlock")
++
++      assert :ok = DownloadingHelpers.enqueue_failed_download_tasks(source)
++
++      assert_enqueued(worker: MediaDownloadWorker, args: %{"id" => failed_pending.id, "force" => true})
++      assert_enqueued(worker: MediaDownloadWorker, args: %{"id" => failed_downloaded.id, "force" => true})
++      assert [_, _] = all_enqueued(worker: MediaDownloadWorker)
++    end
++
++    test "attaches a task to each enqueued job" do
++      source = source_fixture()
++      media_item = media_item_fixture(source_id: source.id, media_filepath: nil, last_error: "error")
++
++      assert :ok = DownloadingHelpers.enqueue_failed_download_tasks(source)
++
++      assert [_] = Tasks.list_tasks_for(media_item, "MediaDownloadWorker")
++    end
++
++    test "doesn't enqueue jobs for media that hasn't failed, is prevented, or belongs to another source" do
++      source = source_fixture()
++      _not_failed = media_item_fixture(source_id: source.id, media_filepath: nil)
++
++      _prevented =
++        media_item_fixture(source_id: source.id, media_filepath: nil, prevent_download: true, last_error: "e")
++
++      _other_source = media_item_fixture(media_filepath: nil, last_error: "error")
++
++      assert :ok = DownloadingHelpers.enqueue_failed_download_tasks(source)
++
++      refute_enqueued(worker: MediaDownloadWorker)
++    end
++
++    test "does not enqueue jobs if the source is set to not download" do
++      source = source_fixture(download_media: false)
++      media_item = media_item_fixture(source_id: source.id, media_filepath: nil, last_error: "error")
++
++      assert :ok = DownloadingHelpers.enqueue_failed_download_tasks(source)
++
++      refute_enqueued(worker: MediaDownloadWorker)
++      assert [] = Tasks.list_tasks_for(media_item)
++    end
++
++    test "does not enqueue duplicate jobs" do
++      source = source_fixture()
++      media_item = media_item_fixture(source_id: source.id, media_filepath: nil, last_error: "error")
++
++      assert :ok = DownloadingHelpers.enqueue_failed_download_tasks(source)
++      assert :ok = DownloadingHelpers.enqueue_failed_download_tasks(source)
++
++      assert [_] = all_enqueued(worker: MediaDownloadWorker, args: %{"id" => media_item.id})
++    end
++
++    test "does not clear the recorded error" do
++      source = source_fixture()
++      media_item = media_item_fixture(source_id: source.id, media_filepath: nil, last_error: "error")
++
++      assert :ok = DownloadingHelpers.enqueue_failed_download_tasks(source)
++
++      assert Repo.reload!(media_item).last_error == "error"
++    end
++  end
++
+   describe "dequeue_pending_download_tasks/1" do
+     test "deletes all pending tasks for a source's media items" do
+       source = source_fixture()
+diff --git a/test/pinchflat/downloading/media_download_worker_test.exs b/test/pinchflat/downloading/media_download_worker_test.exs
+index 9b2e0f8..3c5734d 100644
+--- a/test/pinchflat/downloading/media_download_worker_test.exs
++++ b/test/pinchflat/downloading/media_download_worker_test.exs
+@@ -432,4 +432,277 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+       perform_job(MediaDownloadWorker, %{id: media_item.id})
+     end
+   end
++
++  describe "perform/1 when recording download errors" do
++    test "records yt-dlp's error message when the download fails", %{media_item: media_item} do
++      message = "ERROR: [youtube] abc123: Private video"
++
++      expect(YtDlpRunnerMock, :run, 2, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:error, message, 1}
++      end)
++
++      assert {:error, :download_failed} = perform_job(MediaDownloadWorker, %{id: media_item.id})
++
++      assert Repo.reload!(media_item).last_error == message
++    end
++
++    test "records yt-dlp's error message when checking the downloadable status fails", %{media_item: media_item} do
++      message = "ERROR: [youtube] abc123: Video unavailable. This video is private"
++
++      expect(YtDlpRunnerMock, :run, 1, fn _url, :get_downloadable_status, _opts, _ot, _addl -> {:error, message, 1} end)
++
++      assert {:ok, :non_retry} = perform_job(MediaDownloadWorker, %{id: media_item.id})
++
++      assert Repo.reload!(media_item).last_error == message
++    end
++
++    test "still retries the job after recording the error", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, 2, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:error, "ERROR: [youtube] abc123: Private video", 1}
++      end)
++
++      Oban.Testing.with_testing_mode(:inline, fn ->
++        {:ok, job} = Oban.insert(MediaDownloadWorker.new(%{id: media_item.id}))
++
++        assert job.state == "retryable"
++      end)
++
++      assert Repo.reload!(media_item).last_error == "ERROR: [youtube] abc123: Private video"
++    end
++
++    test "records a readable string for errors that aren't text", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, 2, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:error, :connection_reset}
++      end)
++
++      assert {:error, :download_failed} = perform_job(MediaDownloadWorker, %{id: media_item.id})
++
++      assert Repo.reload!(media_item).last_error == "Unknown error: {:error, :connection_reset}"
++    end
++
++    test "records a readable string for yt-dlp error messages that aren't text", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, 2, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:error, {:port_closed, 137}, 1}
++      end)
++
++      assert {:error, :download_failed} = perform_job(MediaDownloadWorker, %{id: media_item.id})
++
++      last_error = Repo.reload!(media_item).last_error
++      assert is_binary(last_error)
++      assert last_error =~ "{:port_closed, 137}"
++    end
++
++    test "never records an empty reason", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, 2, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:error, "", 1}
++      end)
++
++      assert {:error, :download_failed} = perform_job(MediaDownloadWorker, %{id: media_item.id})
++
++      last_error = Repo.reload!(media_item).last_error
++      assert is_binary(last_error)
++      assert String.trim(last_error) != ""
++    end
++
++    test "records a message when the media isn't downloadable yet", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, 1, fn _url, :get_downloadable_status, _opts, _ot, _addl ->
++        {:ok, Phoenix.json_library().encode!(%{"live_status" => "is_live"})}
++      end)
++
++      Oban.Testing.with_testing_mode(:inline, fn ->
++        {:ok, job} = Oban.insert(MediaDownloadWorker.new(%{id: media_item.id}))
++
++        assert job.state == "completed"
++      end)
++
++      last_error = Repo.reload!(media_item).last_error
++      assert is_binary(last_error)
++      assert last_error =~ "ready to be downloaded"
++    end
++
++    test "records the message of errors that are never retried", %{media_item: media_item} do
++      message = "ERROR: [youtube] abc123: Sign in to confirm you're not a bot"
++
++      expect(YtDlpRunnerMock, :run, 2, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:error, message, 1}
++      end)
++
++      Oban.Testing.with_testing_mode(:inline, fn ->
++        {:ok, job} = Oban.insert(MediaDownloadWorker.new(%{id: media_item.id}))
++
++        assert job.state == "completed"
++      end)
++
++      assert Repo.reload!(media_item).last_error == message
++    end
++
++    test "records the message of recovered errors and keeps the saved details", %{media_item: media_item} do
++      message = "Unable to communicate with SponsorBlock"
++
++      expect(YtDlpRunnerMock, :run, 3, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl ->
++          {:ok, "{}"}
++
++        _url, :download, _opts, _ot, addl ->
++          File.write(Keyword.fetch!(addl, :output_filepath), render_metadata(:media_metadata))
++
++          {:error, message, 1}
++
++        _url, :download_thumbnail, _opts, _ot, _addl ->
++          {:ok, ""}
++      end)
++
++      assert {:error, :retry} = perform_job(MediaDownloadWorker, %{id: media_item.id})
++      media_item = Repo.reload!(media_item)
++
++      assert media_item.last_error == message
++      assert media_item.media_filepath
++      assert media_item.media_downloaded_at
++    end
++
++    test "records the message of recoverable errors when recovery fails", %{media_item: media_item} do
++      message = "Unable to communicate with SponsorBlock"
++
++      expect(YtDlpRunnerMock, :run, 2, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:error, message, 1}
++      end)
++
++      assert {:error, :retry} = perform_job(MediaDownloadWorker, %{id: media_item.id})
++      media_item = Repo.reload!(media_item)
++
++      assert media_item.last_error == message
++      refute media_item.media_filepath
++    end
++
++    test "a new failure replaces the previous reason", %{media_item: media_item} do
++      {:ok, media_item} = Media.update_media_item(media_item, %{last_error: "previous error"})
++
++      expect(YtDlpRunnerMock, :run, 2, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:error, "ERROR: new error", 1}
++      end)
++
++      perform_job(MediaDownloadWorker, %{id: media_item.id})
++
++      assert Repo.reload!(media_item).last_error == "ERROR: new error"
++    end
++
++    test "a successful download clears the previous reason", %{media_item: media_item} do
++      {:ok, media_item} = Media.update_media_item(media_item, %{last_error: "previous error"})
++      assert media_item.last_error == "previous error"
++
++      assert :ok = perform_job(MediaDownloadWorker, %{id: media_item.id})
++      media_item = Repo.reload!(media_item)
++
++      assert media_item.media_filepath
++      assert media_item.last_error == nil
++    end
++
++    test "a successful download clears the reason left by a recovered error", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, 3, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl ->
++          {:ok, "{}"}
++
++        _url, :download, _opts, _ot, addl ->
++          File.write(Keyword.fetch!(addl, :output_filepath), render_metadata(:media_metadata))
++
++          {:error, "Unable to communicate with SponsorBlock", 1}
++
++        _url, :download_thumbnail, _opts, _ot, _addl ->
++          {:ok, ""}
++      end)
++
++      perform_job(MediaDownloadWorker, %{id: media_item.id})
++      assert Repo.reload!(media_item).last_error == "Unable to communicate with SponsorBlock"
++
++      expect(YtDlpRunnerMock, :run, 3, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:ok, render_metadata(:media_metadata)}
++        _url, :download_thumbnail, _opts, _ot, _addl -> {:ok, ""}
++      end)
++
++      assert :ok = perform_job(MediaDownloadWorker, %{id: media_item.id, force: true})
++      assert Repo.reload!(media_item).last_error == nil
++    end
++
++    test "a failed forced download records the reason and keeps the existing file", %{media_item: media_item} do
++      {:ok, media_item} = Media.update_media_item(media_item, %{media_filepath: "/video/existing.mp4"})
++
++      expect(YtDlpRunnerMock, :run, 2, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:error, "ERROR: forced error", 1}
++      end)
++
++      assert {:error, :download_failed} = perform_job(MediaDownloadWorker, %{id: media_item.id, force: true})
++      media_item = Repo.reload!(media_item)
++
++      assert media_item.last_error == "ERROR: forced error"
++      assert media_item.media_filepath == "/video/existing.mp4"
++    end
++
++    test "a failed quality upgrade records the reason", %{media_item: media_item} do
++      {:ok, media_item} = Media.update_media_item(media_item, %{media_filepath: "/video/existing.mp4"})
++
++      expect(YtDlpRunnerMock, :run, 2, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:error, "ERROR: upgrade error", 1}
++      end)
++
++      perform_job(MediaDownloadWorker, %{id: media_item.id, quality_upgrade?: true})
++      media_item = Repo.reload!(media_item)
++
++      assert media_item.last_error == "ERROR: upgrade error"
++      assert media_item.media_filepath == "/video/existing.mp4"
++      assert media_item.media_redownloaded_at == nil
++    end
++
++    test "leaves the reason unchanged if the source is set to not download", %{media_item: media_item} do
++      {:ok, media_item} = Media.update_media_item(media_item, %{last_error: "previous error"})
++      Sources.update_source(media_item.source, %{download_media: false})
++      expect(YtDlpRunnerMock, :run, 0, fn _url, _action, _opts, _ot, _addl -> :ok end)
++
++      assert :ok = perform_job(MediaDownloadWorker, %{id: media_item.id})
++
++      assert Repo.reload!(media_item).last_error == "previous error"
++    end
++
++    test "leaves the reason unchanged if the media item's download is prevented", %{media_item: media_item} do
++      {:ok, media_item} = Media.update_media_item(media_item, %{last_error: "previous error", prevent_download: true})
++      expect(YtDlpRunnerMock, :run, 0, fn _url, _action, _opts, _ot, _addl -> :ok end)
++
++      assert :ok = perform_job(MediaDownloadWorker, %{id: media_item.id})
++
++      assert Repo.reload!(media_item).last_error == "previous error"
++    end
++
++    test "leaves the reason unchanged if the media item isn't pending", %{media_item: media_item} do
++      {:ok, media_item} =
++        Media.update_media_item(media_item, %{last_error: "previous error", media_filepath: "/video/existing.mp4"})
++
++      expect(YtDlpRunnerMock, :run, 0, fn _url, _action, _opts, _ot, _addl -> :ok end)
++
++      assert :ok = perform_job(MediaDownloadWorker, %{id: media_item.id})
++
++      assert Repo.reload!(media_item).last_error == "previous error"
++    end
++
++    test "leaves the reason unchanged if a user script prevents the download", %{media_item: media_item} do
++      {:ok, media_item} = Media.update_media_item(media_item, %{last_error: "previous error"})
++      expect(UserScriptRunnerMock, :run, fn :media_pre_download, _ -> {:ok, "", 1} end)
++      expect(YtDlpRunnerMock, :run, 0, fn _url, _action, _opts, _ot, _addl -> :ok end)
++
++      assert :ok = perform_job(MediaDownloadWorker, %{id: media_item.id})
++      media_item = Repo.reload!(media_item)
++
++      assert media_item.prevent_download
++      assert media_item.last_error == "previous error"
++    end
++  end
+ end
+diff --git a/test/pinchflat/downloading/media_quality_upgrade_worker_test.exs b/test/pinchflat/downloading/media_quality_upgrade_worker_test.exs
+index 6c1d6f5..955ee71 100644
+--- a/test/pinchflat/downloading/media_quality_upgrade_worker_test.exs
++++ b/test/pinchflat/downloading/media_quality_upgrade_worker_test.exs
+@@ -40,5 +40,33 @@ defmodule Pinchflat.Downloading.MediaQualityUpgradeWorkerTest do
+ 
+       assert [] = all_enqueued(worker: MediaDownloadWorker)
+     end
++
++    test "a failed upgrade records the error on the media item and keeps its file" do
++      stub(UserScriptRunnerMock, :run, fn _event_type, _data -> {:ok, "", 0} end)
++
++      stub(YtDlpRunnerMock, :run, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:error, "ERROR: [youtube] abc123: Private video", 1}
++      end)
++
++      media_profile = media_profile_fixture(%{redownload_delay_days: 4})
++      source = source_fixture(%{media_profile_id: media_profile.id, inserted_at: now_minus(10, :days)})
++
++      media_item =
++        media_item_fixture(%{
++          source_id: source.id,
++          uploaded_at: now_minus(6, :days),
++          media_downloaded_at: now_minus(5, :days)
++        })
++
++      perform_job(MediaQualityUpgradeWorker, %{})
++      [job] = all_enqueued(worker: MediaDownloadWorker, args: %{id: media_item.id, quality_upgrade?: true})
++
++      assert {:error, :download_failed} = perform_job(MediaDownloadWorker, job.args)
++      updated_media_item = Repo.reload!(media_item)
++
++      assert updated_media_item.last_error == "ERROR: [youtube] abc123: Private video"
++      assert updated_media_item.media_filepath == media_item.media_filepath
++    end
+   end
+ end
+diff --git a/test/pinchflat/media_test.exs b/test/pinchflat/media_test.exs
+index 6becd5b..73f02be 100644
+--- a/test/pinchflat/media_test.exs
++++ b/test/pinchflat/media_test.exs
+@@ -640,6 +640,29 @@ defmodule Pinchflat.MediaTest do
+     test "creating with invalid data returns error changeset" do
+       assert {:error, %Ecto.Changeset{}} = Media.create_media_item(@invalid_attrs)
+     end
++
++    test "has no last_error by default" do
++      media_item = media_item_fixture()
++
++      assert Map.has_key?(media_item, :last_error)
++      assert media_item.last_error == nil
++    end
++
++    test "accepts a last_error" do
++      valid_attrs = %{
++        media_id: Faker.String.base64(12),
++        title: Faker.Commerce.product_name(),
++        source_id: source_fixture().id,
++        original_url: "https://www.youtube.com/channel/#{Faker.String.base64(12)}",
++        uploaded_at: now(),
++        last_error: "ERROR: [youtube] abc123: Private video"
++      }
++
++      assert {:ok, %MediaItem{} = media_item} = Media.create_media_item(valid_attrs)
++
++      assert media_item.last_error == "ERROR: [youtube] abc123: Private video"
++      assert Repo.reload!(media_item).last_error == "ERROR: [youtube] abc123: Private video"
++    end
+   end
+ 
+   describe "create_media_item_from_backend_attrs/2" do
+@@ -732,6 +755,45 @@ defmodule Pinchflat.MediaTest do
+       assert {:error, %Ecto.Changeset{}} = Media.update_media_item(media_item, @invalid_attrs)
+       assert media_item == Media.get_media_item!(media_item.id)
+     end
++
++    test "can set and clear the last_error" do
++      media_item = media_item_fixture()
++      long_error = String.duplicate("<b>ERROR</b> & 'quotes' \"here\" ", 100)
++
++      assert {:ok, media_item} = Media.update_media_item(media_item, %{last_error: long_error})
++      assert Repo.reload!(media_item).last_error == long_error
++
++      assert {:ok, media_item} = Media.update_media_item(media_item, %{last_error: "a newer error"})
++      assert Repo.reload!(media_item).last_error == "a newer error"
++
++      assert {:ok, media_item} = Media.update_media_item(media_item, %{last_error: nil})
++      assert Repo.reload!(media_item).last_error == nil
++    end
++  end
++
++  describe "list_failed_media_items_for/1" do
++    test "returns the source's media items that have a last_error" do
++      source = source_fixture()
++      failed_pending = media_item_fixture(source_id: source.id, media_filepath: nil, last_error: "error 1")
++      failed_downloaded = media_item_fixture(source_id: source.id, last_error: "error 2")
++      _not_failed = media_item_fixture(source_id: source.id, media_filepath: nil)
++
++      assert ids(Media.list_failed_media_items_for(source)) == ids([failed_pending, failed_downloaded])
++    end
++
++    test "does not return media items whose download is prevented" do
++      source = source_fixture()
++      _media_item = media_item_fixture(source_id: source.id, last_error: "error", prevent_download: true)
++
++      assert [] = Media.list_failed_media_items_for(source)
++    end
++
++    test "does not return other sources' media items" do
++      source = source_fixture()
++      _media_item = media_item_fixture(last_error: "error")
++
++      assert [] = Media.list_failed_media_items_for(source)
++    end
+   end
+ 
+   describe "delete_media_item/2" do
+@@ -1080,4 +1142,6 @@ defmodule Pinchflat.MediaTest do
+       assert updated_media_item.upload_date_index == 0
+     end
+   end
++
++  defp ids(media_items), do: media_items |> Enum.map(& &1.id) |> Enum.sort()
+ end
+diff --git a/test/pinchflat/utils/string_utils_test.exs b/test/pinchflat/utils/string_utils_test.exs
+index a9f79ad..fe44dec 100644
+--- a/test/pinchflat/utils/string_utils_test.exs
++++ b/test/pinchflat/utils/string_utils_test.exs
+@@ -33,4 +33,17 @@ defmodule Pinchflat.Utils.StringUtilsTest do
+       assert StringUtils.double_brace("hello") == "{{ hello }}"
+     end
+   end
++
++  describe "wrap_string/1" do
++    test "returns strings as-is" do
++      assert StringUtils.wrap_string("ERROR: something") == "ERROR: something"
++    end
++
++    test "returns the printed representation of other terms" do
++      assert StringUtils.wrap_string(:some_error) == ":some_error"
++      assert StringUtils.wrap_string({:error, :connection_reset}) == "{:error, :connection_reset}"
++      assert StringUtils.wrap_string(%{reason: 1}) == "%{reason: 1}"
++      assert StringUtils.wrap_string(nil) == "nil"
++    end
++  end
+ end
+diff --git a/test/pinchflat_web/controllers/media_item_controller_test.exs b/test/pinchflat_web/controllers/media_item_controller_test.exs
+index 34457d5..b09216a 100644
+--- a/test/pinchflat_web/controllers/media_item_controller_test.exs
++++ b/test/pinchflat_web/controllers/media_item_controller_test.exs
+@@ -21,6 +21,30 @@ defmodule PinchflatWeb.MediaItemControllerTest do
+ 
+       assert html_response(conn, 200) =~ "#{media_item.title}"
+     end
++
++    test "shows the last error when one is recorded", %{conn: conn} do
++      media_item = media_item_fixture(%{media_filepath: nil, last_error: "ERROR: [youtube] abc123: Private video"})
++      conn = get(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item}")
++      html = html_response(conn, 200)
++
++      assert html =~ "Last Error"
++      assert html =~ "ERROR: [youtube] abc123: Private video"
++    end
++
++    test "escapes the last error", %{conn: conn} do
++      media_item = media_item_fixture(%{media_filepath: nil, last_error: "<script>alert(1)</script>"})
++      conn = get(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item}")
++      html = html_response(conn, 200)
++
++      assert html =~ "Last Error"
++      refute html =~ "<script>alert(1)</script>"
++    end
++
++    test "doesn't show a last error section when none is recorded", %{conn: conn, media_item: media_item} do
++      conn = get(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item}")
++
++      refute html_response(conn, 200) =~ "Last Error"
++    end
+   end
+ 
+   describe "edit media" do
+diff --git a/test/pinchflat_web/controllers/page_controller_test.exs b/test/pinchflat_web/controllers/page_controller_test.exs
+index e549942..7b052d7 100644
+--- a/test/pinchflat_web/controllers/page_controller_test.exs
++++ b/test/pinchflat_web/controllers/page_controller_test.exs
+@@ -1,6 +1,9 @@
+ defmodule PinchflatWeb.PageControllerTest do
+   use PinchflatWeb.ConnCase
+ 
++  import Pinchflat.MediaFixtures
++
++  alias Pinchflat.Media
+   alias Pinchflat.Settings
+ 
+   describe "GET / when testing onboarding" do
+@@ -31,4 +34,40 @@ defmodule PinchflatWeb.PageControllerTest do
+       assert html_response(conn, 200) =~ "MENU"
+     end
+   end
++
++  describe "GET / when testing the media history" do
++    setup do
++      Settings.set(onboarding: false)
++
++      :ok
++    end
++
++    test "shows the recorded errors of downloaded media", %{conn: conn} do
++      media_item = media_item_fixture(last_error: "Unable to communicate with SponsorBlock")
++
++      html = conn |> get(~p"/") |> html_response(200)
++
++      assert html =~ media_item.title
++      assert html =~ "Unable to communicate with SponsorBlock"
++    end
++
++    test "shows the recorded errors of pending media", %{conn: conn} do
++      media_item = media_item_fixture(media_filepath: nil, last_error: "ERROR: [youtube] abc123: Private video")
++
++      html = conn |> get(~p"/") |> html_response(200)
++
++      assert html =~ media_item.title
++      assert html =~ "ERROR: [youtube] abc123: Private video"
++    end
++
++    test "doesn't show errors once they're cleared", %{conn: conn} do
++      media_item = media_item_fixture(media_filepath: nil, last_error: "ERROR: [youtube] abc123: Private video")
++      {:ok, _} = Media.update_media_item(media_item, %{media_filepath: "/video/file.mp4", last_error: nil})
++
++      html = conn |> get(~p"/") |> html_response(200)
++
++      assert html =~ media_item.title
++      refute html =~ "ERROR: [youtube] abc123: Private video"
++    end
++  end
+ end
+diff --git a/test/pinchflat_web/controllers/source_controller_test.exs b/test/pinchflat_web/controllers/source_controller_test.exs
+index 8580d23..eba6027 100644
+--- a/test/pinchflat_web/controllers/source_controller_test.exs
++++ b/test/pinchflat_web/controllers/source_controller_test.exs
+@@ -98,6 +98,71 @@ defmodule PinchflatWeb.SourceControllerTest do
+     end
+   end
+ 
++  describe "show source" do
++    test "renders the page", %{conn: conn} do
++      source = source_fixture()
++
++      conn = get(conn, "/sources/#{source.id}")
++      assert html_response(conn, 200) =~ source.custom_name
++    end
++
++    test "has a Failed tab between the Other and Tasks tabs", %{conn: conn} do
++      source = source_fixture()
++
++      html = conn |> get("/sources/#{source.id}") |> html_response(200)
++
++      tab_positions =
++        Enum.map(~w(pending downloaded other failed tasks), fn tab_id ->
++          {index, _} = :binary.match(html, "setTabByName(&#39;#{tab_id}&#39;)")
++          index
++        end)
++
++      assert tab_positions == Enum.sort(tab_positions)
++      assert html =~ ~r{<span class="text-xl">\s*Failed\s*</span>}
++    end
++
++    test "lists failed media and their errors", %{conn: conn} do
++      source = source_fixture()
++
++      failed =
++        media_item_fixture(source_id: source.id, media_filepath: nil, last_error: "ERROR: [youtube] abc: Private video")
++
++      html = conn |> get("/sources/#{source.id}") |> html_response(200)
++
++      assert html =~ failed.title
++      assert html =~ "ERROR: [youtube] abc: Private video"
++    end
++
++    test "doesn't show errors after a successful download", %{conn: conn} do
++      source = source_fixture()
++      media_item = media_item_fixture(source_id: source.id, media_filepath: nil, last_error: "ERROR: some error")
++      Pinchflat.Media.update_media_item(media_item, %{media_filepath: "/video/file.mp4", last_error: nil})
++
++      html = conn |> get("/sources/#{source.id}") |> html_response(200)
++
++      assert html =~ media_item.title
++      refute html =~ "ERROR: some error"
++    end
++
++    test "offers to retry failed downloads when the source downloads media", %{conn: conn} do
++      source = source_fixture(download_media: true)
++
++      html = conn |> get("/sources/#{source.id}") |> html_response(200)
++
++      assert html =~ ~s(href="/sources/#{source.id}/retry_failed_downloads")
++      assert html =~ "Retry Failed Downloads"
++    end
++
++    test "doesn't offer to retry failed downloads when the source doesn't download media", %{conn: conn} do
++      source = source_fixture(download_media: false)
++
++      html = conn |> get("/sources/#{source.id}") |> html_response(200)
++
++      refute html =~ "/sources/#{source.id}/retry_failed_downloads"
++      refute html =~ "Retry Failed Downloads"
++    end
++  end
++
+   describe "edit source" do
+     setup [:create_source]
+ 
+@@ -182,6 +247,68 @@ defmodule PinchflatWeb.SourceControllerTest do
+     end
+   end
+ 
++  describe "retry_failed_downloads" do
++    test "enqueues a forced download for each failed media item", %{conn: conn} do
++      source = source_fixture()
++      failed_pending = media_item_fixture(source_id: source.id, media_filepath: nil, last_error: "ERROR: private")
++
++      failed_downloaded =
++        media_item_fixture(source_id: source.id, last_error: "Unable to communicate with SponsorBlock")
++
++      _not_failed = media_item_fixture(source_id: source.id, media_filepath: nil)
++
++      _prevented =
++        media_item_fixture(source_id: source.id, media_filepath: nil, prevent_download: true, last_error: "ERROR: x")
++
++      _other_source = media_item_fixture(media_filepath: nil, last_error: "ERROR: other source")
++
++      assert [] = all_enqueued(worker: MediaDownloadWorker)
++      post(conn, "/sources/#{source.id}/retry_failed_downloads")
++
++      assert [_, _] = all_enqueued(worker: MediaDownloadWorker)
++      assert_enqueued(worker: MediaDownloadWorker, args: %{"id" => failed_pending.id, "force" => true})
++      assert_enqueued(worker: MediaDownloadWorker, args: %{"id" => failed_downloaded.id, "force" => true})
++    end
++
++    test "does not enqueue duplicate jobs", %{conn: conn} do
++      source = source_fixture()
++      media_item = media_item_fixture(source_id: source.id, media_filepath: nil, last_error: "ERROR: private")
++
++      post(conn, "/sources/#{source.id}/retry_failed_downloads")
++      post(conn, "/sources/#{source.id}/retry_failed_downloads")
++
++      assert [_] = all_enqueued(worker: MediaDownloadWorker, args: %{"id" => media_item.id})
++    end
++
++    test "does not clear the recorded errors", %{conn: conn} do
++      source = source_fixture()
++      media_item = media_item_fixture(source_id: source.id, media_filepath: nil, last_error: "ERROR: private")
++
++      post(conn, "/sources/#{source.id}/retry_failed_downloads")
++
++      assert Repo.reload!(media_item).last_error == "ERROR: private"
++    end
++
++    test "does not enqueue anything if the source doesn't download media", %{conn: conn} do
++      source = source_fixture(download_media: false)
++      _media_item = media_item_fixture(source_id: source.id, media_filepath: nil, last_error: "ERROR: private")
++
++      conn = post(conn, "/sources/#{source.id}/retry_failed_downloads")
++
++      assert redirected_to(conn) == "/sources/#{source.id}"
++      assert [] = all_enqueued(worker: MediaDownloadWorker)
++    end
++
++    test "redirects to the source page", %{conn: conn} do
++      source = source_fixture()
++
++      conn = post(conn, "/sources/#{source.id}/retry_failed_downloads")
++
++      assert redirected_to(conn) == "/sources/#{source.id}"
++      assert Phoenix.Flash.get(conn.assigns.flash, :info)
++    end
++  end
++
+   describe "force_redownload" do
+     test "enqueues re-download tasks", %{conn: conn} do
+       source = source_fixture()
+diff --git a/test/pinchflat_web/controllers/sources/media_item_table_live_test.exs b/test/pinchflat_web/controllers/sources/media_item_table_live_test.exs
+index b941f84..4963dda 100644
+--- a/test/pinchflat_web/controllers/sources/media_item_table_live_test.exs
++++ b/test/pinchflat_web/controllers/sources/media_item_table_live_test.exs
+@@ -76,6 +76,83 @@ defmodule PinchflatWeb.Sources.MediaItemTableLiveTest do
+ 
+       assert html =~ "Manually Ignored?"
+     end
++
++    test "shows media with a recorded error when failed", %{conn: conn, source: source} do
++      failed_pending = media_item_fixture(source_id: source.id, media_filepath: nil, last_error: "ERROR: pending")
++
++      failed_downloaded =
++        media_item_fixture(source_id: source.id, last_error: "Unable to communicate with SponsorBlock")
++
++      not_failed = media_item_fixture(source_id: source.id, media_filepath: nil)
++
++      prevented =
++        media_item_fixture(source_id: source.id, media_filepath: nil, prevent_download: true, last_error: "ERROR: x")
++
++      other_source_failed = media_item_fixture(media_filepath: nil, last_error: "ERROR: other source")
++
++      {:ok, _view, html} = live_isolated(conn, MediaItemTableLive, session: create_session(source, "failed"))
++
++      assert html =~ failed_pending.title
++      assert html =~ failed_downloaded.title
++      assert html =~ "ERROR: pending"
++      assert html =~ "Unable to communicate with SponsorBlock"
++      refute html =~ not_failed.title
++      refute html =~ prevented.title
++      refute html =~ other_source_failed.title
++    end
++
++    test "shows a message when nothing has failed", %{conn: conn, source: source} do
++      _media_item = media_item_fixture(source_id: source.id, media_filepath: nil)
++
++      {:ok, _view, html} = live_isolated(conn, MediaItemTableLive, session: create_session(source, "failed"))
++
++      assert html =~ "Nothing Here!"
++    end
++
++    test "failed media keeps its membership of the other states", %{conn: conn, source: source} do
++      failed_pending = media_item_fixture(source_id: source.id, media_filepath: nil, last_error: "ERROR: pending")
++      failed_downloaded = media_item_fixture(source_id: source.id, last_error: "ERROR: downloaded")
++
++      {:ok, _view, pending_html} = live_isolated(conn, MediaItemTableLive, session: create_session(source, "pending"))
++
++      {:ok, _view, downloaded_html} =
++        live_isolated(conn, MediaItemTableLive, session: create_session(source, "downloaded"))
++
++      assert pending_html =~ failed_pending.title
++      refute pending_html =~ failed_downloaded.title
++      assert downloaded_html =~ failed_downloaded.title
++      refute downloaded_html =~ failed_pending.title
++    end
++  end
++
++  describe "recorded errors" do
++    test "rows of failed media contain the error", %{conn: conn, source: source} do
++      _failed =
++        media_item_fixture(source_id: source.id, media_filepath: nil, last_error: "ERROR: [youtube] abc: Private video")
++
++      _other = media_item_fixture(source_id: source.id, media_filepath: nil)
++
++      {:ok, _view, html} = live_isolated(conn, MediaItemTableLive, session: create_session(source, "pending"))
++
++      assert html =~ "ERROR: [youtube] abc: Private video"
++    end
++
++    test "errors are escaped", %{conn: conn, source: source} do
++      _failed = media_item_fixture(source_id: source.id, media_filepath: nil, last_error: "<script>alert(1)</script>")
++
++      {:ok, _view, html} = live_isolated(conn, MediaItemTableLive, session: create_session(source, "pending"))
++
++      refute html =~ "<script>alert(1)</script>"
++      assert html =~ "&lt;script&gt;alert(1)&lt;/script&gt;"
++    end
++
++    test "rows of media without an error don't show an error", %{conn: conn, source: source} do
++      _media_item = media_item_fixture(source_id: source.id, media_filepath: nil)
++
++      {:ok, _view, html} = live_isolated(conn, MediaItemTableLive, session: create_session(source, "pending"))
++
++      refute html =~ "hero-exclamation-circle"
++    end
+   end
+ 
+   defp create_session(source, media_state \\ "pending") do

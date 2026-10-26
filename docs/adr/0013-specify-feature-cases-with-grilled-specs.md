@@ -17,6 +17,8 @@ A feature case may extend its upstream PR into a fuller, coherent feature. The c
 
 For feature cases, this amends [ADR 0009](0009-validate-minimal-tasks-with-blind-model-attempts.md) and the minimal-ticket rule in the [selection guidelines](../pr-selection-guidelines.md).
 
+The same mechanism corrects any case's reference, bug fixes included, when review shows that the upstream fix fails a requirement its ticket states. The correction is a curator commit on the reference branch, recorded in provenance beside the upstream change, and it goes through the same review and qualification. Narrowing the requirement instead is right only when the requirement claimed something outside the task; a requirement inside the task is kept and the reference is fixed.
+
 ## Considered options
 
 - **Shortest sufficient ticket**: tests whether the solver guesses product decisions more than whether it implements them, and is unlike how agents receive work after clarification.

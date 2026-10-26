@@ -88,6 +88,7 @@ Cachex.warm(:users, only: [:no_such_warmer])
 ## Compatibility
 
 - Existing warmer specs without a name keep working, and unnamed warmers are still reported by module in `Cachex.warm/2` results.
+- An unnamed warmer that crashes and is restarted by the cache's supervisor keeps being reached by `Cachex.warm/2`, as today.
 - The existing `modules:` option of `Cachex.warm/2` keeps working as an alias of `only:`: it accepts the same entries and behaves identically. If both are given, `only:` is used.
 - The `Cachex.Warmer` behaviour (`interval/0`, `execute/1` and its return values) is unchanged. Warmer modules need no changes.
 - Hook notifications are unchanged: a manual `Cachex.warm/2` call is reported to hooks as before, and starting a cache does not report a `:warm` action.

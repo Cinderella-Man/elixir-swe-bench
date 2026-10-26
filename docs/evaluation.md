@@ -1,6 +1,6 @@
 # Evaluation contract
 
-A benchmark run evaluates one selected model through an endpoint: the active local-server model or a model available to a signed-in ChatGPT account. It freezes the selected inventory (currently eleven cases), controller and fixture hashes, reported model profile and effective generation settings, including supported seeds and budget policies. Checksummed release fixtures remain on disk independently of mutable cache pointers; submission receipts bind the actual prepared images, source receipt and patch, and completion receipts bind grading evidence.
+A benchmark run evaluates one selected model through an endpoint: the active local-server model or a model available to a signed-in ChatGPT account. It freezes the selected inventory (currently twenty cases), controller and fixture hashes, reported model profile and effective generation settings, including supported seeds and budget policies. Checksummed release fixtures remain on disk independently of mutable cache pointers; submission receipts bind the actual prepared images, source receipt and patch, and completion receipts bind grading evidence.
 
 Each case begins in a fresh offline workspace at the actual historical broken revision. The agent receives the ticket, broken source and prepared dependencies. Reference repairs, grader-only checks and upstream Git history remain outside its workspace. Preparation and verification are performed in separate Docker containers.
 

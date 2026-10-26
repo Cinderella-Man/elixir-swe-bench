@@ -1,1 +1,1 @@
-Archived milestones still appear in a project's milestones list. Exclude them while keeping active milestones visible and preserving the existing optional include behavior.
+Archived milestones still appear in a project's milestones list when a single project is fetched with its milestones (the get_project query). Exclude them while keeping active milestones visible and preserving the existing optional include behavior.

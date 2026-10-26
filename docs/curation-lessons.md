@@ -32,6 +32,22 @@ Keep a short requirement-to-check map outside solver input. Review `ticket.md`, 
 
 Evidence: [first submission review and diagnostic](../verification/case-curation-2026-10-20/ash-pr-3031/first-submission-review.md), [minimal wording amendment](../verification/case-curation-2026-10-20/ash-pr-3031/explicit-preservation-review.md).
 
+## Prove checks against wrong solutions, not only the reference
+
+A model's pass shows that a solution passes, not that a wrong one would fail. The review of the first Opus validation run found 16 cases where a plausible wrong or partial solution also passed every check. For each check you add, write down the wrong solution it targets, build that solution as a patch, and show that it passed the old checks and fails the new ones. Run the reference, the model's patch and the untouched starting source beside it.
+
+Recurring gaps:
+
+- **Fixtures that happen to agree with a wrong rule.** If the right answer is also the newest, the first or the last row, then "newest", "first" or "last" pass. Put the right answer in the middle of creation order.
+- **Only one path exercised.** A row click but not the player's Next button; the export but not the in-place export or the preview; header and session plugs but not the cookie plug. Cover every path the requirement names.
+- **"Nothing is saved" never submitted.** A test that only changes a form proves nothing about saving; submit it.
+- **Whole files left out of preservation.** When a few existing tests change on purpose, keep their files in the hidden stage with only those assertions updated, instead of dropping the files.
+- **Requirement texts that claim more than the reference does.** Fix the reference when the claim is inside the task; narrow the text only when it is outside.
+
+Make every new check deterministic on the starting source too. Global broadcasts reach every test running at the same time, so filter them by this test's own data. A supervisor restart leaves a gap, so retry in a monitored process. Wait for the operation that carries a value before asserting on it. Run a new check several times, under different seeds, before relying on its starting-failure status.
+
+The grader's own reporter needs the same care: every record it prints must start on its own line, or a progress dot printed just before it hides it from the parser.
+
 ## Diagnose qualification before repeating expensive work
 
 Use the first execution as a diagnostic gate before scheduling the remaining fresh rounds. Verify the named starting failures, reference pass, plausible incomplete failure and integrity rejection. A guessed `starting_failures` list can invalidate otherwise informative controls. Retain that exploratory evidence; correct a justified declaration in a new version, preserving every assertion.

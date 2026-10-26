@@ -8,6 +8,12 @@ Once the current cases pass, about six more go through the same pipeline: Absint
 
 `admission.json` keeps the qualification hash it was admitted under as a historical record. Readiness at run time comes from the controller's automatic re-qualification under the grading code about to be used. A code change therefore never forces a case-file edit, which completes ADR 0011's rule that code changes never force a rerun.
 
+## Amendment, 2026-10-26: what the first validation run changed
+
+The first complete validation run passed 19 of 20 cases. Its reviews found something a pass alone does not show: in 16 cases, a wrong or partial solution could also have passed, or the reference itself failed a stated requirement. Those cases were corrected with stronger checks, exact requirement texts and, for four of them, curator corrections to the reference. Every correction was proven against the reference, the model's patch, the starting source and the wrong solutions it targets, then independently reviewed and qualified. A changed case starts its two validation attempts again. Reviewing a pass therefore includes trying the wrong solutions the checks should reject, not only reading the patch. See the [validation record](../../verification/opus-validation-2026-10-26/README.md).
+
+The user kept ash-pr-3031 although Opus missed one of its stated requirements: the case is sound, the reference's fix is two lines, and it shows that frontier models still miss stated behaviour. This is an explicit exception to the drop rule above. The case keeps its validation attempts, so a later pass is still recorded.
+
 ## Considered options
 
 - **Keep upstream pins under a recorded exception**: no fork work, but cases would keep two kinds of source and overlay handling.

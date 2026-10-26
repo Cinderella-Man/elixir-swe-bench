@@ -61,7 +61,7 @@ Here `adaclub` and `kfriend` are followed, with the handle-prefix match first. `
 
 - `checked` is a list. Each handle is normalized like a suggestion term (trimmed, a leading `@` dropped, lowercased). Blank entries are dropped and duplicates removed, keeping the order of first appearance. Only the **first 50** distinct handles are kept. `["@Ada", "ada", "  ", "BOB"]` gives `["ada", "bob"]`.
 - `resolved` is a `MapSet` of the handles in `checked` that `VutuvWeb.Markdown.render/1` turns into a mention link (an `<a … class="mention">`):
-  - A handle held by a member always resolves, whatever their confirmation, moderation or block state. The renderer links every member's handle to their profile, and the profile decides what it shows.
+  - A handle held by a member resolves, whatever their confirmation, moderation or block state. The renderer links every member's handle to their profile, and the profile decides what it shows. The one exception is a handle that Markdown formatting takes apart before mentions are linked: `_` marks emphasis, so `@max_mustermann_` renders as `@max` followed by an emphasised `mustermann`. The renderer does not link such a handle, so it does not resolve.
   - A handle held by a page as its root handle resolves only while the page is publicly visible (status `"active"` and not frozen).
   - A handle nobody holds does not resolve.
 - No viewer is involved. The answer is the same for everyone.
@@ -90,7 +90,7 @@ Each row has exactly these five keys:
 - `kind`: `"user"` for a member, `"organization"` for a page.
 - `handle`: the handle without `@`.
 - `name`: for a member, the honorific prefix, first name, last name and honorific suffix joined by single spaces, with blank parts skipped. For a page, its name.
-- `avatar`: the URL the site already serves the account's picture at, or `null` when the account has no picture to show. For a member, this is their avatar thumbnail. For a page, it is its logo, a `/organization_images/<logo token>/…` URL. The site's built-in placeholder image (a `data:` URI) is not a picture: use `null` instead.
+- `avatar`: the URL the site already serves the account's picture at, or `null` when the account has no picture to show. For a member, this is their avatar thumbnail; an avatar still held for moderation review is not a picture to show. For a page, it is its logo, a `/organization_images/<logo token>/…` URL. The site's built-in placeholder image (a `data:` URI) is not a picture: use `null` instead.
 - `initials`: what the site's avatar tile shows when there is no picture. For a member, the uppercased first letters of the first two words of their first and last name (Ada Lovelace gives `AL`; honorifics are not included). For a page, the uppercased first letter of its name (Acme GmbH gives `A`).
 
 A missing `q` is treated as an empty term, so the answer is `{"results": []}`.

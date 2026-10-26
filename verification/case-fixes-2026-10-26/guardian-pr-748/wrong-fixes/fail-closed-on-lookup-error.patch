@@ -1,0 +1,318 @@
+diff --git a/lib/guardian/plug.ex b/lib/guardian/plug.ex
+index 637f83f..d51c25f 100644
+--- a/lib/guardian/plug.ex
++++ b/lib/guardian/plug.ex
+@@ -35,6 +35,16 @@ if Code.ensure_loaded?(Plug) do
+ 
+     If there is a session present the token will be stored in the session
+     to provide traditional session based authentication.
++
++    `sign_in`, `remember_me` and `remember_me_from_token` accept the same
++    connection aware `:secret` option as the verify plugs, so a token can be
++    signed with a secret selected for the current request:
++
++    ```elixir
++    conn = MyApp.Guardian.Plug.sign_in(conn, resource, %{}, secret: &MyApp.Secrets.for_conn/1)
++    ```
++
++    See `resolve_secret/2`.
+     """
+ 
+     defmodule UnauthenticatedError do
+@@ -124,6 +134,55 @@ if Code.ensure_loaded?(Plug) do
+     @spec default_key() :: String.t()
+     def default_key, do: @default_key
+ 
++    @doc """
++    Resolves a connection aware `:secret` option to a concrete value.
++
++    Plug options are built once by `init/1`, so a static `:secret` cannot depend on the request.
++    Giving `:secret` a one argument function defers the decision to call time: the function
++    receives the connection and returns the secret to use.
++
++        plug Guardian.Plug.VerifyHeader, secret: &MyApp.Secrets.for_conn/1
++
++    Use a remote capture. `Plug.Builder` inlines the result of a compile time `init/1`, and an
++    anonymous function cannot be inlined, so `secret: & &1.assigns.tenant.key` in a `plug` line
++    fails to compile.
++
++    Every other value is left untouched, including `{module, function, args}` tuples, which are
++    resolved later by `Guardian.Config.resolve_value/1` without access to the connection. A
++    function of any other arity raises, since no token module can make sense of it.
++
++    Returning `nil` is an error rather than a fallback to the implementation module's
++    `:secret_key`. See `Guardian.Token.Jwt`.
++
++    A verify plug resolves the secret once per request, after it has found a token, so a request
++    carrying no token never calls the function. It can run more than once when `:secret` is also
++    configured on `:refresh_from_cookie`. Keep it a cheap read off the connection and do any
++    loading or parsing in an upstream plug.
++
++    The same option applies when tokens are issued. `sign_in/5`, `remember_me/5` and
++    `remember_me_from_token/5` resolve it before signing, and `Guardian.Plug.SlidingCookie`
++    resolves it once to verify the current cookie and to sign its replacement. A tenant's tokens
++    are therefore signed and verified with the same per request secret, and a `nil` result fails
++    closed on both sides.
++
++    The verify plugs and the issuing functions call this on your behalf. It is public so that
++    custom plugs can offer the same option.
++    """
++    @spec resolve_secret(Plug.Conn.t(), Guardian.options()) :: Guardian.options()
++    def resolve_secret(conn, opts) do
++      case Keyword.fetch(opts, :secret) do
++        {:ok, fun} when is_function(fun, 1) ->
++          Keyword.put(opts, :secret, fun.(conn))
++
++        {:ok, fun} when is_function(fun) ->
++          raise ArgumentError,
++                "the :secret option must be a function of one argument, got: #{inspect(fun)}"
++
++        _ ->
++          opts
++      end
++    end
++
+     @spec current_claims(Plug.Conn.t(), Guardian.options()) :: Guardian.Token.claims() | nil
+     def current_claims(conn, opts \\ []) do
+       key =
+@@ -202,7 +261,8 @@ if Code.ensure_loaded?(Plug) do
+ 
+     @spec sign_in(Plug.Conn.t(), module, any, Guardian.Token.claims(), Guardian.options()) :: Plug.Conn.t()
+     def sign_in(conn, impl, resource, claims \\ %{}, opts \\ []) do
+-      with {:ok, token, full_claims} <- Guardian.encode_and_sign(impl, resource, claims, opts),
++      with sign_opts <- resolve_secret(conn, opts),
++           {:ok, token, full_claims} <- Guardian.encode_and_sign(impl, resource, claims, sign_opts),
+            {:ok, conn} <- add_data_to_conn(conn, resource, token, full_claims, opts),
+            {:ok, conn} <- returning_tuple({impl, :after_sign_in, [conn, resource, token, full_claims, opts]}) do
+         if session_active?(conn) do
+@@ -264,6 +324,9 @@ if Code.ensure_loaded?(Plug) do
+     If the token does not have an exp,t the default will be 30 days.
+ 
+     The max age can be overridden by setting the cookie option config.
++
++    A one argument `:secret` function is called with the connection to select the
++    signing secret. See `resolve_secret/2`.
+     """
+ 
+     @spec remember_me(Plug.Conn.t(), module, any, Guardian.Token.claims(), Guardian.options()) :: Plug.Conn.t()
+@@ -271,7 +334,7 @@ if Code.ensure_loaded?(Plug) do
+       opts = Keyword.put_new(opts, :token_type, "refresh")
+       key = fetch_token_key(conn, opts)
+ 
+-      case Guardian.encode_and_sign(mod, resource, claims, opts) do
++      case Guardian.encode_and_sign(mod, resource, claims, resolve_secret(conn, opts)) do
+         {:ok, token, new_claims} ->
+           put_resp_cookie(conn, key, token, cookie_options(mod, new_claims))
+ 
+@@ -280,6 +343,13 @@ if Code.ensure_loaded?(Plug) do
+       end
+     end
+ 
++    @doc """
++    Verifies `token` and sets a token of type refresh, exchanged from it, on a cookie.
++
++    A one argument `:secret` function is called once with the connection, and the
++    secret it returns is used both to verify `token` and to sign the new one. See
++    `resolve_secret/2`.
++    """
+     @spec remember_me_from_token(
+             Plug.Conn.t(),
+             module,
+@@ -291,8 +361,9 @@ if Code.ensure_loaded?(Plug) do
+       token_type = Keyword.get(opts, :token_type, "refresh")
+       key = fetch_token_key(conn, opts)
+ 
+-      with {:ok, claims} <- Guardian.decode_and_verify(mod, token, claims_to_check, opts),
+-           {:ok, _old, {new_t, full_new_c}} <- Guardian.exchange(mod, token, claims["typ"], token_type, opts) do
++      with token_opts <- resolve_secret(conn, opts),
++           {:ok, claims} <- Guardian.decode_and_verify(mod, token, claims_to_check, token_opts),
++           {:ok, _old, {new_t, full_new_c}} <- Guardian.exchange(mod, token, claims["typ"], token_type, token_opts) do
+         put_resp_cookie(conn, key, new_t, cookie_options(mod, full_new_c))
+       else
+         {:error, _} = err -> handle_unauthenticated(conn, err, opts)
+diff --git a/lib/guardian/plug/sliding_cookie.ex b/lib/guardian/plug/sliding_cookie.ex
+index ea6cfee..e99dd48 100644
+--- a/lib/guardian/plug/sliding_cookie.ex
++++ b/lib/guardian/plug/sliding_cookie.ex
+@@ -56,6 +56,17 @@ if Code.ensure_loaded?(Plug) do
+       will be issued. Defaults to configured values.
+     * `:halt` - Whether to halt the connection in case of error. Defaults to `true`.
+ 
++    Any other option is forwarded to `Guardian.decode_and_verify/4` and `Guardian.Plug.remember_me/5`,
++    and from there to the token module. For `Guardian.Token.Jwt` this includes:
++
++    * `secret` - The secret used to verify the current cookie and to sign its replacement,
++      overriding the implementation module's `:secret_key` configuration. Accepts a
++      `{module, function, args}` tuple, or a one argument function that receives the connection
++      and returns the secret. The function is called once, and only when a cookie token is
++      found. When the secret cannot be found (it is or resolves to `nil`), the cookie is not
++      verified and no replacement is issued. See `Guardian.Plug.resolve_secret/2` and
++      [Runtime secrets](plug-runtime-secrets.html).
++
+     The `:sliding_cookie` config (or plug option) should be the same format as `:ttl`, for example
+     `{1, :hour}`, and obviously it should be less than the prevailing `:ttl`.
+     """
+@@ -85,12 +96,13 @@ if Code.ensure_loaded?(Plug) do
+       with {:ok, token} <- find_token_from_cookies(conn, opts),
+            module <- Pipeline.fetch_module!(conn, opts),
+            {:ok, ttl_softlimit} <- sliding_window(module, opts),
+-           {:ok, %{"exp" => exp} = claims} <- decode_and_verify(module, token, %{}, opts),
++           token_opts <- Guardian.Plug.resolve_secret(conn, opts),
++           {:ok, %{"exp" => exp} = claims} <- decode_and_verify(module, token, %{}, token_opts),
+            {:ok, resource} <- module.resource_from_claims(claims),
+            true <- timestamp() >= exp - ttl_softlimit,
+            {:ok, new_c} <- module.sliding_cookie(claims, resource, opts) do
+         conn
+-        |> Guardian.Plug.remember_me(module, resource, proc_new_claims(new_c, claims), opts)
++        |> Guardian.Plug.remember_me(module, resource, proc_new_claims(new_c, claims), token_opts)
+       else
+         {:error, :not_implemented} ->
+           conn
+diff --git a/lib/guardian/plug/verify_cookie.ex b/lib/guardian/plug/verify_cookie.ex
+index 729794a..6ae17ee 100644
+--- a/lib/guardian/plug/verify_cookie.ex
++++ b/lib/guardian/plug/verify_cookie.ex
+@@ -82,8 +82,9 @@ if Code.ensure_loaded?(Plug) do
+            default_type <- module.default_token_type(),
+            exchange_to <- Keyword.get(opts, :exchange_to, default_type),
+            active_session? <- Guardian.Plug.session_active?(conn),
++           exchange_opts <- Guardian.Plug.resolve_secret(conn, opts),
+            {:ok, _old, {new_t, new_c}} <-
+-             Guardian.exchange(module, token, exchange_from, exchange_to, opts) do
++             Guardian.exchange(module, token, exchange_from, exchange_to, exchange_opts) do
+         conn
+         |> Guardian.Plug.put_current_token(new_t, key: key)
+         |> Guardian.Plug.put_current_claims(new_c, key: key)
+diff --git a/lib/guardian/plug/verify_header.ex b/lib/guardian/plug/verify_header.ex
+index 3fe88a0..cf908d9 100644
+--- a/lib/guardian/plug/verify_header.ex
++++ b/lib/guardian/plug/verify_header.ex
+@@ -38,6 +38,15 @@ if Code.ensure_loaded?(Plug) do
+     * `halt` - Whether to halt the connection in case of error. Defaults to `true`.
+     * `:refresh_from_cookie` - Looks for and validates a token found in the request cookies. (default `false`)
+ 
++    Any other option is forwarded to `Guardian.decode_and_verify/4`, and from there to the token
++    module. For `Guardian.Token.Jwt` this includes:
++
++    * `secret` - The secret used to verify the token, overriding the implementation module's
++      `:secret_key` configuration. Accepts any value resolvable by `Guardian.Config`, including
++      a `{module, function, args}` tuple, or a one argument function that receives the connection
++      and returns the secret. See `Guardian.Plug.resolve_secret/2` and
++      [Runtime secrets](plug-runtime-secrets.html).
++
+     Refresh from cookie option
+ 
+     * `:key` - The location of the token (default `:default`)
+@@ -89,7 +98,8 @@ if Code.ensure_loaded?(Plug) do
+            module <- Pipeline.fetch_module!(conn, opts),
+            claims_to_check <- Keyword.get(opts, :claims, %{}),
+            key <- storage_key(conn, opts),
+-           {:ok, claims} <- Guardian.decode_and_verify(module, token, claims_to_check, opts) do
++           verify_opts <- (try do Guardian.Plug.resolve_secret(conn, opts) rescue RuntimeError -> Keyword.put(opts, :secret, nil) end),
++           {:ok, claims} <- Guardian.decode_and_verify(module, token, claims_to_check, verify_opts) do
+         conn
+         |> Guardian.Plug.put_current_token(token, key: key)
+         |> Guardian.Plug.put_current_claims(claims, key: key)
+diff --git a/lib/guardian/plug/verify_session.ex b/lib/guardian/plug/verify_session.ex
+index 9260bed..6d7a12c 100644
+--- a/lib/guardian/plug/verify_session.ex
++++ b/lib/guardian/plug/verify_session.ex
+@@ -32,6 +32,15 @@ if Code.ensure_loaded?(Plug) do
+ 
+     * `:refresh_from_cookie` - Looks for and validates a token found in the request cookies. (default `false`)
+ 
++    Any other option is forwarded to `Guardian.decode_and_verify/4`, and from there to the token
++    module. For `Guardian.Token.Jwt` this includes:
++
++    * `secret` - The secret used to verify the token, overriding the implementation module's
++      `:secret_key` configuration. Accepts any value resolvable by `Guardian.Config`, including
++      a `{module, function, args}` tuple, or a one argument function that receives the connection
++      and returns the secret. See `Guardian.Plug.resolve_secret/2` and
++      [Runtime secrets](plug-runtime-secrets.html).
++
+     Refresh from cookie option
+ 
+     * `:key` - The location of the token (default `:default`)
+@@ -69,7 +78,8 @@ if Code.ensure_loaded?(Plug) do
+            module <- Pipeline.fetch_module!(conn, opts),
+            claims_to_check <- Keyword.get(opts, :claims, %{}),
+            key <- storage_key(conn, opts),
+-           {:ok, claims} <- Guardian.decode_and_verify(module, token, claims_to_check, opts) do
++           verify_opts <- Guardian.Plug.resolve_secret(conn, opts),
++           {:ok, claims} <- Guardian.decode_and_verify(module, token, claims_to_check, verify_opts) do
+         conn
+         |> Guardian.Plug.put_current_token(token, key: key)
+         |> Guardian.Plug.put_current_claims(claims, key: key)
+diff --git a/lib/guardian/token/jwt.ex b/lib/guardian/token/jwt.ex
+index dac5988..ff64392 100644
+--- a/lib/guardian/token/jwt.ex
++++ b/lib/guardian/token/jwt.ex
+@@ -40,6 +40,11 @@ defmodule Guardian.Token.Jwt do
+   * `token_type` - Override the default token type. The default is "access"
+   * `ttl` - The time to live. See `Guardian.Token.ttl` type
+ 
++  The `secret_key` configuration is only consulted when the `:secret` option is absent. Providing
++  `:secret` explicitly always wins, and a `:secret` that is (or resolves to) `nil` fails with
++  `{:error, :secret_not_found}` rather than falling back to `secret_key`. This keeps a failed
++  runtime lookup from silently verifying or signing with the application wide secret.
++
+   #### Example
+ 
+   ```elixir
+@@ -210,24 +215,25 @@ defmodule Guardian.Token.Jwt do
+     use Guardian.Token.Jwt.SecretFetcher
+ 
+     def fetch_signing_secret(mod, opts) do
+-      secret = Keyword.get(opts, :secret)
+-      secret = Config.resolve_value(secret) || apply(mod, :config, [:secret_key])
+-
+-      case secret do
++      case fetch_secret(mod, opts) do
+         nil -> {:error, :secret_not_found}
+         val -> {:ok, val}
+       end
+     end
+ 
+     def fetch_verifying_secret(mod, _token_headers, opts) do
+-      secret = Keyword.get(opts, :secret)
+-      secret = Config.resolve_value(secret) || mod.config(:secret_key)
+-
+-      case secret do
++      case fetch_secret(mod, opts) do
+         nil -> {:error, :secret_not_found}
+         val -> {:ok, val}
+       end
+     end
++
++    defp fetch_secret(mod, opts) do
++      case Keyword.fetch(opts, :secret) do
++        {:ok, secret} -> Config.resolve_value(secret)
++        :error -> mod.config(:secret_key)
++      end
++    end
+   end
+ 
+   @doc """
+@@ -332,6 +338,7 @@ defmodule Guardian.Token.Jwt do
+         {false, _, _} -> {:error, :invalid_token}
+       end
+     else
++      {:error, :secret_not_found} = error -> error
+       _ -> {:error, :invalid_token}
+     end
+   end
+diff --git a/mix.exs b/mix.exs
+index 72c7bb3..88d0a07 100644
+--- a/mix.exs
++++ b/mix.exs
+@@ -107,6 +107,10 @@ defmodule Guardian.Mixfile do
+         filename: "plug-pipelines",
+         title: "Pipelines"
+       ],
++      "guides/plug/runtime-secrets.md": [
++        filename: "plug-runtime-secrets",
++        title: "Runtime secrets"
++      ],
+       "guides/phoenix/start-phoenix.md": [
+         filename: "phoenix-start",
+         title: "Start"

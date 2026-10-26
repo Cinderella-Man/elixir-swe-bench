@@ -11,7 +11,7 @@
 **Feature spec**: The solver's ticket for a feature case. It records the decisions a clarifying interview would settle: behaviour, edge cases, scope, non-goals and the public interface, with no implementation recipe.
 _Avoid_: grilled ticket, requirements brief, minimal ticket
 
-**Curator extension**: Implementation and checks a curator adds beyond an upstream PR to make a coherent feature case. Provenance records it separately from the upstream change.
+**Curator extension**: Implementation and checks a curator adds beyond an upstream PR to make a coherent feature case, or to correct a reference that fails a requirement its ticket states. Provenance records it separately from the upstream change.
 _Avoid_: enrichment, synthetic PR
 
 **Reference solution**: An accepted upstream implementation used to qualify a case's checks. Submissions may use another implementation that satisfies the stated contract.
