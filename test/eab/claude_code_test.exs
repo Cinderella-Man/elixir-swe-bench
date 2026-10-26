@@ -243,6 +243,11 @@ defmodule Eab.ClaudeCodeTest do
       end
     end
 
+    dated = transcript(prompt, assistant("msg_2", [], 1, "claude-opus-5-5-20261001"))
+
+    assert Transcript.check!(dated, prompt, "claude-opus-5-5")["resolved_models"] ==
+             ~w(claude-opus-5-5 claude-opus-5-5-20261001)
+
     big = transcript(prompt, assistant("msg_2", [], 262_200))
     assert Transcript.check!(big, prompt, "claude-opus-5-5")["over_declared_budget"]
 

@@ -46,8 +46,10 @@ defmodule Eab.ClaudeCode.Transcript do
       for entry <- assistants, m = get_in(entry, ["message", "model"]), m != "<synthetic>", do: m
 
     if models == [], do: raise("The solver's resolved model cannot be read from its transcript")
+    # A dated snapshot of the pinned model is the same model; anything else is a mismatch.
+    pinned = ~r/\A#{Regex.escape(model)}(-\d{8})?\z/
 
-    unless Enum.all?(models, &(&1 == model)),
+    unless Enum.all?(models, &Regex.match?(pinned, &1)),
       do: raise("Solver used #{Enum.join(Enum.uniq(models), ", ")} instead of #{model}")
 
     versions = entries |> Enum.map(& &1["version"]) |> Enum.reject(&is_nil/1) |> Enum.uniq()
@@ -65,6 +67,7 @@ defmodule Eab.ClaudeCode.Transcript do
       "claude_code_version" => version,
       "agent_id" => Enum.find_value(entries, & &1["agentId"]),
       "model" => model,
+      "resolved_models" => Enum.uniq(models),
       "compactions" =>
         Enum.count(entries, &(&1["type"] == "system" and &1["subtype"] == "compact_boundary")),
       "attachments" =>

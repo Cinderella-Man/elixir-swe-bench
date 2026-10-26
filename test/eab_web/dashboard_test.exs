@@ -333,6 +333,56 @@ defmodule EabWeb.DashboardTest do
     assert render_async(view) =~ "Claude Haiku 5.5"
   end
 
+  test "Claude Code runs start on the website, can be validation runs and show the solver" do
+    parent = self()
+    old = Map.new([:runner, :cleanup], &{&1, Application.get_env(:eab, &1)})
+    Application.put_env(:eab, :cleanup, fn _ -> :ok end)
+
+    Application.put_env(:eab, :runner, fn run, _, _ ->
+      send(parent, {:started, run})
+
+      receive do
+        :finish -> :ok
+      end
+    end)
+
+    on_exit(fn ->
+      Eab.Runs.stop()
+
+      # Cleanup runs asynchronously; keep the stub until it has finished.
+      Enum.find(1..200, fn _ ->
+        snapshot = Eab.Runs.snapshot()
+        (is_nil(snapshot.active) and not snapshot.cleaning) || Process.sleep(10)
+      end)
+
+      for {k, v} <- old do
+        if v == nil, do: Application.delete_env(:eab, k), else: Application.put_env(:eab, k, v)
+      end
+    end)
+
+    {:ok, view, _} = live(build_conn(), "/")
+    view |> form("#provider-choice", provider: "claude_code") |> render_change()
+    assert has_element?(view, "#provider-panel[aria-label='Claude Code settings']")
+    assert has_element?(view, "#solver-status", "not connected yet")
+    assert has_element?(view, "#run[disabled]")
+    refute has_element?(view, "#case-timing-status")
+
+    view |> form("#claude-code-model-form", model: "claude-opus-5-5") |> render_change()
+    assert render(view) =~ "CLAUDE CODE"
+    assert has_element?(view, "#provider-panel dd", "eab-opus-5-5-xhigh")
+    view |> form("#validation-form", validation: "true") |> render_change()
+    assert has_element?(view, "#validation-run[checked]")
+
+    view |> element("#run") |> render_click()
+    assert_receive {:started, run}, 3000
+    assert run["validation"] == true and run["harness"]["name"] == "claude_code"
+    assert run["model"]["model"] == "claude-opus-5-5"
+    assert has_element?(view, "#run-harness", "Validation run, never published or scored")
+
+    view |> element("#run-series button", "Load run series") |> render_click()
+    assert has_element?(view, "#run-series")
+  end
+
   test "clearing an endpoint cancels pending discovery and cannot restore its stale model" do
     parent = self()
 

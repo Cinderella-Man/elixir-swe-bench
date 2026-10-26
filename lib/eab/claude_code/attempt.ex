@@ -193,7 +193,7 @@ defmodule Eab.ClaudeCode.Attempt do
       "claude_code" =>
         Map.take(
           summary,
-          ~w(claude_code_version agent_id compactions attachments over_declared_budget)
+          ~w(claude_code_version agent_id resolved_models compactions attachments over_declared_budget)
         )
         |> Map.put("agent_id", summary["agent_id"] || agent_id)
         |> Map.put("tool_calls", state.tools)

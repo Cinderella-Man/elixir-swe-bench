@@ -78,6 +78,41 @@ defmodule Eab.CheckpointsTest do
     end
   end
 
+  test "resume survives a benchmark code change but not a changed agent", %{run: run} do
+    # A release frozen by earlier benchmark code: same cases, fixtures and Pi.
+    older = put_in(run["protocol"], ["implementation"], String.duplicate("0", 64))
+    id = Eab.Cache.key(older)
+    File.cp_r!(Store.path("releases/#{run["release_id"]}"), Store.path("releases/#{id}"))
+
+    Store.write("releases/#{id}/manifest.json", %{"version" => 1, "id" => id, "protocol" => older})
+
+    resumed =
+      Map.merge(run, %{
+        "protocol" => older,
+        "release_id" => id,
+        "experiment_id" => Release.experiment(id, run["model"], run["settings"])
+      })
+
+    assert :ok = Checkpoints.validate_run!(resumed, run["model"], run["settings"])
+
+    agent = put_in(older, ["agent", "version"], "0.0.1")
+    id = Eab.Cache.key(agent)
+    File.cp_r!(Store.path("releases/#{run["release_id"]}"), Store.path("releases/#{id}"))
+
+    Store.write("releases/#{id}/manifest.json", %{"version" => 1, "id" => id, "protocol" => agent})
+
+    changed =
+      Map.merge(resumed, %{
+        "protocol" => agent,
+        "release_id" => id,
+        "experiment_id" => Release.experiment(id, run["model"], run["settings"])
+      })
+
+    assert_raise RuntimeError, ~r/cases or agent changed/, fn ->
+      Checkpoints.validate_run!(changed, run["model"], run["settings"])
+    end
+  end
+
   test "completed failure survives lost coordinator notification and detects changed evidence", %{
     run: run,
     id: id
