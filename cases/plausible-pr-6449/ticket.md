@@ -1,1 +1,0 @@
-Shared-link forms let me overwrite a link's secret URL or attach another site's segment. Keep the URL fixed when editing; on create and edit, save other valid changes with no segment when the selection is empty, invalid, nonexistent, or belongs to another site. Valid same-site selections must still work, including an already-linked segment later made personal.
