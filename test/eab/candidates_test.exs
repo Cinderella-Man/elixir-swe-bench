@@ -112,9 +112,28 @@ defmodule Eab.CandidatesTest do
     }
 
     path = "candidates/#{ref["id"]}/#{ref["version"]}/qualification.json"
-    Store.write(path, Map.put(proof, "checksum", Cache.key(proof)))
     destination = Path.join(root, "export")
+    stale = Map.put(proof, "grader", "earlier")
+    Store.write(path, Map.put(stale, "checksum", Cache.key(stale)))
+
+    assert_raise RuntimeError, ~r/current grader/, fn ->
+      Candidates.export(ref, destination)
+    end
+
+    Store.write(path, Map.put(proof, "checksum", Cache.key(proof)))
     Candidates.export(ref, destination)
+
+    assert :ok ==
+             Inventory.with_case(ref["id"], destination, fn ->
+               Candidates.verify_admission!(ref["id"])
+             end)
+
+    # A later grader change leaves the admitted grader as history only.
+    admission_path = Path.join(destination, "admission.json")
+    admission = Jason.decode!(File.read!(admission_path))
+    recorded = Map.put(admission["qualification"], "grader", "earlier") |> Map.delete("checksum")
+    recorded = Map.put(recorded, "checksum", Cache.key(recorded))
+    File.write!(admission_path, Jason.encode!(%{admission | "qualification" => recorded}))
 
     assert :ok ==
              Inventory.with_case(ref["id"], destination, fn ->

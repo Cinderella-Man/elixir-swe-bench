@@ -12,6 +12,17 @@ defmodule Eab.Fixtures do
     Store
   }
 
+  # An unpinned Hex install follows whatever is newest when an image is rebuilt.
+  @hex_version "2.5.3"
+
+  # Mix before Elixir 1.13 ignores `mix local.hex VERSION`, so those images install
+  # the same release directly. Checksums: https://builds.hex.pm/installs/hex-1.x.csv
+  @hex_builds %{
+    "1.12" =>
+      {"1.12.0",
+       "9a485c1739d61bb56072f388688ad5c754eada53df9050c109757dc0d6130688c089d84891281a21838a485ade0066921482487d1eb72732bbb0d641b884bef4"}
+  }
+
   def ensure(id, emit, opts \\ []) do
     Eab.Retention.with_use(fn -> do_ensure(id, emit, opts) end)
   end
@@ -276,6 +287,16 @@ defmodule Eab.Fixtures do
     List.first(info["RepoDigests"] || []) || raise "Image has no immutable digest"
   end
 
+  defp hex_install(image) do
+    with [_, minor] <- Regex.run(~r{elixir:(\d+\.\d+)\.}, image || ""),
+         {build, sha512} <- @hex_builds[minor] do
+      "mix archive.install https://builds.hex.pm/installs/#{build}/hex-#{@hex_version}.ez " <>
+        "--sha512 #{sha512} --force"
+    else
+      _ -> "mix local.hex #{@hex_version} --force"
+    end
+  end
+
   def dockerfile(spec, base, node \\ nil, opts \\ []) do
     runtime = spec["runtime"]
 
@@ -320,7 +341,7 @@ defmodule Eab.Fixtures do
           "USER agent"
         ] ++
         Enum.map(Enum.sort(env), fn {k, v} -> "ENV #{k}=#{Jason.encode!(v)}" end) ++
-        ["RUN mix local.hex --force && mix local.rebar --force"]
+        ["RUN #{hex_install(runtime["image"])} && mix local.rebar --force"]
 
     lines =
       if opts[:toolchain] do

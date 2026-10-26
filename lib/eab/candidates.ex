@@ -152,6 +152,10 @@ defmodule Eab.Candidates do
         raise("Candidate needs executable qualification")
 
     validate_evidence!(ref, review, proof)
+
+    unless proof["grader"] == Inventory.qualification_hash(),
+      do: raise("Admission needs qualification under the current grader")
+
     unless not File.exists?(destination), do: raise("Admission destination already exists")
     File.mkdir_p!(destination)
 
@@ -178,6 +182,8 @@ defmodule Eab.Candidates do
              files == proof["files"],
            do: raise("Admission does not match the case files")
 
+    # The recorded grader is history. Runs re-qualify every case under the
+    # current grader before any attempt, so grader changes never edit cases.
     validate_evidence!(ref, proof["review"], proof["qualification"])
     :ok
   end
@@ -191,9 +197,8 @@ defmodule Eab.Candidates do
              proof["checksum"] == Cache.key(Map.delete(proof, "checksum")) and
              get_in(proof, ["source", "verified"]) == true and
              get_in(proof, ["controls", "valid"]) == true and
-             proof["grader"] == Inventory.qualification_hash(),
-           do:
-             raise("Admission needs current, matching source, review and qualification evidence")
+             is_binary(proof["grader"]),
+           do: raise("Admission needs matching source, review and qualification evidence")
   end
 
   defp validate!(id) do
