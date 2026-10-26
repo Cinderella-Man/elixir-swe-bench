@@ -57,14 +57,16 @@ defmodule Eab.Release do
 
   # Boundaries check the relevant case, rather than rereading all fixtures for
   # every preparation/attempt/grading event. Start/end checks cover the corpus.
+  # Benchmark code may change between a run's start and its resumption (ADR 0011);
+  # its cases, fixtures and agent may not.
   def verify!(release, case_id \\ nil) do
     protocol = release["protocol"]
 
     unless Cache.key(protocol) == release["id"] and
-             protocol["inventory"] == Inventory.definition() and
-             protocol["implementation"] == Inventory.implementation_hash() and
+             Map.take(protocol["inventory"], ~w(id cases)) ==
+               Map.take(Inventory.definition(), ~w(id cases)) and
              protocol["agent"] == Eab.Pi.identity(),
-           do: raise("Benchmark implementation or release changed; start a new run")
+           do: raise("Benchmark cases or agent changed; start a new run")
 
     cases = if case_id, do: [case_id], else: protocol["inventory"]["cases"]
 

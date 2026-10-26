@@ -327,6 +327,73 @@ defmodule Eab.RunsTest do
     refute File.exists?(Store.path("runs/orphan/run.json"))
   end
 
+  test "Claude Code validation runs record their harness and are never publishable" do
+    parent = self()
+    Runs.subscribe()
+
+    Application.put_env(:eab, :runner, fn run, _, _ ->
+      send(parent, {:started, run})
+
+      # The first attempt's Claude Code version becomes the run's.
+      if run["harness"]["name"] == "claude_code",
+        do: File.write!(Store.path("runs/#{run["id"]}/claude-code-version.txt"), "2.1.308")
+
+      :ok
+    end)
+
+    endpoint = Eab.ClaudeCode.endpoint("claude-opus-5-5")
+    assert {:ok, id} = Runs.start(endpoint, "", %{}, validation: true)
+    assert_receive {:started, run}, 3000
+    assert run["validation"] == true
+    assert run["harness"]["name"] == "claude_code"
+    assert run["harness"]["agent"] == "eab-opus-5-5-xhigh"
+    assert run["settings"]["budget_policy"] == "declared_not_enforced"
+    assert run["code_versions"] == [run["protocol"]["implementation"]]
+    await_terminal(id)
+    await_cleanup()
+    saved = Store.run(id)
+    assert saved["harness"]["claude_code_version"] == "2.1.308"
+    assert File.read!(Store.path("runs/#{id}/report.md")) =~ "never published or scored"
+
+    assert_raise ArgumentError, ~r/never published/, fn ->
+      Eab.Results.export!(Map.put(saved, "status", "completed"))
+    end
+
+    assert {:ok, pi} = Runs.start(endpoint(), "", %{})
+    assert_receive {:started, run}, 3000
+    assert run["harness"]["name"] == "pi" and is_nil(run["validation"])
+    await_terminal(pi)
+  end
+
+  test "dry attempts and escape tests run one case, unscored and unpublishable" do
+    parent = self()
+    Runs.subscribe()
+
+    Application.put_env(:eab, :runner, fn run, _, _ ->
+      send(parent, {:started, run})
+      :ok
+    end)
+
+    endpoint = Eab.ClaudeCode.endpoint("claude-opus-5-5")
+    [first, second | _] = Eab.Inventory.all()
+
+    for {kind, id} <- [{"escape_test", first}, {"dry_attempt", second}] do
+      assert {:ok, run_id} = Runs.start(endpoint, "", %{}, check: {kind, id})
+      assert_receive {:started, run}, 3000
+      assert run["cases"] == [id] and run["validation"] == true
+      assert run["selection"] == %{"kind" => kind, "cases" => [id]}
+      assert :ok = Eab.Checkpoints.validate_run!(run, endpoint, run["settings"])
+      await_terminal(run_id)
+      await_cleanup()
+      assert Store.run(run_id)["score"]["score_percent"] == nil
+      assert File.read!(Store.path("runs/#{run_id}/report.md")) =~ "Unscored"
+    end
+
+    assert {:error, message} = Runs.start(endpoint(), "", %{}, check: {"escape_test", first})
+    assert message =~ "Claude Code"
+    assert {:error, _} = Runs.start(endpoint, "", %{}, check: {"dry_attempt", "unknown-case"})
+  end
+
   test "worker errors are saved without the API credential" do
     Application.put_env(:eab, :runner, fn _, _, _ -> raise "echoed secret-key" end)
     Runs.subscribe()

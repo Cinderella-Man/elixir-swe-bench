@@ -51,6 +51,7 @@ defmodule Eab.Report do
     - Model: #{escape(Eab.ModelIdentity.label(model))}
     - Model weights: #{Eab.ModelIdentity.size_label(model)}
     - Backend: #{model["backend"] || "Unknown"}
+    - Harness: #{Eab.Harness.label(run)}#{if run["validation"], do: "\n- Purpose: case validation run; never published or scored", else: ""}
     - Thinking: #{escape(Eab.Thinking.label(run["settings"]))}
     - Thinking source: #{get_in(run, ["settings", "reasoning_effort_source"]) || if(model["backend"] in ["openai_subscription", "anthropic"], do: "provider request", else: "not recorded")}
     - Release: #{run["release_id"] || "Historical protocol only"}
@@ -73,7 +74,7 @@ defmodule Eab.Report do
     #{Jason.encode!(run["settings"] || %{}, pretty: true)}
     ```
 
-    Case time covers Pi startup, model calls and tools through completion, excluding fixture preparation and independent grading. Missing timings are not reconstructed from logs.
+    Case time covers Pi startup, model calls and tools through completion, excluding fixture preparation and independent grading. Claude Code attempts store no timing. Missing timings are not reconstructed from logs.
 
     | Case | Result | Model calls | Case time | Explanation |
     | --- | --- | ---: | ---: | --- |
@@ -83,7 +84,7 @@ defmodule Eab.Report do
     | --- | --- | ---: | ---: | ---: |
     #{breakdowns}
 
-    Case directories contain command output, Pi transcripts, patches and grading evidence. Infrastructure errors are not scored as failed repairs.
+    Case directories contain command output, Pi or Claude Code transcripts, patches and grading evidence. Infrastructure errors are not scored as failed repairs.
 
     #{evidence}
     """)
@@ -94,6 +95,12 @@ defmodule Eab.Report do
 
   defp scope(%{"selection" => %{"kind" => "case_repeat", "source_run" => id}}),
     do: "Selected-case repeat of " <> id
+
+  defp scope(%{"selection" => %{"kind" => "dry_attempt", "cases" => [id]}}),
+    do: "Unscored dry attempt on " <> id
+
+  defp scope(%{"selection" => %{"kind" => "escape_test", "cases" => [id]}}),
+    do: "Unscored escape test in the workspace of " <> id
 
   defp scope(_), do: "Full inventory"
 

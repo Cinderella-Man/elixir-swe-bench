@@ -1,13 +1,29 @@
 defmodule Eab.Runs do
   use GenServer
-  alias Eab.{Checkpoints, MemoryMonitor, Model, Pipeline, Release, Runner, Sandbox, Store}
+
+  alias Eab.{
+    Checkpoints,
+    Inventory,
+    MemoryMonitor,
+    Model,
+    Pipeline,
+    Release,
+    Runner,
+    Sandbox,
+    Store
+  }
+
   @terminal ~w(completed error cancelled interrupted corrupt)
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   def subscribe, do: Phoenix.PubSub.subscribe(Eab.PubSub, "runs")
   def snapshot, do: GenServer.call(__MODULE__, :snapshot)
 
-  def start(endpoint, key, settings),
-    do: GenServer.call(__MODULE__, {:start, endpoint, key, settings}, 30_000)
+  @doc """
+  Starts a full run. `validation: true` marks an unpublishable case-validation run
+  (ADR 0012); `series: id` contributes to a published run series and must match its setup.
+  """
+  def start(endpoint, key, settings, opts \\ []),
+    do: GenServer.call(__MODULE__, {:start, endpoint, key, settings, opts}, 30_000)
 
   def resume(id, endpoint, key, settings),
     do: GenServer.call(__MODULE__, {:resume, id, endpoint, key, settings}, 30_000)
@@ -63,20 +79,39 @@ defmodule Eab.Runs do
          cleaning: state.cleanup != nil
        }, state}
 
-  def handle_call({:start, _, _, _}, _from, %{active: active} = state) when not is_nil(active),
-    do: {:reply, {:error, "A run is already active"}, state}
+  def handle_call({:start, _, _, _, _}, _from, %{active: active} = state)
+      when not is_nil(active),
+      do: {:reply, {:error, "A run is already active"}, state}
 
-  def handle_call({:start, _, _, _}, _from, %{cleanup: task} = state) when not is_nil(task),
+  def handle_call({:start, _, _, _, _}, _from, %{cleanup: task} = state) when not is_nil(task),
     do: {:reply, {:error, "Previous containers are still being cleaned up"}, state}
 
-  def handle_call({:start, _, _, _}, _from, %{cleanup_error: error} = state)
+  def handle_call({:start, _, _, _, _}, _from, %{cleanup_error: error} = state)
       when not is_nil(error),
       do: {:reply, {:error, "Container cleanup needs attention: #{error}"}, state}
 
-  def handle_call({:start, endpoint, key, settings}, _from, state) do
+  def handle_call({:start, endpoint, key, settings, opts}, _from, state) do
     release = Release.freeze()
     settings = Model.settings(endpoint, settings)
-    launch(new_run(release, endpoint, settings), key, state)
+    run = new_run(release, endpoint, settings)
+
+    run =
+      cond do
+        opts[:check] ->
+          check(run, endpoint, settings, release, opts[:check])
+
+        opts[:validation] ->
+          Map.put(run, "validation", true)
+
+        opts[:series] ->
+          Eab.Series.contribution!(run, opts[:series])
+          Map.put(run, "series", opts[:series])
+
+        true ->
+          run
+      end
+
+    launch(run, key, state)
   rescue
     error -> {:reply, {:error, Exception.message(error)}, state}
   end
@@ -134,6 +169,7 @@ defmodule Eab.Runs do
       new_run(release, endpoint, settings)
       |> Map.put("cases", cases)
       |> Map.put("selection", selection)
+      |> Map.put("validation", source["validation"] == true)
       |> Map.put("message", "Starting selected cases in a fresh partial run")
       |> Map.put(
         "experiment_id",
@@ -179,7 +215,9 @@ defmodule Eab.Runs do
         "case_phases" => Map.new(plan.retained, fn {id, result} -> {id, result["status"]} end),
         "case_messages" => %{},
         "cleanup_pending" => true,
-        "resume_count" => (run["resume_count"] || 0) + 1
+        "resume_count" => (run["resume_count"] || 0) + 1,
+        "code_versions" =>
+          Enum.uniq((run["code_versions"] || []) ++ [Inventory.implementation_hash()])
       })
 
     Store.event(id, %{
@@ -333,6 +371,24 @@ defmodule Eab.Runs do
     {"case_repeat", Enum.filter(source["cases"], &(&1 in cases))}
   end
 
+  # Dry attempts and escape tests run one case, are unscored and never published.
+  defp check(run, endpoint, settings, release, {kind, id}) do
+    unless kind in ["dry_attempt", "escape_test"] and id in run["cases"],
+      do: raise("Choose a case for the harness check")
+
+    if kind == "escape_test" and not Eab.ClaudeCode.harness?(endpoint),
+      do: raise("Escape tests are for the Claude Code harness")
+
+    selection = %{"kind" => kind, "cases" => [id]}
+
+    Map.merge(run, %{
+      "cases" => [id],
+      "selection" => selection,
+      "validation" => true,
+      "experiment_id" => Release.experiment(release["id"], endpoint, settings, selection)
+    })
+  end
+
   defp new_run(release, endpoint, settings) do
     id = DateTime.utc_now() |> Calendar.strftime("%Y%m%d-%H%M%S-")
     id = id <> Base.encode16(:crypto.strong_rand_bytes(4), case: :lower)
@@ -349,6 +405,8 @@ defmodule Eab.Runs do
       "protocol" => release["protocol"],
       "release_id" => release["id"],
       "experiment_id" => Release.experiment(release["id"], endpoint, settings),
+      "harness" => Eab.Harness.identity(endpoint),
+      "code_versions" => [release["protocol"]["implementation"]],
       "case_metadata" => Release.case_metadata(release),
       "attempts" => %{},
       "cleanup_pending" => true
@@ -424,11 +482,22 @@ defmodule Eab.Runs do
 
   defp persist(run) do
     run = if run["status"] in @terminal, do: finalize_attempts(run), else: run
+    run = claude_code_version(run)
     run = Map.put(run, "score", Runner.score(run))
     Store.write("runs/#{run["id"]}/run.json", run)
     Store.index_run(run)
     if run["status"] in @terminal, do: Eab.Report.write(run)
   end
+
+  # The first Claude Code attempt fixes the run's Claude Code version.
+  defp claude_code_version(%{"harness" => %{"name" => "claude_code"} = harness} = run) do
+    case Eab.ClaudeCode.Attempt.recorded_version(run["id"]) do
+      nil -> run
+      version -> Map.put(run, "harness", Map.put(harness, "claude_code_version", version))
+    end
+  end
+
+  defp claude_code_version(run), do: run
 
   defp finalize_attempts(run) do
     attempts =

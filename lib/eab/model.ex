@@ -99,6 +99,9 @@ defmodule Eab.Model do
   def settings(%{"backend" => "anthropic"} = endpoint, input),
     do: Eab.Anthropic.settings(endpoint, input)
 
+  def settings(%{"backend" => "claude_code"} = endpoint, input),
+    do: Eab.ClaudeCode.settings(endpoint, input)
+
   def settings(endpoint, input) do
     defaults = Eab.Inventory.definition()["defaults"]
 
@@ -216,6 +219,9 @@ defmodule Eab.Model do
 
   def unchanged!(%{"backend" => "anthropic"} = endpoint, key),
     do: Eab.Anthropic.unchanged!(endpoint, key)
+
+  def unchanged!(%{"backend" => "claude_code"} = endpoint, _key),
+    do: Eab.ClaudeCode.unchanged!(endpoint)
 
   def unchanged!(endpoint, key) do
     current = discover(endpoint["url"], key)

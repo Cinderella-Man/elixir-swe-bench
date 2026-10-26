@@ -81,9 +81,15 @@ defmodule Eab.ResultsTest do
     }
   end
 
+  defp entry(record), do: hd(record["runs"])
+
   test "public export uses exact artifact identity, outcomes and weight size, and omits private data" do
     result = Results.export!(run())
-    assert Enum.map(result["cases"], & &1["passed"]) == [true, false]
+    assert Enum.map(entry(result)["cases"], & &1["passed"]) == [true, false]
+    assert entry(result)["seed"] == 101 and result["seeds"] == [101, 102, 103]
+    refute Map.has_key?(result["settings"], "seed")
+    assert result["harness"] == %{"name" => "pi", "version" => "unknown"}
+    assert result["series_id"] == Eab.Series.id(run())
     assert result["model"]["name"] == "Swift-1.5-Qwen3.8-27B"
     assert result["model"]["quantization"] == "Q4_K_M"
     assert result["model"]["size_bytes"] == 17_431_404_544
@@ -93,7 +99,7 @@ defmodule Eab.ResultsTest do
         do: refute(Jason.encode!(result) =~ private)
   end
 
-  test "preserves tokens and case durations and rejects invalid durations" do
+  test "preserves tokens and model calls but publishes no timing" do
     source =
       run()
       |> put_in(["attempts", "case-a", "generated_tokens"], 1234)
@@ -102,12 +108,10 @@ defmodule Eab.ResultsTest do
         "attempt_ms" => 120_000
       })
 
-    [a, b] = Results.export!(source)["cases"]
+    [a, b] = entry(Results.export!(source))["cases"]
     assert a["generated_tokens"] == 1234 and a["model_calls"] == 12
-    assert a["measurement"]["attempt_ms"] == 120_000
-    assert b["measurement"] == nil and b["generated_tokens"] == nil
-    bad = put_in(source, ["attempts", "case-a", "measurement", "attempt_ms"], -1)
-    assert_raise ArgumentError, ~r/Invalid measured duration/, fn -> Results.export!(bad) end
+    assert b["generated_tokens"] == nil
+    refute Jason.encode!(Results.export!(source)) =~ "attempt_ms"
   end
 
   test "thinking presets survive public export without backfilling old runs" do
@@ -126,7 +130,7 @@ defmodule Eab.ResultsTest do
 
   test "snapshots must match artifact, backend and context" do
     source = put_in(run(), ["settings", "window_tokens"], 262_144)
-    assert Results.export!(source, resources: snapshot())["resources"] == snapshot()
+    assert entry(Results.export!(source, resources: snapshot()))["resources"] == snapshot()
 
     for {key, value} <- [
           {"context_tokens", 65536},
@@ -178,12 +182,12 @@ defmodule Eab.ResultsTest do
 
     source = run() |> put_in(["settings", "window_tokens"], 262_144) |> Map.put("memory", memory)
     result = Results.export!(source)
-    assert result["resources"]["peak_combined_bytes"] == 120
+    assert entry(result)["resources"]["peak_combined_bytes"] == 120
 
     for private <- ~w(private-machine private.service private-gpu),
         do: refute(Jason.encode!(result) =~ private)
 
-    assert Results.export!(put_in(source, ["memory", "status"], "partial"))["resources"][
+    assert entry(Results.export!(put_in(source, ["memory", "status"], "partial")))["resources"][
              "coverage"
            ] == "partial"
 
@@ -214,7 +218,7 @@ defmodule Eab.ResultsTest do
     result = Results.export!(source)
     assert result["model"]["size_bytes"] == 1234
     assert result["model"]["size_source"] == "artifact_files"
-    refute Map.has_key?(result["resources"], "weight_files")
+    refute Map.has_key?(entry(result)["resources"], "weight_files")
     assert Results.export!(source, size_bytes: 5678)["model"]["size_bytes"] == 5678
     assert Results.export!(source, size_bytes: 5678)["model"]["size_source"] == "owner_supplied"
 
@@ -230,6 +234,7 @@ defmodule Eab.ResultsTest do
       update_in(run(), ["attempts"], &Map.delete(&1, "case-b")),
       put_in(run(), ["attempts", "case-b", "grade"], %{}),
       Map.put(run(), "selection", %{"kind" => "case_repeat"}),
+      Map.put(run(), "validation", true),
       Map.put(run(), "cases", ["case-a"]),
       run()
       |> Map.put("cases", ~w(case-a case-a))
@@ -290,8 +295,9 @@ defmodule Eab.ResultsTest do
       end)
 
     result = Results.export!(source, inventory: inventory)
-    assert Enum.map(result["cases"], & &1["id"]) == inventory["cases"]
-    assert Enum.all?(result["cases"], & &1["passed"])
+    assert Enum.map(entry(result)["cases"], & &1["id"]) == inventory["cases"]
+    assert Enum.all?(entry(result)["cases"], & &1["passed"])
+    assert Map.keys(result["case_fixtures"]) == Enum.sort(inventory["cases"])
     refute Jason.encode!(result) =~ "retired-"
     assert source["cases"] == inventory["cases"] ++ ~w(retired-a retired-b)
 
@@ -310,17 +316,15 @@ defmodule Eab.ResultsTest do
   test "private records, unexpected settings and unsafe links are rejected" do
     assert_raise ArgumentError, fn -> Results.validate!(run()) end
 
-    for key <- ["resources", "evidence_url"] do
-      assert_raise ArgumentError, fn ->
-        Results.export!(run()) |> Map.put(key, false) |> Results.validate!()
-      end
+    assert_raise ArgumentError, fn ->
+      Results.export!(run()) |> Map.put("evidence_url", false) |> Results.validate!()
+    end
+
+    assert_raise ArgumentError, fn ->
+      Results.export!(run()) |> put_in(["runs", Access.at(0), "url"], "x") |> Results.validate!()
     end
 
     assert_raise ArgumentError, fn -> Results.export!(run(), resources: false) end
-
-    assert_raise ArgumentError, fn ->
-      put_in(run(), ["attempts", "case-a", "measurement"], false) |> Results.export!()
-    end
 
     assert_raise ArgumentError, fn ->
       Results.export!(run()) |> Map.put("account_id", "secret") |> Results.validate!()
@@ -339,15 +343,20 @@ defmodule Eab.ResultsTest do
     source = current()
     record = Results.export!(source, model_label: "<img src=x onerror=alert(1)>")
     Results.write!(Path.join(dir, "first.json"), record)
-    Results.write!(Path.join(dir, "second.json"), record)
-    assert_raise ArgumentError, ~r/Duplicate/, fn -> Results.load!(dir) end
-    File.rm!(Path.join(dir, "second.json"))
+    assert_raise ArgumentError, ~r/series ID/, fn -> Results.load!(dir) end
+    File.rm!(Path.join(dir, "first.json"))
+    Results.write!(Path.join(dir, record["series_id"] <> ".json"), record)
+    other = Map.put(record, "series_id", String.duplicate("c", 64))
+    Results.write!(Path.join(dir, other["series_id"] <> ".json"), other)
+    assert_raise ArgumentError, ~r/more than one series/, fn -> Results.load!(dir) end
+    File.rm!(Path.join(dir, other["series_id"] <> ".json"))
     output = Path.join(dir, "dist")
     Results.build!(Results.load!(dir), output)
     [built] = Results.read!(Path.join(output, "results.json"))["results"]
-    assert built["passed"] == length(source["cases"])
+    assert built["score_percent"] == 100.0 and built["run_count"] == 1
     assert built["total"] == length(source["cases"])
-    assert Enum.map(built["cases"], & &1["id"]) == source["cases"]
+    assert built["interval_percent"] == nil and built["missing_seeds"] == [102, 103]
+    assert Enum.map(entry(built)["cases"], & &1["id"]) == source["cases"]
     refute File.read!(Path.join(output, "results.js")) =~ "<img"
 
     assert Enum.sort(File.ls!(output)) ==
@@ -358,7 +367,7 @@ defmodule Eab.ResultsTest do
     altered =
       put_in(
         record,
-        ["case_fixtures", hd(record["cases"])["id"], "ticket.md"],
+        ["case_fixtures", hd(entry(record)["cases"])["id"], "ticket.md"],
         String.duplicate("b", 64)
       )
 
@@ -373,16 +382,17 @@ defmodule Eab.ResultsTest do
     page = page(dir)
     opts = [page_root: page, inventory: source["protocol"]["inventory"]]
     assert Results.publish!(source, opts) == :added
-    dest = Path.join([page, "results", source["id"] <> ".json"])
+    dest = Path.join([page, "results", Eab.Series.id(source) <> ".json"])
     record = Results.read!(dest)
-    assert record["run_id"] == source["id"]
+    assert entry(record)["run_id"] == source["id"]
     Results.write!(dest, Map.put(record, "note", "Reviewed note"))
     assert Results.publish!(source, opts) == :already_added
+    assert Results.added?(source["id"], page_root: page)
     [built] = Results.read!(Path.join(page, "dist/results.json"))["results"]
     assert built["note"] == "Reviewed note"
-    assert built["passed"] == length(source["cases"])
+    assert built["score_percent"] == 100.0
     assert built["total"] == length(source["cases"])
-    assert Enum.map(built["cases"], & &1["id"]) == source["cases"]
+    assert Enum.map(entry(built)["cases"], & &1["id"]) == source["cases"]
     refute Jason.encode!(built) =~ "private-host"
     refute Jason.encode!(built) =~ "private-account"
     refute Jason.encode!(built) =~ "private-trace"
@@ -395,15 +405,22 @@ defmodule Eab.ResultsTest do
   } do
     page = page(dir)
     source = current()
-    runs = [source, source, Map.put(source, "id", "second-run")]
+
+    second =
+      source
+      |> Map.merge(%{"id" => "second-run", "created_at" => "2026-10-18T12:00:00Z"})
+      |> put_in(["settings", "seed"], 102)
+
+    runs = [source, source, second]
 
     tasks =
       Enum.map(runs, fn run -> Task.async(fn -> Results.publish!(run, page_root: page) end) end)
 
     assert Enum.sort(Enum.map(tasks, &Task.await/1)) == [:added, :added, :already_added]
-    records = Results.read!(Path.join(page, "dist/results.json"))["results"]
-    assert Enum.sort(Enum.map(records, & &1["run_id"])) == ["second-run", "test-run"]
-    assert length(Path.wildcard(Path.join(page, "results/*.json"))) == 2
+    [series] = Results.read!(Path.join(page, "dist/results.json"))["results"]
+    assert Enum.map(series["runs"], & &1["run_id"]) == ["test-run", "second-run"]
+    assert series["run_count"] == 2 and series["missing_seeds"] == [103]
+    assert length(Path.wildcard(Path.join(page, "results/*.json"))) == 1
   end
 
   test "invalid runs and failed builds never leave a new public record", %{dir: dir} do
@@ -416,7 +433,7 @@ defmodule Eab.ResultsTest do
 
     File.rm!(Path.join(page, "app.js"))
     assert_raise File.Error, fn -> Results.publish!(source, page_root: page) end
-    refute File.exists?(Path.join(page, "results/test-run.json"))
+    assert Path.wildcard(Path.join(page, "results/*.json")) == []
     assert Path.wildcard(Path.join(page, ".publish-*")) == []
   end
 

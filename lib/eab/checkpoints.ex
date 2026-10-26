@@ -127,6 +127,10 @@ defmodule Eab.Checkpoints do
           Store.valid_id?(source) and is_list(cases) and cases != [] and
             Enum.filter(inventory, &(&1 in cases)) == cases
 
+        # Unscored single-case harness checks (ADR 0010).
+        %{"kind" => kind, "cases" => [id] = ^cases} when kind in ["dry_attempt", "escape_test"] ->
+          id in inventory
+
         _ ->
           false
       end

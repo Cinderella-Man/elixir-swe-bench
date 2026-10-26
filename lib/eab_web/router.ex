@@ -22,6 +22,19 @@ defmodule EabWeb.Router do
     plug(:put_root_layout, html: {EabWeb.Layouts, :root})
   end
 
+  pipeline :claude_code do
+    plug(:accepts, ["json"])
+  end
+
+  # Loopback-only solver kit endpoints; no session or CSRF token is involved.
+  scope "/claude-code", EabWeb do
+    pipe_through(:claude_code)
+    post("/mcp", ClaudeCodeController, :mcp)
+    get("/mcp", ClaudeCodeController, :mcp)
+    delete("/mcp", ClaudeCodeController, :mcp)
+    post("/hook", ClaudeCodeController, :hook)
+  end
+
   scope "/", EabWeb do
     pipe_through(:browser)
     get("/auth/chatgpt", ChatGPTController, :start)

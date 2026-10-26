@@ -93,12 +93,15 @@ defmodule Eab.Store do
 
   def index_run(run) do
     summary =
-      Map.take(run, ~w(id created_at status phase message model score release_id experiment_id))
+      Map.take(
+        run,
+        ~w(id created_at status phase message model score release_id experiment_id harness validation series)
+      )
       |> Map.put(
         "settings",
         Map.take(
           run["settings"] || %{},
-          ~w(reasoning_effort reasoning_effort_source thinking_policy)
+          ~w(reasoning_effort reasoning_effort_source thinking_policy seed)
         )
       )
 

@@ -1,6 +1,6 @@
 defmodule Mix.Tasks.Eab.Results do
   use Mix.Task
-  @shortdoc "Build, check, add or preview public benchmark results"
+  @shortdoc "Build, check, add or preview public run series"
   @moduledoc """
   mix eab.results build
   mix eab.results check
@@ -42,13 +42,13 @@ defmodule Mix.Tasks.Eab.Results do
 
         Mix.shell().info(
           if(status == :added,
-            do: "Added to results page",
+            do: "Added to its run series on the results page",
             else: "Already added; rebuilt results page"
           )
         )
 
       ["check"] ->
-        Mix.shell().info("Validated #{length(Eab.Results.load!())} results")
+        Mix.shell().info("Validated #{length(Eab.Results.load!())} run series")
 
       ["build"] ->
         build()
@@ -79,7 +79,7 @@ defmodule Mix.Tasks.Eab.Results do
   defp build do
     records = Eab.Results.load!()
     directory = Eab.Results.build!(records)
-    Mix.shell().info("Built #{directory}/index.html (#{length(records)} results)")
+    Mix.shell().info("Built #{directory}/index.html (#{length(records)} run series)")
     directory
   end
 

@@ -106,6 +106,9 @@ defmodule Eab.Evidence do
           {"error.txt", "Full evaluation error"},
           {"provider-error.json", "Provider error details"},
           {"pi-events.jsonl", "Pi trajectory"},
+          {"claude-transcript.jsonl", "Claude Code transcript"},
+          {"claude-tool-calls.jsonl", "Workspace tool calls"},
+          {"harness-prompt.md", "Harness prompt"},
           {"attempt.json", "Attempt and usage"},
           {"submission.json", "Saved submission receipt"},
           {"qualification.json", "Baseline qualification"},
@@ -124,7 +127,7 @@ defmodule Eab.Evidence do
     summary =
       Map.take(
         record,
-        ~w(case status calls generated_tokens stop_reason error generation experiment_id interrupted_stage measurement)
+        ~w(case status calls generated_tokens stop_reason error generation experiment_id interrupted_stage measurement usage claude_code escape_test)
       )
 
     summary = Map.put(summary, "verdict", verdict(record))

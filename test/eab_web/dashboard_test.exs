@@ -119,9 +119,9 @@ defmodule EabWeb.DashboardTest do
     [public] = Eab.Results.load!(Path.join(page, "results"))
     assert public == Eab.Results.export!(run, inventory: run["protocol"]["inventory"])
     [built] = Eab.Results.read!(Path.join(page, "dist/results.json"))["results"]
-    assert built["passed"] == length(run["cases"])
+    assert built["score_percent"] == 100.0 and built["run_count"] == 1
     assert built["total"] == length(run["cases"])
-    assert Enum.map(built["cases"], & &1["id"]) == run["cases"]
+    assert Enum.map(hd(built["runs"])["cases"], & &1["id"]) == run["cases"]
     assert built["model"]["quantization"] == "Q4_K_M"
     refute Jason.encode!(built) =~ "private-host"
 
@@ -174,7 +174,7 @@ defmodule EabWeb.DashboardTest do
     render_async(view)
     assert has_element?(view, "#result-publication-error", "Could not add result")
     assert has_element?(view, "#add-result:not([disabled])")
-    refute File.exists?(Path.join(page, "results/#{run["id"]}.json"))
+    assert Path.wildcard(Path.join(page, "results/*.json")) == []
     File.write!(Path.join(page, "app.js"), source)
     view |> element("#add-result") |> render_click()
     render_async(view)
@@ -331,6 +331,71 @@ defmodule EabWeb.DashboardTest do
     assert has_element?(view, "#connection")
     view |> form("#provider-choice", provider: "claude") |> render_change()
     assert render_async(view) =~ "Claude Haiku 5.5"
+  end
+
+  test "Claude Code runs start on the website, can be validation runs and show the solver" do
+    parent = self()
+    old = Map.new([:runner, :cleanup], &{&1, Application.get_env(:eab, &1)})
+    Application.put_env(:eab, :cleanup, fn _ -> :ok end)
+
+    Application.put_env(:eab, :runner, fn run, _, _ ->
+      send(parent, {:started, run})
+
+      receive do
+        :finish -> :ok
+      end
+    end)
+
+    on_exit(fn ->
+      Eab.Runs.stop()
+
+      # Cleanup runs asynchronously; keep the stub until it has finished.
+      Enum.find(1..200, fn _ ->
+        snapshot = Eab.Runs.snapshot()
+        (is_nil(snapshot.active) and not snapshot.cleaning) || Process.sleep(10)
+      end)
+
+      for {k, v} <- old do
+        if v == nil, do: Application.delete_env(:eab, k), else: Application.put_env(:eab, k, v)
+      end
+    end)
+
+    {:ok, view, _} = live(build_conn(), "/")
+    view |> form("#provider-choice", provider: "claude_code") |> render_change()
+    assert has_element?(view, "#provider-panel[aria-label='Claude Code settings']")
+    # The broker is application-wide; other tests may already have reported a kit.
+    assert has_element?(view, "#solver-status", "Solver")
+    assert has_element?(view, "#run[disabled]")
+    refute has_element?(view, "#case-timing-status")
+
+    view |> form("#claude-code-model-form", model: "claude-opus-5-5") |> render_change()
+    assert render(view) =~ "CLAUDE CODE"
+    assert has_element?(view, "#provider-panel dd", "eab-opus-5-5-xhigh")
+    view |> form("#validation-form", validation: "true") |> render_change()
+    assert has_element?(view, "#validation-run[checked]")
+
+    view |> element("#run") |> render_click()
+    assert_receive {:started, run}, 3000
+    assert run["validation"] == true and run["harness"]["name"] == "claude_code"
+    assert run["model"]["model"] == "claude-opus-5-5"
+    assert has_element?(view, "#run-harness", "Validation run, never published or scored")
+
+    view |> element("#run-series button", "Load run series") |> render_click()
+    assert has_element?(view, "#run-series")
+    Eab.Runs.stop()
+
+    Enum.find(1..200, fn _ ->
+      snapshot = Eab.Runs.snapshot()
+      (is_nil(snapshot.active) and not snapshot.cleaning) || Process.sleep(10)
+    end)
+
+    # An escape test runs the frozen probe in one case's workspace.
+    id = hd(Eab.Inventory.all())
+    view |> form("#claude-code-scope", scope: %{kind: "escape_test"}) |> render_change()
+    view |> form("#claude-code-scope", scope: %{kind: "escape_test", case: id}) |> render_change()
+    view |> element("#run") |> render_click()
+    assert_receive {:started, run}, 3000
+    assert run["selection"] == %{"kind" => "escape_test", "cases" => [id]}
   end
 
   test "clearing an endpoint cancels pending discovery and cannot restore its stale model" do
