@@ -34,6 +34,7 @@ defmodule Eab.Runner do
     pending = Enum.reject(run["cases"], &Map.has_key?(recovery.retained, &1))
 
     context = fn id, fun -> Activity.with_case(run["id"], id, key, fun) end
+    agent = Eab.Harness.agent(run)
 
     callbacks = %{
       baseline: fn id ->
@@ -59,7 +60,7 @@ defmodule Eab.Runner do
               id,
               run["id"],
               fn box ->
-                progress(emit, "warm", id, "Workspace ready for Pi")
+                progress(emit, "warm", id, "Workspace ready for #{agent}")
                 use.(box)
               end
             )
@@ -75,7 +76,7 @@ defmodule Eab.Runner do
               submission
 
             :error ->
-              progress(emit, "running", id, "Starting Pi for #{id}")
+              progress(emit, "running", id, "Starting #{agent} for #{id}")
 
               submit.(
                 id,

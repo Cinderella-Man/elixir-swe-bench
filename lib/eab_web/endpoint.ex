@@ -16,10 +16,12 @@ defmodule EabWeb.Endpoint do
   plug(Plug.Static, at: "/", from: :eab, only: ~w(assets))
   plug(Plug.RequestId)
 
+  # Solver transcripts arrive as JSON from the loopback Claude Code hook.
   plug(Plug.Parsers,
     parsers: [:urlencoded, :multipart, :json],
     pass: ["*/*"],
-    json_decoder: Jason
+    json_decoder: Jason,
+    length: 64_000_000
   )
 
   plug(Plug.MethodOverride)

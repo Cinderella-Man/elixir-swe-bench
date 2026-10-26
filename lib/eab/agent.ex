@@ -1,6 +1,17 @@
 defmodule Eab.Agent do
-  @moduledoc "Pi submission and independent grading, with durable handoff between them."
-  alias Eab.{Checkpoints, Evidence, Grader, Inventory, Model, Pi, Sandbox, Store, TaskContract}
+  @moduledoc "Harness submission and independent grading, with durable handoff between them."
+  alias Eab.{
+    Checkpoints,
+    ClaudeCode,
+    Evidence,
+    Grader,
+    Inventory,
+    Model,
+    Pi,
+    Sandbox,
+    Store,
+    TaskContract
+  }
 
   def attempt(id, run_id, endpoint, key, settings, control, emit) do
     submission =
@@ -17,22 +28,13 @@ defmodule Eab.Agent do
     prefix = "runs/#{run_id}/#{id}"
     spec = Inventory.spec(id)
     prompt = Inventory.file(id, "ticket.md")
-
-    instructions = """
-    #{TaskContract.instructions(spec)}
-    Dependencies are prepared. The workspace is offline. Preserve existing behavior and do not weaken tests.
-    #{if Eab.Browser.enabled?(spec), do: "Chromium and Playwright are preinstalled. Node tests can import process.env.EAB_BROWSER_MODULE. Bind any test web server to loopback and close browsers/servers after each suite.", else: ""}
-    Allowed edit prefixes: #{Enum.join(spec["allowed_edit_prefixes"], ", ")}.
-    When finished, give a short summary. Your current patch is then checked in a fresh workspace.
-    #{budget_instructions(settings)}
-    History is never compacted. If a budget is exhausted, the current patch is graded.
-    Task details: #{Jason.encode!(spec["clarifications"] || %{})}
-    """
+    instructions = instructions(spec, settings)
+    claude_code = ClaudeCode.harness?(endpoint)
 
     base = %{
       "case" => id,
       "settings" => settings,
-      "agent" => Pi.identity(),
+      "agent" => if(claude_code, do: ClaudeCode.identity(endpoint), else: Pi.identity()),
       "agent_image" => box.runtime["image"],
       "calls" => 0,
       "generated_tokens" => 0,
@@ -46,7 +48,20 @@ defmodule Eab.Agent do
 
     {record, patch} =
       try do
-        result = Pi.run(box, endpoint, key, settings, prefix, prompt, instructions, emit)
+        result =
+          if claude_code do
+            ClaudeCode.Attempt.run(
+              box,
+              endpoint,
+              key,
+              prefix,
+              ClaudeCode.prompt(instructions, prompt),
+              emit
+            )
+          else
+            Pi.run(box, endpoint, key, settings, prefix, prompt, instructions, emit)
+          end
+
         {Map.merge(base, result), Sandbox.patch(box)}
       after
         try do
@@ -57,6 +72,20 @@ defmodule Eab.Agent do
       end
 
     Checkpoints.submit(run_id, id, record, patch, key)
+  end
+
+  @doc "Pi's exact task instructions; the Claude Code harness sends the same text."
+  def instructions(spec, settings) do
+    """
+    #{TaskContract.instructions(spec)}
+    Dependencies are prepared. The workspace is offline. Preserve existing behavior and do not weaken tests.
+    #{if Eab.Browser.enabled?(spec), do: "Chromium and Playwright are preinstalled. Node tests can import process.env.EAB_BROWSER_MODULE. Bind any test web server to loopback and close browsers/servers after each suite.", else: ""}
+    Allowed edit prefixes: #{Enum.join(spec["allowed_edit_prefixes"], ", ")}.
+    When finished, give a short summary. Your current patch is then checked in a fresh workspace.
+    #{budget_instructions(settings)}
+    History is never compacted. If a budget is exhausted, the current patch is graded.
+    Task details: #{Jason.encode!(spec["clarifications"] || %{})}
+    """
   end
 
   def grade(id, run_id, {record, patch}, endpoint, key, control, emit) do
@@ -87,7 +116,9 @@ defmodule Eab.Agent do
     record
   end
 
-  defp budget_instructions(%{"budget_policy" => "response_boundary_soft_limit"} = settings) do
+  # The Claude Code harness declares the same subscription sentence without enforcing it.
+  defp budget_instructions(%{"budget_policy" => policy} = settings)
+       when policy in ["response_boundary_soft_limit", "declared_not_enforced"] do
     "Model and tool calls are unlimited. Stop after #{settings["max_tokens"]} generated tokens total, checked between complete responses. A response can exceed the remaining threshold. Context and per-response limits are enforced by the provider."
   end
 

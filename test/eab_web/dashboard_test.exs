@@ -119,9 +119,9 @@ defmodule EabWeb.DashboardTest do
     [public] = Eab.Results.load!(Path.join(page, "results"))
     assert public == Eab.Results.export!(run, inventory: run["protocol"]["inventory"])
     [built] = Eab.Results.read!(Path.join(page, "dist/results.json"))["results"]
-    assert built["passed"] == length(run["cases"])
+    assert built["score_percent"] == 100.0 and built["run_count"] == 1
     assert built["total"] == length(run["cases"])
-    assert Enum.map(built["cases"], & &1["id"]) == run["cases"]
+    assert Enum.map(hd(built["runs"])["cases"], & &1["id"]) == run["cases"]
     assert built["model"]["quantization"] == "Q4_K_M"
     refute Jason.encode!(built) =~ "private-host"
 
@@ -174,7 +174,7 @@ defmodule EabWeb.DashboardTest do
     render_async(view)
     assert has_element?(view, "#result-publication-error", "Could not add result")
     assert has_element?(view, "#add-result:not([disabled])")
-    refute File.exists?(Path.join(page, "results/#{run["id"]}.json"))
+    assert Path.wildcard(Path.join(page, "results/*.json")) == []
     File.write!(Path.join(page, "app.js"), source)
     view |> element("#add-result") |> render_click()
     render_async(view)

@@ -45,7 +45,7 @@ defmodule Eab.InventoryTest do
     end
 
     assert Inventory.all() == []
-    assert_raise RuntimeError, ~r/release changed/, fn -> Release.verify!(release) end
+    assert_raise RuntimeError, ~r/cases or agent changed/, fn -> Release.verify!(release) end
     assert_raise RuntimeError, ~r/Invalid release case inventory/, fn -> Release.freeze() end
 
     for id <- ["existing-case", "new-case"] do

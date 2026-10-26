@@ -1,23 +1,22 @@
 defmodule Eab.Results.Schema do
   @moduledoc false
-  @fields ~w(schema_version run_id created_at model benchmark source_release_id settings cases case_fixtures resources evidence_url note)
+  @fields ~w(schema_version series_id benchmark model harness settings setup case_fixtures seeds required_runs runs evidence_url note)
+  @run_fields ~w(run_id created_at seed source_release_id code_version deployment cases resources)
   @model_fields ~w(name backend quantization quantization_source size_bytes size_source parameter_count)
-  @nullable_int ~w(window_tokens response_tokens seed)
+  @nullable_int ~w(window_tokens response_tokens)
   @integer ~w(safety_tokens max_tokens)
   @text ~w(budget_policy context_policy reasoning_effort reasoning_effort_source thinking_policy)
+  @thinking %{
+    "server_preset" => ~w(server_reported operator_declared not_reported),
+    "provider_request" => ~w(provider_request),
+    "harness_agent_file" => ~w(harness_agent_file)
+  }
 
   def validate!(r) do
-    fields!(r, @fields, "Expected a public v4 result; export the original run.json with add")
-    require!(r["schema_version"] === 4, "Unsupported result schema")
-    require!(Regex.match?(~r/^[A-Za-z0-9_-]+$/, text!(r["run_id"], "run_id")), "Invalid run ID")
-    date!(r["created_at"])
+    fields!(r, @fields, "Expected a public v5 run series; export the original run.json with add")
+    require!(r["schema_version"] === 5, "Unsupported result schema")
+    hex!(r["series_id"], "A series ID is required")
     text!(r["benchmark"], "benchmark")
-
-    require!(
-      is_binary(r["source_release_id"]) and
-        Regex.match?(~r/^[a-f0-9]{64}$/, r["source_release_id"]),
-      "A frozen source release ID is required"
-    )
 
     model = r["model"]
     fields!(model, @model_fields, "Unexpected model fields")
@@ -49,6 +48,8 @@ defmodule Eab.Results.Schema do
       "Size and its source must agree"
     )
 
+    harness!(r["harness"])
+
     settings = r["settings"]
     require!(is_map(settings) and map_size(settings) > 0, "Effective settings are required")
 
@@ -66,13 +67,10 @@ defmodule Eab.Results.Schema do
     end)
 
     if Map.has_key?(settings, "thinking_policy") do
-      require!(settings["thinking_policy"] == "server_preset", "Invalid thinking policy")
+      sources = @thinking[settings["thinking_policy"]]
+      require!(is_list(sources), "Invalid thinking policy")
       text!(settings["reasoning_effort"], "reasoning_effort")
-
-      require!(
-        settings["reasoning_effort_source"] in ~w(server_reported operator_declared not_reported),
-        "Invalid thinking source"
-      )
+      require!(settings["reasoning_effort_source"] in sources, "Invalid thinking source")
 
       if settings["reasoning_effort_source"] == "not_reported",
         do:
@@ -82,30 +80,72 @@ defmodule Eab.Results.Schema do
           )
     end
 
-    cases = r["cases"]
-    require!(is_list(cases) and cases != [], "At least one case is required")
+    require!(is_map(r["setup"]) and map_size(r["setup"]) > 0, "The series setup is required")
+    require!(r["required_runs"] === 3, "A run series has three runs")
 
-    for c <- cases do
-      fields!(c, ~w(id passed generated_tokens model_calls measurement), "Unexpected case fields")
-      text!(c["id"], "case.id")
-      require!(is_boolean(c["passed"]), "Every case needs a final pass/fail outcome")
+    require!(
+      is_nil(r["seeds"]) or r["seeds"] == [101, 102, 103],
+      "Local series use seeds 101, 102 and 103"
+    )
 
-      for key <- ~w(generated_tokens model_calls),
-          do:
-            require!(
-              is_nil(c[key]) or nonnegative?(c[key]),
-              "#{key} must be a nonnegative integer or null"
-            )
+    runs = r["runs"]
+    require!(is_list(runs) and length(runs) in 1..3, "A series holds one to three runs")
+    ids = Enum.map(hd(runs)["cases"] || [], & &1["id"])
+    require!(ids != [] and Enum.uniq(ids) == ids, "Invalid or duplicated case IDs")
 
-      if not is_nil(c["measurement"]) do
-        m = c["measurement"]
-        fields!(m, ~w(attempt_ms), "Unexpected measurement fields")
-        require!(nonnegative?(m["attempt_ms"]), "Invalid measured duration")
+    for run <- runs do
+      fields!(run, @run_fields, "Unexpected run fields")
+
+      require!(
+        Regex.match?(~r/^[A-Za-z0-9_-]+$/, text!(run["run_id"], "run_id")),
+        "Invalid run ID"
+      )
+
+      date!(run["created_at"])
+      hex!(run["source_release_id"], "A frozen source release ID is required")
+      require!(is_nil(run["code_version"]) or hex?(run["code_version"]), "Invalid code version")
+
+      if r["seeds"],
+        do: require!(run["seed"] in r["seeds"], "Each run needs one of the series seeds"),
+        else: require!(is_nil(run["seed"]), "This series records no seed")
+
+      fields!(run["deployment"], ~w(server_build total_slots), "Unexpected deployment fields")
+
+      require!(
+        is_nil(run["deployment"]["server_build"]) or is_binary(run["deployment"]["server_build"]),
+        "Invalid server build"
+      )
+
+      require!(
+        is_nil(run["deployment"]["total_slots"]) or positive?(run["deployment"]["total_slots"]),
+        "Invalid slot count"
+      )
+
+      require!(is_list(run["cases"]), "Missing case outcomes")
+      require!(Enum.map(run["cases"], & &1["id"]) == ids, "Every run must list the same cases")
+
+      for c <- run["cases"] do
+        fields!(c, ~w(id passed generated_tokens model_calls), "Unexpected case fields")
+        require!(is_boolean(c["passed"]), "Every case needs a final pass/fail outcome")
+
+        for key <- ~w(generated_tokens model_calls),
+            do:
+              require!(
+                is_nil(c[key]) or nonnegative?(c[key]),
+                "#{key} must be a nonnegative integer or null"
+              )
       end
+
+      if not is_nil(run["resources"]),
+        do: Eab.Results.Resources.validate!(run["resources"], model, settings)
     end
 
-    ids = Enum.map(cases, & &1["id"])
-    require!(Enum.uniq(ids) == ids, "Duplicate case IDs")
+    run_ids = Enum.map(runs, & &1["run_id"])
+    require!(Enum.uniq(run_ids) == run_ids, "Duplicate run IDs")
+    seeds = Enum.map(runs, & &1["seed"])
+    require!(is_nil(r["seeds"]) or Enum.uniq(seeds) == seeds, "Each seed counts once")
+    require!(Enum.sort_by(runs, & &1["created_at"]) == runs, "Runs are listed oldest first")
+
     fields!(r["case_fixtures"], ids, "Case fixture identities are required")
 
     for files <- Map.values(r["case_fixtures"]) do
@@ -113,17 +153,13 @@ defmodule Eab.Results.Schema do
 
       Enum.each(files, fn {name, digest} ->
         require!(
-          is_binary(name) and Path.basename(name) == name and is_binary(digest) and
-            Regex.match?(~r/^[a-f0-9]{64}$/, digest),
+          is_binary(name) and Path.basename(name) == name and hex?(digest),
           "Invalid fixture identity"
         )
       end)
     end
 
     require!(is_binary(r["note"]), "note must be text")
-
-    if not is_nil(r["resources"]),
-      do: Eab.Results.Resources.validate!(r["resources"], model, settings)
 
     if not is_nil(r["evidence_url"]) do
       url = r["evidence_url"]
@@ -138,6 +174,27 @@ defmodule Eab.Results.Schema do
 
     r
   end
+
+  defp harness!(%{"name" => "pi"} = harness) do
+    fields!(harness, ~w(name version), "Unexpected harness fields")
+    text!(harness["version"], "harness version")
+  end
+
+  defp harness!(%{"name" => "claude_code"} = harness) do
+    fields!(
+      harness,
+      ~w(name version agent kit_sha256 preamble_sha256),
+      "Unexpected harness fields"
+    )
+
+    for key <- ~w(version agent), do: text!(harness[key], "harness #{key}")
+    for key <- ~w(kit_sha256 preamble_sha256), do: hex!(harness[key], "Invalid #{key}")
+  end
+
+  defp harness!(_), do: raise(ArgumentError, "Unknown harness")
+
+  defp hex?(value), do: is_binary(value) and Regex.match?(~r/^[a-f0-9]{64}$/, value)
+  defp hex!(value, message), do: require!(hex?(value), message)
 
   def fields!(value, names, message),
     do: require!(is_map(value) and Enum.sort(Map.keys(value)) == Enum.sort(names), message)

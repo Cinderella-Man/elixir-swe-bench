@@ -13,7 +13,10 @@ defmodule Eab.Comparison do
     identities = Enum.map(runs, &identity/1) |> Enum.uniq()
 
     unless length(runs) in 2..30 and length(identities) == 1,
-      do: raise("Comparison requires the same frozen release, case order and effective settings")
+      do:
+        raise(
+          "Comparison requires the same cases, fixtures and effective settings apart from seed"
+        )
 
     [first | _] = runs
 
@@ -26,6 +29,8 @@ defmodule Eab.Comparison do
             "id" => run["id"],
             "model" => Eab.ModelIdentity.label(run["model"]),
             "backend" => get_in(run, ["model", "backend"]),
+            "harness" => Eab.Harness.label(run),
+            "seed" => get_in(run, ["settings", "seed"]),
             "status" => run["status"],
             "score" => Runner.score(run)
           }
@@ -37,12 +42,18 @@ defmodule Eab.Comparison do
     }
   end
 
+  # Runs of one series may differ in seed and benchmark code version (ADR 0011), so the
+  # frozen cases and their fixture files stand in for the release identity.
   defp identity(run) do
     unless is_binary(run["release_id"]) and is_map(run["settings"]) and is_list(run["cases"]) and
              run["cases"] != [],
            do: raise("Legacy or corrupt runs without a frozen release cannot join a comparison")
 
-    Map.take(run, ~w(release_id cases settings))
+    %{
+      "cases" => run["cases"],
+      "fixtures" => Map.take(get_in(run, ["protocol", "fixtures"]) || %{}, run["cases"]),
+      "settings" => Map.delete(run["settings"], "seed")
+    }
   end
 
   defp outcome(%{"status" => "completed", "grade" => %{"passed" => true}}), do: "Passed"

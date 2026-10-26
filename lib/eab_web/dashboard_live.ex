@@ -2,6 +2,7 @@ defmodule EabWeb.DashboardLive do
   use Phoenix.LiveView
 
   alias Eab.{
+    ClaudeCode,
     Comparison,
     Evidence,
     Inventory,
@@ -10,9 +11,12 @@ defmodule EabWeb.DashboardLive do
     Retention,
     Runner,
     Runs,
+    Series,
     Storage,
     Store
   }
+
+  alias Eab.ClaudeCode.Broker
 
   @defaults %{
     "window_tokens" => "",
@@ -47,8 +51,15 @@ defmodule EabWeb.DashboardLive do
         saved_settings: %{
           "local" => @defaults,
           "chatgpt" => subscription_defaults(),
-          "claude" => claude_defaults()
+          "claude" => claude_defaults(),
+          "claude_code" => %{}
         },
+        validation: false,
+        solver: Broker.status(),
+        contribution: nil,
+        series: nil,
+        published_series: [],
+        series_error: nil,
         error: Phoenix.Flash.get(socket.assigns.flash, :error),
         detecting: false,
         selected: selected,
@@ -111,6 +122,14 @@ defmodule EabWeb.DashboardLive do
      |> switch_provider("claude")
      |> assign(url: "https://api.anthropic.com", key: socket.assigns.claude_key)
      |> discover_claude()}
+  end
+
+  def handle_event("provider", %{"provider" => "claude_code"}, socket) do
+    {:noreply,
+     socket
+     |> cancel_async(:discovery)
+     |> switch_provider("claude_code")
+     |> assign(url: "", key: "", models: [], endpoint: nil, detecting: false, error: nil)}
   end
 
   def handle_event("provider", %{"provider" => "local"}, socket) do
@@ -183,6 +202,65 @@ defmodule EabWeb.DashboardLive do
      )}
   end
 
+  def handle_event("claude_code_model", %{"model" => model}, socket) do
+    endpoint =
+      if Enum.any?(ClaudeCode.profiles(), &(&1["model"] == model)),
+        do: ClaudeCode.endpoint(model)
+
+    {:noreply, assign(socket, endpoint: endpoint)}
+  end
+
+  def handle_event("validation", params, socket),
+    do: {:noreply, assign(socket, validation: params["validation"] == "true")}
+
+  def handle_event("release_pause", _, socket) do
+    Broker.release_pause()
+    {:noreply, assign(socket, solver: Broker.status())}
+  end
+
+  def handle_event("series", _, socket) do
+    {series, error} =
+      try do
+        {Series.group(Store.runs()), nil}
+      rescue
+        error -> {[], Exception.message(error)}
+      end
+
+    {published, error} =
+      try do
+        {Enum.map(Results.load!(), &Results.aggregate/1), error}
+      rescue
+        problem -> {[], error || Exception.message(problem)}
+      end
+
+    {:noreply, assign(socket, series: series, published_series: published, series_error: error)}
+  end
+
+  def handle_event("contribute", %{"id" => id}, socket) do
+    case Enum.find(socket.assigns.published_series, &(&1["series_id"] == id)) do
+      nil ->
+        {:noreply, socket}
+
+      series ->
+        settings =
+          series["settings"]
+          |> Map.take(~w(window_tokens response_tokens max_tokens reasoning_effort))
+          |> Map.reject(fn {_, value} -> is_nil(value) end)
+          |> Map.new(fn {key, value} -> {key, to_string(value)} end)
+          |> Map.put("seed", to_string(List.first(series["missing_seeds"]) || ""))
+
+        {:noreply,
+         assign(socket,
+           contribution: series,
+           settings: Map.merge(socket.assigns.settings, settings),
+           validation: false
+         )}
+    end
+  end
+
+  def handle_event("cancel_contribution", _, socket),
+    do: {:noreply, assign(socket, contribution: nil)}
+
   def handle_event("chatgpt_account", %{"account" => id}, socket) do
     Eab.ChatGPTAuth.retry_requests(id)
     {:noreply, discover_chatgpt(assign(socket, account: id, endpoint: nil))}
@@ -225,7 +303,12 @@ defmodule EabWeb.DashboardLive do
     do: {:noreply, assign(socket, error: "Connect to a model first")}
 
   def handle_event("run", _, socket) do
-    case Runs.start(socket.assigns.endpoint, socket.assigns.key, socket.assigns.settings) do
+    opts = [
+      validation: socket.assigns.validation and socket.assigns.provider == "claude_code",
+      series: socket.assigns.contribution && socket.assigns.contribution["series_id"]
+    ]
+
+    case Runs.start(socket.assigns.endpoint, socket.assigns.key, socket.assigns.settings, opts) do
       {:ok, id} ->
         {:noreply, refresh(assign(socket, selected: id, selected_case: nil, error: nil))}
 
@@ -531,7 +614,8 @@ defmodule EabWeb.DashboardLive do
       selected: selected,
       selected_run: if(selected && Store.valid_id?(selected), do: Store.run(selected)),
       history_page: Store.run_page(socket.assigns.history_offset),
-      cache_status: Retention.status()
+      cache_status: Retention.status(),
+      solver: Broker.status()
     )
     |> load_log()
   end
@@ -607,8 +691,8 @@ defmodule EabWeb.DashboardLive do
         "qualifying" -> "Qualifying baseline"
         "ready" -> "Image ready"
         "warming" -> "Starting workspace"
-        "warm" -> "Ready for Pi"
-        "running" -> "Pi running"
+        "warm" -> "Ready for #{Eab.Harness.agent(run)}"
+        "running" -> "#{Eab.Harness.agent(run)} running"
         "submitted" -> "Waiting for grading"
         "grading" -> "Grading submission"
         _ -> outcome(run["attempts"][id])
@@ -768,6 +852,28 @@ defmodule EabWeb.DashboardLive do
                   </svg>
                   <span>Claude</span>
                 </label>
+                <label
+                  class={["provider-option", @provider == "claude_code" && "is-selected"]}
+                  title="Claude Code: use your Claude subscription through the solver kit"
+                >
+                  <input
+                    type="radio"
+                    name="provider"
+                    value="claude_code"
+                    checked={@provider == "claude_code"}
+                  />
+                  <svg
+                    aria-hidden="true"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.6"
+                    stroke-linecap="round"
+                  >
+                    <path d="m8 8-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14" />
+                  </svg>
+                  <span>Claude Code</span>
+                </label>
               </div>
             </fieldset>
           </form>
@@ -779,6 +885,7 @@ defmodule EabWeb.DashboardLive do
               case @provider do
                 "chatgpt" -> "ChatGPT settings"
                 "claude" -> "Claude settings"
+                "claude_code" -> "Claude Code settings"
                 _ -> "Local server settings"
               end
             }
@@ -851,6 +958,61 @@ defmodule EabWeb.DashboardLive do
                 </select>
               </form>
             </div>
+            <div
+              :if={@provider == "claude_code"}
+              class="chatgpt-connection"
+              id="claude-code-connection"
+            >
+              <p class="muted">
+                Claude models on your Claude subscription, attempting cases as locked-down Claude Code subagents. The run waits here until the solver session drives it.
+              </p>
+              <form id="claude-code-model-form" phx-change="claude_code_model">
+                <label for="claude-code-model">Model</label>
+                <select id="claude-code-model" name="model">
+                  <option value="" selected={is_nil(@endpoint)}>Choose a model</option>
+                  <option
+                    :for={profile <- ClaudeCode.profiles()}
+                    value={profile["model"]}
+                    selected={@endpoint && @endpoint["model"] == profile["model"]}
+                  >
+                    {profile["name"]} · {profile["effort"]} effort
+                  </option>
+                </select>
+              </form>
+              <form id="validation-form" phx-change="validation">
+                <label class="run-choice">
+                  <input type="hidden" name="validation" value="false" />
+                  <input
+                    id="validation-run"
+                    type="checkbox"
+                    name="validation"
+                    value="true"
+                    checked={@validation}
+                    disabled={not is_nil(@contribution)}
+                  /> Validation run · decides which cases stay; never published or scored
+                </label>
+              </form>
+              <ol class="fine-print">
+                <li>Install the kit: <code>scripts/install-claude-code-kit.sh ~/eab-solver</code></li>
+                <li>Open that folder in a new Claude desktop Code session and trust it.</li>
+                <li>Start the run here, then type <code>/solve-run</code> in that session.</li>
+              </ol>
+              <div id="solver-status" class="model-card" role="status">
+                <p :if={is_nil(@solver.kit)}>Solver session: not connected yet.</p>
+                <p :if={@solver.kit && @solver.kit["problems"] == []}>
+                  Solver kit: matches this controller.
+                </p>
+                <p :if={@solver.kit && @solver.kit["problems"] != []} class="notice error">
+                  Solver kit differs: {Enum.join(@solver.kit["problems"], "; ")}. Reinstall it.
+                </p>
+                <p :if={@solver.waiting}>Workspace ready for the solver: {@solver.waiting}</p>
+                <p :if={@solver.active}>Solver working on: {@solver.active}</p>
+                <div :if={@solver.pause} class="notice error">
+                  {@solver.pause}
+                  <button class="secondary" phx-click="release_pause">Release usage-limit pause</button>
+                </div>
+              </div>
+            </div>
             <div :if={@provider == "chatgpt"} class="chatgpt-connection" id="chatgpt-connection">
               <p class="muted">Sign in to choose a model available to your ChatGPT account.</p>
               <form :if={@accounts != []} id="chatgpt-account-form" phx-change="chatgpt_account">
@@ -902,10 +1064,24 @@ defmodule EabWeb.DashboardLive do
               <span class="badge">CONNECTED · {case @endpoint["backend"] do
                 "openai_subscription" -> "CHATGPT"
                 "anthropic" -> "CLAUDE API"
+                "claude_code" -> "CLAUDE CODE"
                 "strata" -> "STRATA"
                 _ -> "LLAMA.CPP"
               end}</span>
               <h3>{Eab.ModelIdentity.label(@endpoint)}</h3>
+              <dl :if={@provider == "claude_code"}>
+                <div>
+                  <dt>Model ID</dt><dd>{@endpoint["model"]}</dd>
+                </div><div>
+                  <dt>Solver agent</dt><dd>{@endpoint["profile"]["agent"]}</dd>
+                </div><div>
+                  <dt>Effort</dt><dd>{@endpoint["profile"]["effort"]}</dd>
+                </div><div>
+                  <dt>Kit</dt><dd>
+                    <code>{String.slice(@endpoint["profile"]["kit_sha256"], 0, 12)}</code>
+                  </dd>
+                </div>
+              </dl>
               <dl :if={@provider == "claude"}>
                 <div>
                   <dt>Model ID</dt><dd>{@endpoint["model"]}</dd>
@@ -980,10 +1156,13 @@ defmodule EabWeb.DashboardLive do
                 Use “on” for thinking without a level, or enter the exact level name.
                 Blank uses server metadata when available; otherwise it is saved as not reported.
               </p>
-              <p id="case-timing-status" class="fine-print">
+              <p :if={@provider != "claude_code"} id="case-timing-status" class="fine-print">
                 Case timing is always recorded. Preparation and grading are excluded.
               </p>
-              <details class="advanced">
+              <p :if={@provider == "claude_code"} class="fine-print">
+                Pi's exact instructions declare a 262,144 generated-token threshold that Claude Code cannot enforce; usage above it is flagged. Compaction is off, a full context grades the current patch, a usage-limit stop is an evaluation error, there is no seed and no timing is stored.
+              </p>
+              <details :if={@provider != "claude_code"} class="advanced">
                 <summary>Advanced run settings</summary>
                 <p :if={@provider == "local"} class="fine-print">
                   Defaults use the detected context up to 262,144 tokens. Full history is retained.
@@ -1048,8 +1227,16 @@ defmodule EabWeb.DashboardLive do
                 not is_nil(@snapshot.cleanup_error)
             }
           >Run benchmark <span>↗</span></button>
+          <div :if={@contribution} id="contribution" class="notice" role="status">
+            Contributing to run series <code>{String.slice(@contribution["series_id"], 0, 12)}</code>
+            ({@contribution["model"]["name"]}, {@contribution["run_count"]}/{@contribution[
+              "required_runs"
+            ]} runs<span :if={@contribution["missing_seeds"] != []}>, missing seeds {Enum.join(@contribution["missing_seeds"], ", ")}</span>).
+            The run starts only if this endpoint and these settings match its setup.
+            <button class="secondary" phx-click="cancel_contribution">Cancel contribution</button>
+          </div>
           <p class="fine-print">
-            Pi repairs one case at a time. Upcoming cases prepare in the background, and submitted repairs are graded independently. Prepared images and fixture checks are reused across runs.
+            One agent works on one case at a time. Upcoming cases prepare in the background, and submitted repairs are graded independently. Prepared images and fixture checks are reused across runs.
           </p>
         </section>
         <section class="panel results">
@@ -1069,7 +1256,13 @@ defmodule EabWeb.DashboardLive do
             <div class="run-heading">
               <span class="badge">{String.upcase(@run["status"])}</span><code>{@run["id"]}</code>
             </div>
-            <h3 class="run-model">{Eab.ModelIdentity.label(@run["model"])}</h3><p
+            <h3 class="run-model">{Eab.ModelIdentity.label(@run["model"])}</h3>
+            <p id="run-harness" class="fine-print">
+              Harness: {Eab.Harness.label(@run)}<span :if={@run["validation"]}> · Validation run, never published or scored</span><span :if={
+                @run["series"]
+              }> · Contribution to series <code>{String.slice(@run["series"], 0, 12)}</code></span>
+            </p>
+            <p
               class="run-message"
               role="status"
             >
@@ -1148,7 +1341,7 @@ defmodule EabWeb.DashboardLive do
                 <button
                   :if={
                     @run["status"] == "completed" && is_nil(@run["selection"]) &&
-                      !is_nil(@score["score_percent"])
+                      !is_nil(@score["score_percent"]) && @run["validation"] != true
                   }
                   id="add-result"
                   class="secondary"
@@ -1248,7 +1441,7 @@ defmodule EabWeb.DashboardLive do
                     {get_in(@run, ["attempts", @log_case, "error"])}
                   </p>
                   <section id="case-verdict" aria-label="Case result explanation" tabindex="-1">
-                    <p id="case-time" class="fine-print">
+                    <p :if={Eab.Harness.name(@run) != "claude_code"} id="case-time" class="fine-print">
                       Case time: {Eab.Measurement.label((@case_attempt || %{})["measurement"])} · Pi startup through completion, excluding preparation and grading.
                     </p>
                     <h4>
@@ -1277,10 +1470,30 @@ defmodule EabWeb.DashboardLive do
                       :if={get_in(@run, ["case_phases", @log_case]) == "qualifying"}
                       class="fine-print"
                     >
-                      Checking the unchanged application, reference repair and negative controls before Pi starts this case.
+                      Checking the unchanged application, reference repair and negative controls before the agent starts this case.
                     </p>
                     <p :if={get_in(@run, ["attempts", @log_case, "stop_reason"])} class="fine-print">
-                      Pi stopped: {get_in(@run, ["attempts", @log_case, "stop_reason"])}
+                      {Eab.Harness.agent(@run)} stopped: {get_in(@run, [
+                        "attempts",
+                        @log_case,
+                        "stop_reason"
+                      ])}
+                    </p>
+                    <p
+                      :if={
+                        get_in(@run, ["attempts", @log_case, "claude_code", "over_declared_budget"])
+                      }
+                      class="notice"
+                    >
+                      Flagged: the transcript shows more output than the declared 262,144 generated tokens. The attempt is not failed for it.
+                    </p>
+                    <p :if={get_in(@run, ["attempts", @log_case, "claude_code"])} class="fine-print">
+                      Claude Code {get_in(@run, [
+                        "attempts",
+                        @log_case,
+                        "claude_code",
+                        "claude_code_version"
+                      ])} · {get_in(@run, ["attempts", @log_case, "claude_code", "compactions"]) || 0} compactions · usage read from the transcript, best effort.
                     </p>
                     <div
                       :for={check <- Evidence.checks(@case_attempt)}
@@ -1339,7 +1552,7 @@ defmodule EabWeb.DashboardLive do
                     tabindex="0"
                   >{@log_text}</pre>
                   <p class="fine-print">
-                    Updates every second. Docker setup, test output, model responses and Pi tool commands appear here.
+                    Updates every second. Docker setup, test output, model responses and agent tool commands appear here.
                   </p>
                 </section>
               </article>
@@ -1408,9 +1621,10 @@ defmodule EabWeb.DashboardLive do
           class="history-row"
           phx-click="select"
           phx-value-id={run["id"]}
-        ><span><strong>{Eab.ModelIdentity.label(run["model"])}</strong><span class="fine-print">Thinking: {Eab.Thinking.label(
-          run["settings"]
-        )}</span><code>{run["id"]}</code></span><span>{run[
+        ><span><strong>{Eab.ModelIdentity.label(run["model"])}</strong><span class="fine-print">{Eab.Harness.label(
+          run
+        )} · Thinking: {Eab.Thinking.label(run["settings"])}{if run["validation"],
+          do: " · validation run"}</span><code>{run["id"]}</code></span><span>{run[
           "status"
         ]} →</span></button>
         <nav :if={@history_page.total > 20} aria-label="History pages">
@@ -1435,7 +1649,7 @@ defmodule EabWeb.DashboardLive do
       >
         <summary>Compare model runs</summary>
         <p class="fine-print">
-          Choose runs with the same frozen release and effective settings. Repeated runs stay separate; incomplete runs have no final score. Model identities are server-reported.
+          Choose runs with the same cases, fixtures and effective settings; seeds may differ. Repeated runs stay separate; incomplete runs have no final score. Compare models only within one harness. Model identities are server-reported.
         </p>
         <p class="fine-print">Selections stay checked when you change history pages.</p>
         <form id="compare-runs" phx-submit="compare" phx-change="comparison_select">
@@ -1462,7 +1676,11 @@ defmodule EabWeb.DashboardLive do
             </thead>
             <tbody>
               <tr :for={run <- @comparison["runs"]}>
-                <td>{run["model"]}<br /><code>{run["id"]}</code></td>
+                <td>
+                  {run["model"]} · {run["harness"]}{if run["seed"], do: " · seed #{run["seed"]}"}<br /><code>{run[
+                    "id"
+                  ]}</code>
+                </td>
                 <td>{run["score"]["passed"]}/{run["score"]["planned"]}</td>
                 <td>
                   {if is_number(run["score"]["score_percent"]),
@@ -1502,6 +1720,58 @@ defmodule EabWeb.DashboardLive do
               disabled={@comparison_offset + 25 >= length(@comparison["cases"])}
             >Next cases</button>
           </nav>
+        </div>
+      </details>
+      <details class="case-inventory" id="run-series" open={not is_nil(@series)}>
+        <summary>Run series</summary>
+        <p class="fine-print">
+          A published result is a series of three runs with identical setup. Local runs use seeds 101, 102 and 103 and each seed counts once; subscription series take their first three scored runs. The score is the mean; ± is 1.96 standard errors of rerun noise on these cases, shown from two runs. Validation runs never join a series.
+        </p>
+        <button class="secondary" phx-click="series">Load run series</button>
+        <p :if={@series_error} class="notice error">{@series_error}</p>
+        <table :if={@series && @series != []} aria-label="Local run series">
+          <thead>
+            <tr>
+              <th>Series</th><th>Runs</th><th>Score</th><th>Missing seeds</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr :for={series <- @series}>
+              <td>
+                {series["setup"]["model"]["name"]} · {series["setup"]["harness"]["name"]} · Thinking: {series[
+                  "setup"
+                ]["settings"]["reasoning_effort"] || "Not recorded"}<br /><code>{String.slice(
+                  series["id"],
+                  0,
+                  12
+                )}</code>
+              </td>
+              <td>{series["run_count"]}/{series["required_runs"]}</td>
+              <td>
+                {series["score_percent"]}%{if series["interval_percent"],
+                  do: " ± #{series["interval_percent"]}"}
+              </td>
+              <td>{Enum.join(series["missing_seeds"], ", ")}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p :if={@series == []} class="muted">No local runs with final scores yet.</p>
+        <div :for={series <- Enum.reject(@published_series, & &1["complete"])} class="model-card">
+          <h3>
+            Provisional: {series["model"]["name"]} · {series["harness"]["name"]} · {series[
+              "run_count"
+            ]}/{series["required_runs"]} runs
+          </h3>
+          <p :if={series["missing_seeds"] != []}>
+            Missing seeds: {Enum.join(series["missing_seeds"], ", ")}
+          </p>
+          <details>
+            <summary>Required setup</summary>
+            <pre>{Jason.encode!(series["setup"], pretty: true)}</pre>
+          </details>
+          <button class="secondary" phx-click="contribute" phx-value-id={series["series_id"]}>
+            Contribute a run
+          </button>
         </div>
       </details>
       <details

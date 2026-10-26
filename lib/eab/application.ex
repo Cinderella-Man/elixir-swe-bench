@@ -10,6 +10,7 @@ defmodule Eab.Application do
       {Task.Supervisor, name: Eab.Tasks},
       {DynamicSupervisor, strategy: :one_for_one, name: Eab.MemoryMonitors},
       Eab.ChatGPTAuth,
+      Eab.ClaudeCode.Broker,
       Eab.Runs,
       EabWeb.Endpoint
     ]
