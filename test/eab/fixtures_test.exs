@@ -170,13 +170,16 @@ defmodule Eab.FixturesTest do
     recipe = fn image -> Fixtures.dockerfile(%{"runtime" => %{"image" => image}}, "base") end
     current = recipe.("hexpm/elixir:1.18.4-erlang-27.3.4-ubuntu-noble@sha256:abc")
     legacy = recipe.("hexpm/elixir:1.12.3-erlang-23.3.4.20-ubuntu-focal@sha256:abc")
+    older = recipe.("hexpm/elixir:1.13.4-erlang-24.3.4.17-ubuntu-jammy@sha256:abc")
 
     assert current =~ "RUN mix local.hex 2.5.3 --force && mix local.rebar --force"
 
     assert legacy =~
              "RUN mix archive.install https://builds.hex.pm/installs/1.12.0/hex-2.5.3.ez --sha512 9a485c17"
 
+    assert older =~ "https://builds.hex.pm/installs/1.13.0/hex-2.5.3.ez --sha512 a096b3c8"
     refute legacy =~ "mix local.hex"
+    refute older =~ "mix local.hex"
   end
 
   test "recipes reconcile seeds before compilation and export an independent fixture" do

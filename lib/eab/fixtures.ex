@@ -15,12 +15,15 @@ defmodule Eab.Fixtures do
   # An unpinned Hex install follows whatever is newest when an image is rebuilt.
   @hex_version "2.5.3"
 
-  # Mix before Elixir 1.13 ignores `mix local.hex VERSION`, so those images install
+  # Mix before Elixir 1.14 ignores `mix local.hex VERSION`, so those images install
   # the same release directly. Checksums: https://builds.hex.pm/installs/hex-1.x.csv
   @hex_builds %{
     "1.12" =>
       {"1.12.0",
-       "9a485c1739d61bb56072f388688ad5c754eada53df9050c109757dc0d6130688c089d84891281a21838a485ade0066921482487d1eb72732bbb0d641b884bef4"}
+       "9a485c1739d61bb56072f388688ad5c754eada53df9050c109757dc0d6130688c089d84891281a21838a485ade0066921482487d1eb72732bbb0d641b884bef4"},
+    "1.13" =>
+      {"1.13.0",
+       "a096b3c82cea512cba884f5f86d0b623389b13cac3dcbd5afe571fa73a7850fe40353c5e1f0deff0123dcced25b31e6c6c5390d2a8695cbcb77a467c56d17a7c"}
   }
 
   def ensure(id, emit, opts \\ []) do
