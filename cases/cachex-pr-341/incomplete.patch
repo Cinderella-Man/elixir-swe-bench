@@ -1,0 +1,414 @@
+diff --git a/lib/cachex.ex b/lib/cachex.ex
+index cfa7700..f14cf98 100644
+--- a/lib/cachex.ex
++++ b/lib/cachex.ex
+@@ -45,7 +45,6 @@ defmodule Cachex do
+   alias Cachex.Services
+ 
+   # alias any services
+-  alias Services.Informant
+   alias Services.Overseer
+ 
+   # import util macros
+@@ -308,9 +307,9 @@ defmodule Cachex do
+          {:ok, true} <- ensure_unused(name),
+          {:ok, cache} <- setup_env(name, options),
+          {:ok, pid} = Supervisor.start_link(__MODULE__, cache, name: name),
+-         {:ok, link} = Informant.link(cache),
+-         ^link <- Overseer.update(name, link) do
+-      _ = run_warmers(cache)
++         {:ok, link} = Services.link(cache),
++         ^link <- Overseer.update(name, link),
++         :ok <- setup_warmers(link) do
+       {:ok, pid}
+     end
+   end
+@@ -1371,22 +1370,32 @@ defmodule Cachex do
+ 
+   ## Options
+ 
+-    * `:modules`
++    * `:only`
+ 
+       An optional list of modules to warm, acting as a whitelist. The default
+-      behaviour of this function is to trigger warming in all modules.
++      behaviour of this function is to trigger warming in all modules. You may
++      provide either the module name, or the registered warmer name.
++
++    * `:wait`
++
++      Whether to wait for warmer completion or not, as a boolean. By default
++      warmers are triggered to run in the background, but passing `true` here
++      will block the return of this call until all warmers have completed.
+ 
+   ## Examples
+ 
+       iex> Cachex.warm(:my_cache)
+       { :ok, [MyWarmer] }
+ 
+-      iex> Cachex.warm(:my_cache, modules: [MyWarmer])
++      iex> Cachex.warm(:my_cache, only: [MyWarmer])
+       { :ok, [MyWarmer] }
+ 
+-      iex> Cachex.warm(:my_cache, modules: [])
++      iex> Cachex.warm(:my_cache, only: [])
+       { :ok, [] }
+ 
++      iex> Cachex.warm(:my_cache, wait: true)
++      { :ok, [MyWarmer]}
++
+   """
+   @spec warm(cache, Keyword.t()) :: {status, [atom()]}
+   def warm(cache, options \\ []),
+@@ -1443,23 +1452,19 @@ defmodule Cachex do
+     end
+   end
+ 
+-  # Run warmers on cache startup
++  # Initializes cache warmers on startup.
+   #
+-  # This will find the cache's warmer pids by getting the children from the
+-  # Incubator server, matching those pids to the warmer by module, and then
+-  # executing the warmer based on the warmer's `async` attribute
+-  defp run_warmers(cache(warmers: warmers) = cache) do
+-    parent = Services.locate(cache, Services.Incubator)
+-    children = if parent, do: Supervisor.which_children(parent), else: []
+-    warmer_map = Map.new(children, fn {mod, pid, _, _} -> {mod, pid} end)
+-
+-    for warmer(module: module, async: async) <- warmers,
+-        pid = warmer_map[module] do
+-      if async do
+-        send(pid, :cachex_warmer)
+-      else
+-        GenServer.call(pid, :cachex_warmer, :infinity)
+-      end
++  # This will trigger the initial cache warming via `Cachex.warm/2` while
++  # also respecting whether certain warmers should block startup or not.
++  defp setup_warmers(cache(warmers: warmers) = cache) do
++    groups = Enum.group_by(warmers, &warmer(&1, :async), &warmer(&1, :name))
++
++    startup = [wait: true, only: Map.get(groups, false, [])]
++    spawned = [wait: false, only: Map.get(groups, true, [])]
++
++    with {:ok, _} <- Cachex.warm(cache, const(:notify_false) ++ spawned),
++         {:ok, _} <- Cachex.warm(cache, const(:notify_false) ++ startup) do
++      :ok
+     end
+   end
+ 
+diff --git a/lib/cachex/actions/warm.ex b/lib/cachex/actions/warm.ex
+index b1f6471..8651538 100644
+--- a/lib/cachex/actions/warm.ex
++++ b/lib/cachex/actions/warm.ex
+@@ -18,18 +18,50 @@ defmodule Cachex.Actions.Warm do
+   to our services module. This allows us to avoid having to track any special
+   state in order to support manual warming.
+ 
+-  You can provide a `:modules` option to restrict the warming to a specific
+-  set of warmer modules. The list of modules which had a warming triggered will
+-  be returned in the result of this call.
++  You can provide an `:only` option to restrict the warming to a specific set
++  of warmer modules or names. The list can contain either the name of the
++  module, or the name of the registered server. The list of warmer names which
++  had a warming triggered will be returned in the result of this call.
+   """
+   def execute(cache(warmers: warmers), options) do
+-    mods = Keyword.get(options, :modules, nil)
++    only = Keyword.get(options, :only, nil)
++    wait = Keyword.get(options, :wait, false)
+ 
+-    handlers =
+-      for warmer(module: mod) <- warmers, mods == nil or mod in mods do
+-        send(mod, :cachex_warmer) && mod
+-      end
++    warmed =
++      warmers
++      |> Enum.filter(&filter_mod(&1, only))
++      |> Enum.map(&spawn_call(&1, wait))
++      |> Task.yield_many()
++      |> Enum.map(&extract_name/1)
+ 
+-    {:ok, handlers}
++    {:ok, warmed}
+   end
++
++  ###############
++  # Private API #
++  ###############
++
++  # Filters warmers based on the :only flag for module/name.
++  defp filter_mod(warmer(module: mod, name: name), only),
++    do: only == nil or mod in only or name in only
++
++  # Spawns a task to invoke the call to the remote warmer.
++  defp spawn_call(warmer(name: name) = warmer, wait) do
++    Task.async(fn ->
++      call_warmer(warmer, wait)
++      name
++    end)
++  end
++
++  # Invokes a warmer with blocking enabled.
++  defp call_warmer(warmer(name: name), true),
++    do: GenServer.call(name, :cachex_warmer, :infinity)
++
++  # Invokes a warmer with blocking disabled.
++  defp call_warmer(warmer(name: name), _),
++    do: send(name, :cachex_warmer)
++
++  # Converts a task result to a name reference.
++  defp extract_name({_, {:ok, name}}),
++    do: name
+ end
+diff --git a/lib/cachex/services.ex b/lib/cachex/services.ex
+index 1f3815c..c3e7c69 100644
+--- a/lib/cachex/services.ex
++++ b/lib/cachex/services.ex
+@@ -60,6 +60,34 @@ defmodule Cachex.Services do
+     |> Enum.concat(janitor_spec(cache))
+   end
+ 
++  @doc """
++  Links all hooks in a cache to their running process.
++
++  This is a required post-step as hooks are started independently and
++  are not named in a deterministic way. It will look up all hooks using
++  the Supervisor children and place them in a modified cache record.
++  """
++  @spec link(Cachex.Spec.cache()) :: {:ok, Cachex.Spec.cache()}
++  def link(cache(hooks: hooks(pre: [], post: []), warmers: []) = cache),
++    do: {:ok, cache}
++
++  def link(cache(hooks: hooks(pre: pre, post: post), warmers: warmers) = cache) do
++    hook_children = find_children(cache, Services.Informant)
++    warmer_children = find_children(cache, Services.Incubator)
++
++    linked =
++      cache(cache,
++        hooks:
++          hooks(
++            pre: attach_child(pre, hook_children),
++            post: attach_child(post, hook_children)
++          ),
++        warmers: attach_child(warmers, warmer_children)
++      )
++
++    {:ok, linked}
++  end
++
+   @doc """
+   Retrieves the process identifier of the provided service.
+ 
+@@ -67,10 +95,9 @@ defmodule Cachex.Services do
+   """
+   @spec locate(Cachex.Spec.cache(), atom) :: pid | nil
+   def locate(cache() = cache, service) do
+-    Enum.find_value(services(cache), fn
+-      {^service, pid, _tag, _id} -> pid
+-      _ -> false
+-    end)
++    cache
++    |> services
++    |> find_pid(service)
+   end
+ 
+   @doc """
+@@ -185,6 +212,41 @@ defmodule Cachex.Services do
+     ]
+   end
+ 
++  # Iterates a list of hooks and finds their reference in list of children.
++  #
++  # When there is a reference found, the hook is updated with the new PID.
++  defp attach_child(structs, children) do
++    Enum.map(structs, fn
++      warmer(module: module, name: nil) = warmer ->
++        warmer(warmer, name: find_pid(children, module))
++
++      hook(module: module, name: nil) = hook ->
++        hook(hook, name: find_pid(children, module))
++
++      value ->
++        value
++    end)
++  end
++
++  # Finds a list of running children for a service.
++  defp find_children(cache, service) do
++    case locate(cache, service) do
++      nil -> []
++      pid -> Supervisor.which_children(pid)
++    end
++  end
++
++  # Locates a process identifier for the given module.
++  #
++  # This uses a list of child modules; if no child is
++  # found, the value returned is nil.
++  defp find_pid(children, module) do
++    Enum.find_value(children, fn
++      {^module, pid, _, _} -> pid
++      _ -> false
++    end)
++  end
++
+   # Determines if a module is a Cachex service.
+   #
+   # This is done by just checking if the module starts with the namespace
+diff --git a/lib/cachex/services/incubator.ex b/lib/cachex/services/incubator.ex
+index 3454c82..68e3fc5 100644
+--- a/lib/cachex/services/incubator.ex
++++ b/lib/cachex/services/incubator.ex
+@@ -33,10 +33,14 @@ defmodule Cachex.Services.Incubator do
+   # Private API #
+   ###############
+ 
+-  # Generates a Supervisor specification for a hook.
+-  defp spec(warmer(module: module) = warmer, cache),
+-    do: %{
+-      id: module,
+-      start: {GenServer, :start_link, [module, {cache, warmer}, [name: module]]}
+-    }
++  # Generates a Supervisor specification for a warmer.
++  defp spec(warmer(module: module, name: name) = warmer, cache) do
++    options =
++      case name do
++        nil -> [module, {cache, warmer}]
++        val -> [module, {cache, warmer}, [name: val]]
++      end
++
++    %{id: module, start: {GenServer, :start_link, options}}
++  end
+ end
+diff --git a/lib/cachex/services/informant.ex b/lib/cachex/services/informant.ex
+index fb9d238..cdb529c 100644
+--- a/lib/cachex/services/informant.ex
++++ b/lib/cachex/services/informant.ex
+@@ -47,33 +47,6 @@ defmodule Cachex.Services.Informant do
+   def broadcast(cache(hooks: hooks(post: post_hooks)), action, result),
+     do: broadcast_action(post_hooks, action, result)
+ 
+-  @doc """
+-  Links all hooks in a cache to their running process.
+-
+-  This is a required post-step as hooks are started independently and
+-  are not named in a deterministic way. It will look up all hooks using
+-  the Supervisor children and place them in a modified cache record.
+-  """
+-  @spec link(Cachex.Spec.cache()) :: {:ok, Cachex.Spec.cache()}
+-  def link(cache(hooks: hooks(pre: [], post: [])) = cache),
+-    do: {:ok, cache}
+-
+-  def link(
+-        cache(name: name, hooks: hooks(pre: pre_hooks, post: post_hooks)) =
+-          cache
+-      ) do
+-    children =
+-      name
+-      |> Supervisor.which_children()
+-      |> find_pid(__MODULE__)
+-      |> Supervisor.which_children()
+-
+-    link_pre = attach_hook_pid(pre_hooks, children)
+-    link_post = attach_hook_pid(post_hooks, children)
+-
+-    {:ok, cache(cache, hooks: hooks(pre: link_pre, post: link_post))}
+-  end
+-
+   @doc """
+   Notifies a set of hooks of the passed in data.
+ 
+@@ -104,19 +77,6 @@ defmodule Cachex.Services.Informant do
+   # Private API #
+   ###############
+ 
+-  # Iterates a list of hooks and finds their reference in list of children.
+-  #
+-  # When there is a reference found, the hook is updated with the new PID.
+-  defp attach_hook_pid(hooks, children) do
+-    Enum.map(hooks, fn
+-      hook(module: module, name: nil) = hook ->
+-        hook(hook, name: find_pid(children, module))
+-
+-      hook ->
+-        hook
+-    end)
+-  end
+-
+   # Broadcasts an action to hooks listening for it.
+   #
+   # This will enforce the actions list inside a hook definition to ensure
+@@ -133,17 +93,6 @@ defmodule Cachex.Services.Informant do
+     notify(actionable, msg, result)
+   end
+ 
+-  # Locates a process identifier for the given module.
+-  #
+-  # This uses a list of child modules; if no child is
+-  # found, the value returned is nil.
+-  defp find_pid(children, module) do
+-    Enum.find_value(children, fn
+-      {^module, pid, _, _} -> pid
+-      _ -> nil
+-    end)
+-  end
+-
+   # Generates a Supervisor specification for a hook.
+   defp spec(hook(module: module, name: name, state: state)) do
+     options =
+diff --git a/lib/cachex/services/steward.ex b/lib/cachex/services/steward.ex
+index 439314e..36bb4ee 100644
+--- a/lib/cachex/services/steward.ex
++++ b/lib/cachex/services/steward.ex
+@@ -53,6 +53,6 @@ defmodule Cachex.Services.Steward do
+     do: {name, module}
+ 
+   # Map a warmer into the name and module tuple
+-  defp map_names(warmer(module: module)),
+-    do: {module, module}
++  defp map_names(warmer(name: name, module: module)),
++    do: {name, module}
+ end
+diff --git a/lib/cachex/spec.ex b/lib/cachex/spec.ex
+index 003a2b0..a7ea78c 100644
+--- a/lib/cachex/spec.ex
++++ b/lib/cachex/spec.ex
+@@ -102,7 +102,8 @@ defmodule Cachex.Spec do
+           record(:warmer,
+             module: atom,
+             state: any,
+-            async: boolean
++            async: boolean,
++            name: GenServer.server()
+           )
+ 
+   ###########
+@@ -259,7 +260,8 @@ defmodule Cachex.Spec do
+   defrecord :warmer,
+     module: nil,
+     state: nil,
+-    async: false
++    async: false,
++    name: nil
+ 
+   ###############
+   # Record Docs #
+diff --git a/lib/cachex/spec/validator.ex b/lib/cachex/spec/validator.ex
+index 6f76c86..f0e65b9 100644
+--- a/lib/cachex/spec/validator.ex
++++ b/lib/cachex/spec/validator.ex
+@@ -135,11 +135,12 @@ defmodule Cachex.Spec.Validator do
+   #
+   # This will validate that the provided module correctly implements
+   # the behaviour of `Cachex.Warmer` via function checking.
+-  def valid?(:warmer, warmer(module: module)) do
++  def valid?(:warmer, warmer(module: module, name: name)) do
+     check1 = behaviour?(module, Cachex.Warmer)
+     check2 = check1 and {:interval, 0} in module.__info__(:functions)
+     check3 = check2 and {:execute, 1} in module.__info__(:functions)
+-    check3
++    check4 = check3 and nillable?(name, &(is_atom(&1) or is_pid(&1)))
++    check4
+   end
+ 
+   # Catch-all for invalid records.

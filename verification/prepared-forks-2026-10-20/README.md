@@ -1,6 +1,16 @@
 # Prepared fork migration
 
-Status: **read-only audit complete; migration deferred by the user**. Work remains on `codex/curate-researched-multifile-case`. The user authorized preparing and using their forks for every runnable case and specifically required inspecting existing Plausible branches before making changes.
+Status: **completed on 2026-10-26** as part of the case rebuild ([ADR 0012](../../docs/adr/0012-rebuild-release-and-validate-with-unpublished-opus-runs.md)). The original audit and procedure below are kept as written.
+
+## Rebuild record (2026-10-26)
+
+- `prepare-case.py` published the 13 upstream-pinned cases to the user's forks: 17 new branches and 13 draft source-pair PRs, with no existing ref moved. Two changes were made to the reviewed utility: Ash's recorded single-run exception satisfies its completion prerequisite, and `--dry-run` reports the intended refs and PR before any push. Each case's `source-preparation.json` records the operations.
+- The nine legacy cases were converted to schema v2 with every scored check stated as a requirement; the five newer cases kept their contracts. The freeze-audit fixes were applied in the same versions. Each case's `conversion-notes.md` holds the curator's mapping rationale and new incomplete controls where the legacy probe failed no starting failure (Livebook 2527, Plausible 5939).
+- Independent reviewers approved every draft against its exact hashes (`source-review.json`), reading requirements before checks.
+- `run-case.py qualify` then ran three fresh rounds per case under grader `da5bcd94…`. All fourteen passed with identical named outcomes and exported admissions. LiveBeats' three receipts are byte-identical because its Node output has no timestamps; its log shows three separate executions. Accent first failed to prepare when its Elixir 1.12 image ignored the Hex pin and installed Hex 2.6.0; it passed after the recipe installed Hex 2.5.3 directly.
+- Opus validation follows once the Claude Code harness has passed its escape test.
+
+Status before the rebuild: **read-only audit complete; migration deferred by the user**. Work remains on `codex/curate-researched-multifile-case`. The user authorized preparing and using their forks for every runnable case and specifically required inspecting existing Plausible branches before making changes.
 
 The [Ash 3031 record](../case-curation-2026-10-20/ash-pr-3031/README.md) tracks the current new-case validation. The user subsequently requested finishing Ash and then stopping to limit token consumption. Do not execute these migration utilities without a renewed request. This directory contains read-only audits and independently reviewed procedures, not completed migration claims. No other fork or case source has been changed.
 

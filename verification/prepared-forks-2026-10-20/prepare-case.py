@@ -3,7 +3,7 @@
 Run only after Ash completion is committed. Drafting this utility does not mutate refs.
 """
 import argparse,hashlib,json,os,pathlib,re,shutil,subprocess
-parser=argparse.ArgumentParser();parser.add_argument('case');parser.add_argument('--ash-completion-commit',required=True);args=parser.parse_args()
+parser=argparse.ArgumentParser();parser.add_argument('case');parser.add_argument('--ash-completion-commit',required=True);parser.add_argument('--dry-run',action='store_true');args=parser.parse_args()
 assert re.fullmatch(r'[0-9a-f]{40}',args.ash_completion_commit)
 root=pathlib.Path.cwd();work=root/'.local/fork-migration'
 def call(argv,**kw):return subprocess.check_output(argv,text=True,**kw).strip()
@@ -12,7 +12,8 @@ def save(path,value):
 def sha(path):return hashlib.sha256(path.read_bytes()).hexdigest()
 # An actual committed successful pair and restoration are prerequisites to migration.
 completion=json.loads(call(['git','show',args.ash_completion_commit+':verification/case-curation-2026-10-20/ash-pr-3031/astra-results.json']))
-assert completion['two_fresh_blind_runs'] and len(completion['runs'])==2
+# Ash completed under the user's recorded single-run exception (case-curation-loop.md).
+assert completion['two_fresh_blind_runs'] or (completion['single_fresh_blind_run'] and completion['user_authorized_single_run_exception'] and len(completion['runs'])==1)
 call(['git','cat-file','-e',args.ash_completion_commit+':verification/case-curation-2026-10-20/ash-pr-3031/restoration.json'])
 row=next(r for r in json.loads((work/'initial-source-audit.json').read_text()) if r['case']==args.case)
 repo=work/'forks'/row['fork'].rsplit('/',1)[1]
@@ -27,7 +28,8 @@ def remote_heads():
     return {line.split()[1].removeprefix('refs/heads/'):line.split()[0] for line in git('ls-remote','--heads','origin').splitlines()}
 before=remote_heads();fork_slug=row['fork'].removeprefix('https://github.com/')
 record={'case':args.case,'status':'preparing','ash_completion_commit':args.ash_completion_commit,'old_source_pair':old,'remote_heads_before':before,'old_bundle_hashes':{p.name:sha(p) for p in sorted(source.iterdir()) if p.is_file()},'tree_audit':row['prepared_tree_audit'],'operations':[]}
-record_path=work/'preparation-records'/f'{args.case}.json'
+record_path=work/('dry-run-records' if args.dry_run else 'preparation-records')/f'{args.case}.json'
+if args.dry_run and record_path.exists():record_path.unlink()
 if record_path.exists():raise RuntimeError('Existing preparation record; inspect and resume explicitly')
 save(record_path,record)
 trees=row['prepared_tree_audit'];overlay=(source/'environment.patch').exists()
@@ -74,6 +76,12 @@ assert git('rev-parse',fixed+'^{tree}')==trees['fixed_tree']
 assert git('diff','--binary',old['broken_revision'],old['fixed_revision'])==git('diff','--binary',broken,fixed), 'Prepared repair differs from original upstream diff'
 record.update(preparation_branch=baseline,reference_branch=reference,broken_revision=broken,fixed_revision=fixed)
 save(record_path,record)
+if args.dry_run:
+    # Report the intended refs and PR; nothing is pushed or opened.
+    existing=json.loads(call(['gh','pr','list','--repo',fork_slug,'--state','all','--base',baseline,'--head',reference,'--json','number,url']))
+    plan=[{'branch':branch,'action':'reuse' if branch in before else 'create','commit':commit,'new_commit':commit not in (old['broken_revision'],old['fixed_revision'])} for branch,commit in [(baseline,broken),(reference,fixed)]]
+    print(json.dumps({'case':args.case,'fork':fork_slug,'overlay':overlay,'refs':plan,'pull_request':existing[0]['url'] if existing else 'create draft'}))
+    raise SystemExit(0)
 new_refs=[]
 for branch,commit in [(baseline,broken),(reference,fixed)]:
     if branch in before:

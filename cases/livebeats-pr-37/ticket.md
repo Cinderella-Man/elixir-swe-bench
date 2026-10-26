@@ -1,0 +1,1 @@
+Show the current song title and artist in the browser tab and supported Media Session metadata, updating when the song changes. Restore the ordinary non-playing tab title when listening stops. Keep ordinary playback working in browsers without the Media Session API.

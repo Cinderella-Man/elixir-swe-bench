@@ -1,0 +1,197 @@
+diff --git a/test/livebook/runtime/evaluator_test.exs b/test/livebook/runtime/evaluator_test.exs
+index 6d2fe89f079424811bdf105ce94207070f22bd93..9e0a4f63e4ade3d0518dc45beacabd1893c43c4d 100644
+--- a/test/livebook/runtime/evaluator_test.exs
++++ b/test/livebook/runtime/evaluator_test.exs
+@@ -811,7 +811,7 @@ defmodule Livebook.Runtime.EvaluatorTest do
+       ref = eval_idx
+       parent_refs = Enum.to_list((eval_idx - 1)..0//-1)
+       Evaluator.evaluate_code(evaluator, :elixir, code, ref, parent_refs)
+-      assert_receive {:runtime_evaluation_response, ^ref, terminal_text(_), metadata}
++      assert_receive {:runtime_evaluation_response, ^ref, _output, metadata}
+       %{used: metadata.identifiers_used, defined: metadata.identifiers_defined}
+     end
+ 
+@@ -1191,6 +1191,94 @@ defmodule Livebook.Runtime.EvaluatorTest do
+ 
+       assert context.pdict == %{x: 1, y: 2}
+     end
++
++    test "context merging with errored evaluation", %{evaluator: evaluator} do
++      # This test is similar to the above, but the second evaluation
++      # fails with an error
++
++      """
++      x = 1
++      y = 1
++
++      alias Enum, as: E
++      alias Map, as: M
++
++      require Enum
++
++      import Integer, only: [is_odd: 1, is_even: 1, to_string: 2, to_charlist: 2]
++
++      Process.put(:x, 1)
++      Process.put(:y, 1)
++      Process.put(:z, 1)
++
++      defmodule Livebook.Runtime.EvaluatorTest.Identifiers.ErrorContextMergingOne do
++      end
++      """
++      |> eval(evaluator, 0)
++
++      """
++      y = 2
++
++      alias MapSet, as: M
++
++      require Map
++
++      import Integer, except: [is_even: 1, to_string: 2]
++
++      Process.put(:y, 2)
++      Process.delete(:z)
++
++      defmodule Livebook.Runtime.EvaluatorTest.Identifiers.ErrorContextMergingTwo do
++      end
++
++      raise "oops"
++      """
++      |> eval(evaluator, 1)
++
++      # Evaluation 1 context
++      #
++      # Should be empty, except for imports and process dictionary,
++      # which are not diffed and should be kept from evaluation 0.
++
++      context = Evaluator.get_evaluation_context(evaluator, [1])
++
++      assert Enum.sort(context.binding) == []
++
++      assert Enum.sort(context.env.aliases) == []
++
++      assert Map not in context.env.requires
++      assert Enum not in context.env.requires
++
++      assert [_, _ | _] = context.env.functions[Integer]
++      assert [_, _ | _] = context.env.macros[Integer]
++
++      assert context.env.versioned_vars == %{}
++
++      assert context.env.context_modules == []
++
++      assert context.pdict == %{x: 1, y: 1, z: 1}
++
++      # Merged context
++
++      context = Evaluator.get_evaluation_context(evaluator, [1, 0])
++
++      assert Enum.sort(context.binding) == [x: 1, y: 1]
++
++      assert Enum.sort(context.env.aliases) == [{E, Enum}, {M, Map}]
++
++      assert Enum in context.env.requires
++
++      assert [_, _ | _] = context.env.functions[Integer]
++      assert [_, _ | _] = context.env.macros[Integer]
++
++      assert context.env.versioned_vars == %{{:x, nil} => 0, {:y, nil} => 1}
++
++      assert context.env.context_modules == [
++               Livebook.Runtime.EvaluatorTest.Identifiers.ErrorContextMergingOne
++             ]
++
++      assert context.pdict == %{x: 1, y: 1, z: 1}
++    end
+   end
+ 
+   describe "forget_evaluation/2" do
+diff --git a/test/benchmark_failed_context_test.exs b/test/benchmark_failed_context_test.exs
+new file mode 100644
+--- /dev/null
++++ b/test/benchmark_failed_context_test.exs
+@@ -0,0 +1,84 @@
++defmodule Livebook.Benchmark.FailedContextTest do
++  use ExUnit.Case, async: true
++  import Livebook.TestHelpers
++  alias Livebook.Runtime.Evaluator
++
++  setup do
++    {:ok, object_tracker} = start_supervised(Evaluator.ObjectTracker)
++    {:ok, client_tracker} = start_supervised(Evaluator.ClientTracker)
++    {:ok, _pid, evaluator} = start_supervised({Evaluator,
++      send_to: self(), object_tracker: object_tracker, client_tracker: client_tracker})
++    %{evaluator: evaluator}
++  end
++
++  test "later evaluations use the exact prior imports and dictionary after errors",
++       %{evaluator: evaluator} do
++    good = """
++    import Integer, only: [is_odd: 1, is_even: 1, to_string: 2, to_charlist: 2]
++    import ExUnit.Assertions
++    previous_binding = 17
++    alias Map, as: PriorMap
++    Process.put(:prior, :preserved)
++    Process.put(:keep, :present)
++    :ok
++    """
++    assert %{type: :terminal_text} = evaluate(evaluator, good, :good, [])
++    before = Evaluator.get_evaluation_context(evaluator, [:good])
++
++    bad = """
++    failed_binding = 99
++    alias MapSet, as: PriorMap
++    require MapSet
++    import Integer, except: [is_even: 1, to_string: 2]
++    Process.put(:prior, :changed)
++    Process.put(:introduced, :leaked)
++    Process.delete(:keep)
++    defmodule Livebook.Benchmark.FailedContextTest.FailedModule do
++      def value, do: :leaked
++    end
++    raise "audit failure"
++    """
++    assert %{type: :error, message: message} = evaluate(evaluator, bad, :bad, [:good])
++    assert message =~ "audit failure"
++    after_error = Evaluator.get_evaluation_context(evaluator, [:bad])
++    assert normalized_imports(after_error.env.functions) == normalized_imports(before.env.functions)
++    assert normalized_imports(after_error.env.macros) == normalized_imports(before.env.macros)
++    assert after_error.pdict == before.pdict
++    assert after_error.binding == []
++    assert after_error.env.aliases == []
++    refute MapSet in after_error.env.requires
++    assert after_error.env.context_modules == []
++    refute Code.ensure_loaded?(Livebook.Benchmark.FailedContextTest.FailedModule)
++
++    verification = """
++    assert is_even(2)
++    assert is_odd(3)
++    assert to_string(31, 16) == "1F"
++    assert to_charlist(31, 16) == ~c"1F"
++    assert Process.get(:prior) == :preserved
++    assert Process.get(:keep) == :present
++    assert Process.get(:introduced) == nil
++    :audit_ok
++    """
++    assert terminal_text(result) = evaluate(evaluator, verification, :after_error, [:bad])
++    assert clean_message(result) == ":audit_ok"
++
++    merged_verification = verification <> "\nassert previous_binding == 17\nassert PriorMap.new() == %{}\n:merged_ok"
++    assert terminal_text(result) = evaluate(evaluator, merged_verification, :merged, [:bad, :good])
++    assert clean_message(result) == ":merged_ok"
++
++    assert %{type: :error} = evaluate(evaluator, "assert false", :assertion_error, [:bad, :good])
++    assert terminal_text(result) = evaluate(evaluator, "assert true\nProcess.get(:prior)", :after_assertion, [:assertion_error, :bad, :good])
++    assert clean_message(result) == ":preserved"
++  end
++
++  defp normalized_imports(imports) do
++    Map.new(imports, fn {module, entries} -> {module, Enum.sort(entries)} end)
++  end
++
++  defp evaluate(evaluator, code, ref, parents) do
++    Evaluator.evaluate_code(evaluator, :elixir, code, ref, parents)
++    assert_receive {:runtime_evaluation_response, ^ref, output, _metadata}
++    output
++  end
++end

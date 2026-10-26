@@ -60,7 +60,7 @@ For features, write a grilled spec in `ticket.md` ([ADR 0013](adr/0013-specify-f
 - compatibility constraints;
 - the public interface the feature exposes (module and function names, routes, configuration keys).
 
-Keep `grading.requirements` to a short list of key outcomes mapped to checks. A feature may extend its upstream PR into a fuller, coherent feature when the extension follows the project's style and passes its full existing suite. Record the curator extension separately from the upstream PR in provenance.
+The spec describes the product, never its grading: no mention of checks, hidden tests or what is graded. Keep `grading.requirements` to a short list of key outcomes mapped to checks. The grader compiles the solver's added test files against the starting source, and one file that fails to compile fails the whole model-test check. A new macro, struct or record makes that likely, so every feature case ends its environment clarification with: "Added or changed test files are also compiled and run against the starting source, so each of them must compile there." A feature may extend its upstream PR into a fuller, coherent feature when the extension follows the project's style and passes its full existing suite. Record the curator extension separately from the upstream PR in provenance.
 
 Illustrative task shapes, not admitted cases:
 

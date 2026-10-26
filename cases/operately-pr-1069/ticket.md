@@ -1,0 +1,1 @@
+Posting a project check-in can create duplicate notification subscriptions when the same person is selected or mentioned more than once, including the author. Keep one subscription per person, preserve every distinct intended recipient, and keep explicitly invited recipients invited even when they are also mentioned. Posting without an explicit recipient list must still work.
