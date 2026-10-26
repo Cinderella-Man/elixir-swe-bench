@@ -118,7 +118,7 @@ defmodule Eab.ClaudeCode do
     root = path("kit")
 
     Path.wildcard(Path.join(root, ".claude/**/*"), match_dot: true)
-    |> Enum.filter(&File.regular?/1)
+    |> Enum.filter(&(File.regular?(&1) and "__pycache__" not in Path.split(&1)))
     |> Map.new(fn file ->
       body = File.read!(file) |> String.replace("__EAB_CONTROLLER_URL__", url)
       {Path.relative_to(file, root), body}

@@ -15,9 +15,13 @@ import urllib.request
 
 CONTROLLER = "__EAB_CONTROLLER_URL__"
 INSTRUCTIONS = ("CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", ".claude/CLAUDE.md")
-# Claude Code writes the solver's final message after SubagentStop hooks start, and
-# marks the subagent finished in its .meta.json once the transcript is complete.
-FINISH_WAIT_SECONDS = 300
+# Claude Code writes the solver's last records after SubagentStop hooks start, sometimes
+# even after .meta.json says finished. The uploader waits until the transcript ends its
+# turn and stops growing; after the bound it uploads what exists and the controller's
+# truncation check fails closed.
+COMPLETE_WAIT_SECONDS = 120
+STABLE_SECONDS = 1.0
+POLL_SECONDS = 0.25
 
 
 def kit(root):
@@ -50,22 +54,72 @@ def detail(error):
     return getattr(error, "read", lambda: b"")().decode("utf-8", "replace") or str(error)
 
 
-def upload(body):
-    """Detached: wait until the subagent is finished, then send its whole transcript."""
-    path = pathlib.Path(body["event"]["agent_transcript_path"])
-    meta = path.with_suffix(".meta.json")
-    deadline = time.monotonic() + FINISH_WAIT_SECONDS
-    while time.monotonic() < deadline:
+def content_blocks(record):
+    content = (record.get("message") or {}).get("content")
+    return [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+
+
+def complete(text):
+    """True when the last conversation record ends the turn: an assistant message without
+    a pending tool call, or a successful SubagentHandback result (the desktop's ending)."""
+    records = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
         try:
-            if json.loads(meta.read_text(encoding="utf-8")).get("finished") is True:
-                break
-        except (OSError, ValueError):
-            pass
-        time.sleep(0.5)
-    else:
-        body["transcript_error"] = "the subagent was not marked finished within %d seconds" % FINISH_WAIT_SECONDS
+            records.append(json.loads(line))
+        except ValueError:
+            return False  # a record still being written
+    handbacks = {block.get("id") for record in records if record.get("type") == "assistant"
+                 for block in content_blocks(record)
+                 if block.get("type") == "tool_use" and block.get("name") == "SubagentHandback"}
+    for record in reversed(records):
+        kind = record.get("type")
+        if kind == "assistant":
+            return not any(block.get("type") == "tool_use" for block in content_blocks(record))
+        if kind == "user":
+            for block in content_blocks(record):
+                if block.get("type") != "tool_result" or block.get("tool_use_id") not in handbacks:
+                    continue
+                if block.get("is_error") is True:
+                    return False
+                result = block.get("content")
+                if isinstance(result, list):
+                    result = "".join(part.get("text", "") for part in result if isinstance(part, dict))
+                try:
+                    return json.loads(result).get("success") is True
+                except (TypeError, ValueError, AttributeError):
+                    return False
+            return False
+    return False
+
+
+def settled(path):
+    """Wait for a complete transcript whose size holds still; return its text."""
+    deadline = time.monotonic() + COMPLETE_WAIT_SECONDS
+    text, size, since = None, None, time.monotonic()
+    while True:
+        try:
+            current = path.stat().st_size
+        except OSError:
+            current = None
+        now = time.monotonic()
+        if current != size:
+            size, since = current, now
+        elif current is not None and now - since >= STABLE_SECONDS:
+            text = path.read_text(encoding="utf-8")
+            if len(text.encode("utf-8")) == current and complete(text):
+                return text
+        if now >= deadline:
+            return path.read_text(encoding="utf-8")
+        time.sleep(POLL_SECONDS)
+
+
+def upload(body):
+    """Detached: wait until the subagent's transcript is complete, then send all of it."""
+    path = pathlib.Path(body["event"]["agent_transcript_path"])
     try:
-        body["transcript"] = path.read_text(encoding="utf-8")
+        body["transcript"] = settled(path)
     except OSError as error:
         body["transcript_error"] = str(error)
     for attempt in range(5):
@@ -113,4 +167,5 @@ def main():
         }}))
 
 
-main()
+if __name__ == "__main__":
+    main()

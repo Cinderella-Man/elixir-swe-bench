@@ -39,7 +39,7 @@ if [ -e "$target/.mcp.json" ]; then echo "Refusing: remove $target/.mcp.json fir
 
 # Replace the whole .claude folder so stale or extra files cannot survive.
 rm -rf "$target/.claude"
-(cd "$source" && find .claude -type f | sort) | while read -r file; do
+(cd "$source" && find .claude -type f -not -path '*/__pycache__/*' | sort) | while read -r file; do
   mkdir -p "$target/$(dirname "$file")"
   sed "s|__EAB_CONTROLLER_URL__|$url|g" "$source/$file" > "$target/$file"
 done
