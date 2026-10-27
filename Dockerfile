@@ -36,5 +36,6 @@ COPY mix.lock mix.lock
 COPY priv/fixtures priv/fixtures
 COPY priv/pi priv/pi
 COPY priv/claude_code priv/claude_code
+COPY priv/admitted_validation_runs.json priv/admitted_validation_runs.json
 VOLUME /data
 CMD ["bin/eab", "start"]

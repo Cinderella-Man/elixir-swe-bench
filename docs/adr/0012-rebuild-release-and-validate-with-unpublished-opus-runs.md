@@ -32,6 +32,8 @@ Validation runs stayed unpublished because their outcomes decided which cases st
 
 If run G's review changes no case, runs F and G count as two of Opus 5.5's three series runs under [ADR 0011](0011-publish-three-run-series.md), and one fresh run completes the series. If it changes any case, neither counts and Opus gets three fresh runs. The two runs join through an explicit list of run IDs in the repository; no run record is edited, and every other validation run stays unpublished, because its results changed cases. ADR 0010's escape test and dry attempt still run before the third run; nothing in the harness changes between them, so passing them also covers runs F and G.
 
+Run G passed 17 of 20. Its review changed no case: its three failures, ash-pr-3031, livebook-pr-2800 and vutuv-pr-1759, are sound cases Opus missed, so all three stay. Runs F and G are admitted.
+
 ## Considered options
 
 - **Keep upstream pins under a recorded exception**: no fork work, but cases would keep two kinds of source and overlay handling.

@@ -12,6 +12,7 @@ Unpublished validation runs under [ADR 0012](../../docs/adr/0012-rebuild-release
 | `20261027-095752-a0aaa695` | all 20 cases, 2 parallel attempts | The first run under the parallel-attempts kit ([ADR 0014](../../docs/adr/0014-run-a-runs-attempts-in-parallel.md)). Completed: **18 of 20 passed**. livebook-pr-2800 and ash-pr-3031 failed. Per-case grade summaries, the sealed patches, the patches that show both failing cases are solvable, and the hook decision log are in [`run-20261027-095752-a0aaa695/`](run-20261027-095752-a0aaa695/). No elapsed times were recorded. |
 | `20261027-143532-8d2e4ed2` | all 20 cases, 2 parallel attempts | Completed: **19 of 20 passed**. ash-pr-3031 failed. Per-case grade summaries, the sealed patches, the patches that show ash-pr-3031 is solvable, and the hook decision log are in [`run-20261027-143532-8d2e4ed2/`](run-20261027-143532-8d2e4ed2/). No elapsed times were recorded. |
 | `20261027-183407-2bbea0a5` | all 20 cases, 2 parallel attempts | The first run under the session-level workspace server and the final case versions. Completed: **18 of 20 passed**. ash-pr-3031 and livebook-pr-2800 failed. Per-case grade summaries, the sealed patches, the patches that show both failing cases are solvable, and the hook decision log are in [`run-20261027-183407-2bbea0a5/`](run-20261027-183407-2bbea0a5/). No elapsed times were recorded. |
+| `20261027-204103-33348dcc` | all 20 cases, 2 parallel attempts | Completed: **17 of 20 passed**. ash-pr-3031, livebook-pr-2800 and vutuv-pr-1759 failed. Per-case grade summaries, the sealed patches, the patches that show all three failing cases are solvable, and the hook decision log are in [`run-20261027-204103-33348dcc/`](run-20261027-204103-33348dcc/). No elapsed times were recorded. |
 
 Raw transcripts stay in the controller's data volume: they carry the solver's environment block and account details.
 
@@ -65,10 +66,24 @@ Reviewed under the final-batch rule: each pass was checked for genuineness and f
 - **ash-pr-3031 failed on the same two requirements as in runs 11868a92 and 8d2e4ed2** (13 of 15 hidden checks pass). Opus's patch passes all 15 with both repaired ([patches](run-20261027-183407-2bbea0a5/ash-pr-3031/soundness/)).
 - **The harness fixes held.** No tool call lost its answer, including two long calls that were running while the other solver finished. The solvers' own `git diff` and `git checkout` worked on their edits, and vutuv-pr-1759's full suite ran without a database drop.
 
+## What the reviews of run 33348dcc found
+
+Reviewed under the final-batch rule, like run 2bbea0a5. Before any of this run's results were read, the user decided that no case leaves the release because Opus misses it in this run ([ADR 0012 amendment](../../docs/adr/0012-rebuild-release-and-validate-with-unpublished-opus-runs.md)).
+
+- **All 17 passes are genuine, and no case is at fault.** No solution weakened or deleted an existing test, special-cased hidden data or edited outside the allowed prefixes. No review found a new check gap.
+- **vutuv-pr-1759 failed one stated requirement.** Opus passed a NUL byte in `q` or `handles` straight to PostgreSQL, which rejects it, so the endpoint crashed where the ticket says both endpoints "answer `200` with a JSON body for any text" (24 of 25 hidden checks pass). Opus passed this check in runs a0aaa695, 8d2e4ed2 and 2bbea0a5. A NUL check before each of the two queries, as the reference has, makes this run's patch pass all 25 ([patch](run-20261027-204103-33348dcc/vutuv-pr-1759/soundness/)). The case is sound and stays.
+- **livebook-pr-2800 failed as in run 2bbea0a5**: Opus left the starting source's `:erlang.list_to_binary/1` call in place (3 of 67 fail). Replacing it with `IO.chardata_to_string/1` makes the patch pass all 67.
+- **ash-pr-3031 failed the same requirement as in every run**, this time in another test: Opus wrapped the already converted literal for a typed comparison without marking it converted, so it was converted twice and the custom `Label` type rejected its own output (13 of 15 pass). Marking it makes the patch pass all 15.
+- **Harness and environment were clean.** No tool call lost its answer, the solvers' own git commands worked on their edits, and no database connection dropped. Two notes outside any graded command: an existing Livebook Fly.io settings test failed once in a solver's wider run and then passed five reruns, and Livebook's `RemoteIntellisenseTest` cannot start a `:peer` node in the offline workspace's full suite.
+
 ## Validation ledger
 
-A case stays in the release after two reviewed passes under the same case version and harness kit (ADR 0012). A changed case starts its two attempts again. The kit changed after run 8d2e4ed2 ([ADR 0014 amendment](../../docs/adr/0014-run-a-runs-attempts-in-parallel.md)), so all 20 cases collect their two passes under the new kit; runs a0aaa695 and 8d2e4ed2 no longer count. Eight cases also changed in the final case-fix batch.
+Validation is complete. A case stays in the release after two reviewed passes under the same case version and harness kit (ADR 0012); all 20 cases are on the versions and kit of runs 2bbea0a5 and 33348dcc.
 
-- **One reviewed pass under the current kit and case versions (run 2bbea0a5), one more needed:** absinthe-pr-1176, accent-pr-183, beacon-pr-687, cachex-pr-341, guardian-pr-748, livebeats-pr-37, livebook-pr-2219, livebook-pr-2527, livebook-pr-2663, livebook-pr-2822, livebook-pr-3076, operately-pr-1069, operately-pr-1205, pinchflat-pr-610, plausible-pr-5939, plausible-pr-5956, plausible-pr-6449 and vutuv-pr-1759.
-- **Kept by the user's decision whatever their results:** ash-pr-3031 (Opus has missed stated requirements in all five attempts) and livebook-pr-2800 (missed in runs a0aaa695 and 2bbea0a5, passed in run 8d2e4ed2). Both stay sound cases Opus can be measured against.
-- **Final batch:** on 2026-10-27 the user made the fixes after run 8d2e4ed2 the final strengthening batch. In the next two runs only a failure the case is at fault for changes a case; new minor gaps a review finds are recorded instead of reopening validation.
+- **Two reviewed passes (runs 2bbea0a5 and 33348dcc):** absinthe-pr-1176, accent-pr-183, beacon-pr-687, cachex-pr-341, guardian-pr-748, livebeats-pr-37, livebook-pr-2219, livebook-pr-2527, livebook-pr-2663, livebook-pr-2822, livebook-pr-3076, operately-pr-1069, operately-pr-1205, pinchflat-pr-610, plausible-pr-5939, plausible-pr-5956 and plausible-pr-6449.
+- **Kept by the user's decisions, each a sound case Opus missed:**
+  - ash-pr-3031: Opus missed stated requirements in all six attempts.
+  - livebook-pr-2800: missed in runs a0aaa695, 2bbea0a5 and 33348dcc, passed in run 8d2e4ed2.
+  - vutuv-pr-1759: passed in run 2bbea0a5, missed in run 33348dcc, which by the decision made before its results could not remove a case.
+- **Final batch:** the fixes after run 8d2e4ed2 were the last strengthening batch; neither later run changed a case.
+- **Runs 2bbea0a5 and 33348dcc count toward Opus 5.5's published series.** Neither run's outcome changed the release, so both are listed in [`priv/admitted_validation_runs.json`](../../priv/admitted_validation_runs.json) under the ADR 0012 amendment. One fresh scored run completes the series. Every earlier validation run stays unpublished.
