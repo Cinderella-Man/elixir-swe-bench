@@ -1435,7 +1435,8 @@ defmodule EabWeb.DashboardLive do
                 <button
                   :if={
                     @run["status"] == "completed" && is_nil(@run["selection"]) &&
-                      !is_nil(@score["score_percent"]) && @run["validation"] != true
+                      !is_nil(@score["score_percent"]) &&
+                      (@run["validation"] != true || Eab.Series.admitted_validation?(@run))
                   }
                   id="add-result"
                   class="secondary"

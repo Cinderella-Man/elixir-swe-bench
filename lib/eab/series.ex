@@ -6,7 +6,7 @@ defmodule Eab.Series do
   Claude Code program version may differ. Each seed counts once: the first run with a final
   score fills it.
   """
-  alias Eab.{Cache, ModelIdentity, Runner}
+  alias Eab.{Cache, Inventory, ModelIdentity, Runner}
 
   @seeds [101, 102, 103]
   @required 3
@@ -69,8 +69,26 @@ defmodule Eab.Series do
 
   @doc "Runs that may join a series at all: full, unpublishable-free runs with a final score."
   def eligible?(run) do
-    is_map(run) and run["validation"] != true and is_nil(run["selection"]) and
-      is_binary(run["release_id"]) and is_number(Runner.score(run)["score_percent"])
+    is_map(run) and (run["validation"] != true or admitted_validation?(run)) and
+      is_nil(run["selection"]) and is_binary(run["release_id"]) and
+      is_number(Runner.score(run)["score_percent"])
+  end
+
+  @doc """
+  A validation run that a recorded decision admits, by run and release: its outcome could
+  not change the release, so it counts like an ordinary run (ADR 0012).
+  """
+  def admitted_validation?(run) do
+    is_map(run) and run["validation"] == true and
+      Enum.any?(
+        admitted_validation_runs(),
+        &(&1["run_id"] == run["id"] and &1["release_id"] == run["release_id"])
+      )
+  end
+
+  def admitted_validation_runs do
+    Application.get_env(:eab, :admitted_validation_runs) ||
+      Inventory.read_json(Inventory.path("priv/admitted_validation_runs.json"))["runs"]
   end
 
   def seeded?(run), do: is_integer(get_in(run, ["settings", "seed"]))

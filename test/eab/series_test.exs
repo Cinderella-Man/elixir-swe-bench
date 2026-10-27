@@ -165,6 +165,47 @@ defmodule Eab.SeriesTest do
     assert Series.peak_resources([nil]) == nil
   end
 
+  test "a validation run counts only when a recorded decision admits it with its release",
+       %{page: page} do
+    validation = fn id, at ->
+      run(id, nil, [], at)
+      |> put_in(["model", "backend"], "claude_code")
+      |> put_in(["model", "model"], "claude-opus-5-5")
+      |> Map.put("validation", true)
+    end
+
+    admitted = validation.("admitted-validation", "2026-10-27T18:00:00Z")
+    other_release = validation.("admitted-elsewhere", "2026-10-27T19:00:00Z")
+    unlisted = validation.("unlisted-validation", "2026-10-27T20:00:00Z")
+
+    Application.put_env(:eab, :admitted_validation_runs, [
+      %{"run_id" => "admitted-validation", "release_id" => admitted["release_id"]},
+      %{"run_id" => "admitted-elsewhere", "release_id" => String.duplicate("b", 64)}
+    ])
+
+    on_exit(fn -> Application.delete_env(:eab, :admitted_validation_runs) end)
+
+    assert Series.admitted_validation?(admitted)
+    refute Series.admitted_validation?(other_release) or Series.admitted_validation?(unlisted)
+    refute Series.admitted_validation?(Map.delete(admitted, "validation"))
+
+    [series] = Series.group([unlisted, other_release, admitted])
+    assert series["runs"] == ["admitted-validation"]
+
+    assert Results.publish!(admitted, page_root: page) == :added
+
+    for run <- [other_release, unlisted] do
+      assert_raise ArgumentError, ~r/never published/, fn ->
+        Results.publish!(run, page_root: page)
+      end
+    end
+  end
+
+  test "every admitted validation run names its run, its release and the reason" do
+    for entry <- Series.admitted_validation_runs(),
+        do: assert(Map.keys(entry) |> Enum.sort() == ~w(reason release_id run_id))
+  end
+
   test "published series take each seed once and at most three runs", %{page: page} do
     opts = [page_root: page]
     assert Results.publish!(run("first", 101, [false]), opts) == :added

@@ -35,8 +35,8 @@ defmodule Eab.Results do
     require!(run["status"] == "completed", "Only completed runs can be published")
 
     require!(
-      run["validation"] != true,
-      "Validation runs decide which cases stay and are never published"
+      run["validation"] != true or Series.admitted_validation?(run),
+      "Validation runs decide which cases stay and are never published, unless a recorded decision admits them"
     )
 
     require!(
