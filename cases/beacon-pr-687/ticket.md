@@ -9,7 +9,7 @@ Search engines find a site's pages through `robots.txt` and XML sitemaps. A Beac
 - **Per-site routes.** Every `beacon_site` mount serves two more routes, relative to the site's full mount path (the enclosing `scope` paths plus the `beacon_site` prefix). No router change is needed.
   - `GET <mount path>/sitemap.xml`
   - `GET <mount path>/robots.txt`
-- **`beacon_sitemap_index/1`.** This is a new router macro in `Beacon.Router`, imported by `use Beacon.Router` like `beacon_site/2`. `beacon_sitemap_index "/sitemap_index.xml"` adds a `GET` route that serves the sitemap index at the given path, file name included, relative to the enclosing scope. Inside `scope "/seo"`, `beacon_sitemap_index "/all.xml"` serves `/seo/all.xml`. The macro may be used more than once and in any scope. Like any specific route, it must be declared before a `beacon_site "/"` mount that would otherwise catch the path.
+- **`beacon_sitemap_index/1`.** This is a new router macro in `Beacon.Router`, imported by `use Beacon.Router` like `beacon_site/2`. `beacon_sitemap_index "/sitemap_index.xml"` adds a `GET` route that serves the sitemap index at the given path, file name included, relative to the enclosing scope. Inside `scope "/seo"`, `beacon_sitemap_index "/all.xml"` serves `/seo/all.xml`. The macro may be used more than once and in any scope, including the router's top level. Any `pipe_through`, route or scope declared after it, in the same scope or at the top level, works as it would without the index. Like any specific route, it must be declared before a `beacon_site "/"` mount that would otherwise catch the path.
 
 ## Example setup
 

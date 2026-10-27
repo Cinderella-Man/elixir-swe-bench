@@ -18,6 +18,10 @@ The user kept ash-pr-3031 although Opus missed one of its stated requirements: t
 
 The second complete run passed 18 of 20 as graded. accent-pr-183's only failure came from the grader: one of the model's test files could not compile on the starting source and hid its other files from the coverage probe, which now runs each file on its own in that case. Re-graded, the patch passes. Reviewing the passes found a further 15 cases with checks a plausible wrong solution still passes, texts that claim more than the reference delivers, or references that fail a stated input; six references got curator corrections. These were corrected the same way and start their two attempts again, so this amendment keeps the rule rather than relaxing it. Two of the second run's passes (vutuv-pr-1759 and guardian-pr-748) would fail the corrected checks, which is why a pass is reviewed rather than trusted. See the [validation record](../../verification/opus-validation-2026-10-26/README.md).
 
+## Amendment, 2026-10-27: what the third validation run changed
+
+The third complete run, the first with two parallel attempts under [ADR 0014](0014-run-a-runs-attempts-in-parallel.md), passed 18 of 20. Its reviews found 9 more cases where a wrong solution the reviewers built passes every check, a text promises more than the reference, or a reference breaks a stated requirement (two got curator corrections). Each gap was run before anything changed, and the cases were corrected the same way. livebook-pr-2800 failed because Opus built an error message in a way that raises on the non-ASCII text the ticket names; replacing that one call makes its patch pass. The user kept it on the same terms as ash-pr-3031: a sound case that measures model quality, not a case at fault. See the [validation record](../../verification/opus-validation-2026-10-26/README.md).
+
 ## Considered options
 
 - **Keep upstream pins under a recorded exception**: no fork work, but cases would keep two kinds of source and overlay handling.

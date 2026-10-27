@@ -46,7 +46,12 @@ Recurring gaps:
 - **Only one actor or one input shape.** Every title test acted in the browser that played the song; every foreign segment came from a site in another team; every Markdown-split handle had the same shape. Add a second actor, a sibling in the same team, a second shape.
 - **Absolute words in texts.** "Always", "every", "leaves no state behind" and "everything is rolled back" were each false for some input on the reference. Probe such sentences with a throwaway test on the reference and the starting source before keeping them.
 
-Each later model run finds new gaps, because a different solution takes a different wrong turn. The second Opus review still changed 15 cases, though most findings were low severity.
+- **Assertions that cannot fail.** `html =~ "New shared link" or html =~ "<error>"` passed because its first branch always matched, while the error itself was never rendered under the test setup. Check each assertion's failing branch on a wrong solution.
+- **Short, plain inputs only.** Every reason was under 90 characters with no markup; every code block was one line. A truncated store, an unescaped render and a blank-line-dropping formatter all passed. Use long, multi-line inputs with reserved characters.
+- **A change but never a change back.** A cache that keeps a stale entry beside a fresh one passes a single update. Change the value, then change it back.
+- **The reference sharing the model's defect.** A router macro that imported `Phoenix.Router` with `only:` broke every route declared after it, in the reference and in Opus's patch alike, because every check put the macro last. Exercise what the ticket allows after and around a construct, not only the ticket's example layout.
+
+Each later model run finds new gaps, because a different solution takes a different wrong turn. The second Opus review still changed 15 cases and the third 9, though most findings were low or medium severity. Run a reviewer's claimed wrong solution before acting on it: one claimed patch called a function that does not exist and failed for that reason alone, and one confirmation test missed a second wrong solution that a change back catches.
 
 Make every new check deterministic on the starting source too. Global broadcasts reach every test running at the same time, so filter them by this test's own data. A supervisor restart leaves a gap, so retry in a monitored process. Wait for the operation that carries a value before asserting on it. Run a new check several times, under different seeds, before relying on its starting-failure status.
 

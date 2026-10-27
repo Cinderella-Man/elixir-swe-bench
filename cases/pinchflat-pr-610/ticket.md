@@ -12,7 +12,8 @@ A reason is recorded only when the download job actually attempts a download and
 
 | Situation | Reason recorded |
 | --- | --- |
-| yt-dlp exits with an error, for example `ERROR: [youtube] abc123: Private video` | yt-dlp's error message, exactly as reported |
+| yt-dlp exits with an error, for example `ERROR: [youtube] abc123: Private video` | yt-dlp's error message, exactly as reported, however long and whatever characters it contains |
+| yt-dlp exits with an error but its output is empty or only whitespace, for example the runner returning `{:error, "", 1}` | A readable string that includes the printed error term, for example `Unknown error: {:error, "", 1}`. Never an empty or blank string. |
 | yt-dlp reports that the media isn't downloadable yet (an active or still-processing live stream) | A non-empty message saying the item isn't ready to be downloaded yet. The wording is up to you. |
 | An error that isn't text, for example the runner returning `{:error, :connection_reset}` | A readable string that includes the printed error term, for example `Unknown error: {:error, :connection_reset}`. Never the raw term and never an empty string. |
 | yt-dlp downloads the media, but the item can't be updated with the downloaded details, for example because the downloaded title is `youtube video #abc123`, which media items don't accept | A readable, non-empty message. The wording is up to you. |
@@ -72,7 +73,7 @@ Example, for a source that downloads media:
 ## Edge cases and errors
 
 - An unknown source id behaves like the existing source actions: `Ecto.NoResultsError`, which is a 404 in production.
-- A reason can be long or contain any characters. It is rendered escaped, and it may be truncated visually, but the full text must be in the page markup.
+- A reason can be long, span several lines or contain any characters, including `<`, `&` and quotes. It is recorded in full and rendered escaped. It may be truncated visually, but the media item page and every table row that shows it must have the full text in their markup, as visible text or as tooltip or `title` text.
 - A successful download clears the reason even when that download is not a retry, for example a normal scheduled download after indexing.
 
 ## Compatibility

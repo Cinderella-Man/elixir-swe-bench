@@ -1,1 +1,1 @@
-New or updated dedicated tracker scripts return server errors until I restart Community Edition; fix it.
+New or updated dedicated tracker scripts return server errors until I restart Community Edition; fix it. A cache refresh should also bring scripts up to date when a configuration was changed directly in the database or by another node.
