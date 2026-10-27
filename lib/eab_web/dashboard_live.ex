@@ -56,6 +56,7 @@ defmodule EabWeb.DashboardLive do
         },
         validation: false,
         parallel: 1,
+        confirm_stop: false,
         check_kind: "",
         check_case: "",
         solver: Broker.status(),
@@ -346,9 +347,13 @@ defmodule EabWeb.DashboardLive do
     end
   end
 
+  # Stopping interrupts the cases in progress, so the button only asks first.
+  def handle_event("confirm_stop", _, socket), do: {:noreply, assign(socket, confirm_stop: true)}
+  def handle_event("cancel_stop", _, socket), do: {:noreply, assign(socket, confirm_stop: false)}
+
   def handle_event("stop", _, socket) do
     Runs.stop()
-    {:noreply, refresh(socket)}
+    {:noreply, refresh(assign(socket, confirm_stop: false))}
   end
 
   def handle_event("add_result", _, %{assigns: %{publishing: id}} = socket) when not is_nil(id),
@@ -1290,16 +1295,47 @@ defmodule EabWeb.DashboardLive do
             <button class="secondary" phx-click="cancel_contribution">Cancel contribution</button>
           </div>
           <p class="fine-print">
-            One agent works on one case at a time. Upcoming cases prepare in the background, and submitted repairs are graded independently. Prepared images and fixture checks are reused across runs.
+            Each agent works on one case; up to the run's parallel attempts work at once. Upcoming cases prepare in the background, and submitted repairs are graded independently. Prepared images and fixture checks are reused across runs.
           </p>
         </section>
         <section class="panel results">
           <div class="section-title">
             <span class="section-icon" aria-hidden="true">▤</span><h2>Benchmark results</h2><button
               :if={@snapshot.active}
+              id="stop-run"
               class="danger"
-              phx-click="stop"
+              phx-click="confirm_stop"
             >Stop run</button>
+          </div>
+          <div
+            :if={@confirm_stop and @snapshot.active}
+            class="modal-backdrop"
+            phx-click="cancel_stop"
+            phx-window-keydown="cancel_stop"
+            phx-key="Escape"
+          >
+            <div
+              id="stop-confirm"
+              class="modal"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="stop-confirm-title"
+              phx-click={%Phoenix.LiveView.JS{}}
+            >
+              <h3 id="stop-confirm-title">Are you sure?</h3>
+              <p>
+                Stopping ends this run now. Cases in progress are interrupted; finished results are kept, and the run can be resumed later.
+              </p>
+              <div class="modal-actions">
+                <button
+                  id="stop-confirm-no"
+                  class="secondary"
+                  phx-click="cancel_stop"
+                  phx-mounted={Phoenix.LiveView.JS.focus()}
+                >No, keep running</button>
+                <button id="stop-confirm-yes" class="danger" phx-click="stop">Yes, stop the run</button>
+              </div>
+            </div>
           </div>
           <div :if={is_nil(@run)} class="empty">
             <div class="empty-glyph">⌘</div><h3>Ready when you are.</h3><p>

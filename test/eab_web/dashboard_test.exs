@@ -353,7 +353,26 @@ defmodule EabWeb.DashboardTest do
 
     view |> element("#run-series button", "Load run series") |> render_click()
     assert has_element?(view, "#run-series")
-    Eab.Runs.stop()
+
+    # Stop asks first; No, Escape and the backdrop all keep the run going.
+    view |> element("#stop-run") |> render_click()
+    assert has_element?(view, "#stop-confirm[role=dialog]", "Are you sure?")
+    assert Eab.Runs.snapshot().active
+    view |> element("#stop-confirm-no") |> render_click()
+    refute has_element?(view, "#stop-confirm")
+    view |> element("#stop-run") |> render_click()
+    render_keydown(view, "cancel_stop", %{"key" => "Escape"})
+    refute has_element?(view, "#stop-confirm")
+    view |> element("#stop-run") |> render_click()
+    view |> element(".modal-backdrop") |> render_click()
+    refute has_element?(view, "#stop-confirm")
+    assert Eab.Runs.snapshot().active
+
+    # Only Yes stops it.
+    view |> element("#stop-run") |> render_click()
+    view |> element("#stop-confirm-yes") |> render_click()
+    refute has_element?(view, "#stop-confirm")
+    refute Eab.Runs.snapshot().active
 
     Enum.find(1..1000, fn _ ->
       snapshot = Eab.Runs.snapshot()
