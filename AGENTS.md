@@ -1,5 +1,9 @@
 # Repository instructions
 
+## Branches
+
+Work on `main`: commit there and push it. Create or use another branch only when the user explicitly asks for one. This repository keeps `main` as its single branch.
+
 ## Case curation
 
 When adding a benchmark case, resuming an unfinished candidate, changing an existing case's source or preparation, or finishing a curation batch, follow [the case curation workflow](docs/case-curation-loop.md). Every runnable case must use a prepared branch in the user's fork. The workflow defines isolation, qualification, solver validation, explicit user overrides and restoration. For screening and preservation-check design, or unexpected qualification/model results, consult [curation diagnostics and lessons](docs/curation-lessons.md).
