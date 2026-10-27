@@ -26,9 +26,15 @@ The third complete run, the first with two parallel attempts under [ADR 0014](00
 
 The fourth complete run passed 19 of 20; ash-pr-3031 failed on the same requirements as before and stays on the user's terms. Its reviews accepted 12 cases as they are. 8 got one more check or a narrower text, each backed by a wrong solution that passed the released checks; no reference changed. Two harness faults and one environment fault turned up in the logs and were fixed with them. The user made this the final strengthening batch: in the two runs that follow, a case changes only for a failure the case is at fault for, and new minor gaps a review finds are recorded rather than reopening validation. Without that stop, each review of a pass keeps finding smaller gaps (16, 15, 9 and 8 cases in four batches), and validation would never end. See the [validation record](../../verification/opus-validation-2026-10-26/README.md).
 
+## Amendment, 2026-10-27: the last two validation runs may count toward Opus's series
+
+Validation runs stayed unpublished because their outcomes decided which cases stay, so publishing them would score Opus on a set filtered by its own results. That reason holds only while a run's outcome can change the release. Run F (`20261027-183407-2bbea0a5`) changed nothing: under the final-batch rule only a fault of a case changes it, and the user keeps the cases Opus missed. While run G (`20261027-204103-33348dcc`) was still running, with 14 of 20 cases graded and none of its results read by the curator, the user decided that no case leaves the release because Opus misses it in run G either.
+
+If run G's review changes no case, runs F and G count as two of Opus 5.5's three series runs under [ADR 0011](0011-publish-three-run-series.md), and one fresh run completes the series. If it changes any case, neither counts and Opus gets three fresh runs. The two runs join through an explicit list of run IDs in the repository; no run record is edited, and every other validation run stays unpublished, because its results changed cases. ADR 0010's escape test and dry attempt still run before the third run; nothing in the harness changes between them, so passing them also covers runs F and G.
+
 ## Considered options
 
 - **Keep upstream pins under a recorded exception**: no fork work, but cases would keep two kinds of source and overlay handling.
 - **Validate one parked case at a time**, as in the original curation loop: the same evidence with more folder shuffling, and none of it reusable for full-inventory runs.
-- **Count the validation runs as Opus's first two series runs**: two fewer runs, but a score inflated by the selection itself.
+- **Count the validation runs as Opus's first two series runs**: two fewer runs, but a score inflated by the selection itself. Still rejected for runs whose outcome could change the release; see the last amendment.
 - **Archive the old runs**: rejected because the records describe case versions that will no longer exist.
