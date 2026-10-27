@@ -1,0 +1,224 @@
+diff --git a/lib/livebook/live_markdown/import.ex b/lib/livebook/live_markdown/import.ex
+index af8a195..808b709 100644
+--- a/lib/livebook/live_markdown/import.ex
++++ b/lib/livebook/live_markdown/import.ex
+@@ -632,8 +632,9 @@ defmodule Livebook.LiveMarkdown.Import do
+ 
+     {stamp_verified?, notebook, messages} =
+       with %{"offset" => offset, "stamp" => stamp} <- stamp_data,
+-           {:ok, notebook_source} <- safe_binary_slice(notebook_source, 0, offset),
+-           {:ok, metadata} <- Livebook.Hubs.verify_notebook_stamp(hub, notebook_source, stamp) do
++           {:ok, signed_source, unsigned_source} <- split_at_offset(notebook_source, offset),
++           true <- only_stamp?(unsigned_source, stamp_data),
++           {:ok, metadata} <- Livebook.Hubs.verify_notebook_stamp(hub, signed_source, stamp) do
+         notebook = apply_stamp_metadata(notebook, metadata)
+         {true, notebook, []}
+       else
+@@ -658,12 +659,37 @@ defmodule Livebook.LiveMarkdown.Import do
+     {%{notebook | teams_enabled: teams_enabled}, stamp_verified?, messages}
+   end
+ 
+-  defp safe_binary_slice(binary, start, size)
+-       when byte_size(binary) < start + size,
+-       do: :error
++  defp split_at_offset(binary, offset)
++       when is_integer(offset) and offset >= 0 and offset <= byte_size(binary) do
++    signed = binary_part(binary, 0, offset)
++    unsigned = binary_part(binary, offset, byte_size(binary) - offset)
++    {:ok, signed, unsigned}
++  end
++
++  defp split_at_offset(_binary, _offset), do: :error
++
++  # The stamp only covers the source up to the offset, so anything
++  # that follows it is not signed. We make sure that the unsigned
++  # part consists exclusively of the stamp itself (optionally with
++  # surrounding whitespace), otherwise any content added between
++  # the signed source and the stamp (such as new cells or sections)
++  # would be imported as if it was signed.
++  defp only_stamp?(unsigned_source, stamp_data) do
++    # The offset may point in the middle of a multi-byte character,
++    # in which case the source has been tampered with
++    if String.valid?(unsigned_source) do
++      {_, ast, _} = MarkdownHelpers.markdown_to_block_ast(unsigned_source)
++
++      case normalize_comments(ast) do
++        [{:comment, _, ["livebook:" <> json], %{comment: true}}] ->
++          Jason.decode(json) == {:ok, stamp_data}
+ 
+-  defp safe_binary_slice(binary, start, size) do
+-    {:ok, binary_slice(binary, start, size)}
++        _ ->
++          false
++      end
++    else
++      false
++    end
+   end
+ 
+   defp apply_stamp_metadata(notebook, metadata) do
+diff --git a/test/livebook/live_markdown/import_test.exs b/test/livebook/live_markdown/import_test.exs
+index 928fadc..f9d423e 100644
+--- a/test/livebook/live_markdown/import_test.exs
++++ b/test/livebook/live_markdown/import_test.exs
+@@ -1205,6 +1205,131 @@ defmodule Livebook.LiveMarkdown.ImportTest do
+                messages
+     end
+ 
++    test "does not verify the stamp when content is added between the signed source and the stamp" do
++      # Valid stamp, see the "restores hub secret names from notebook stamp" test
++      markdown = """
++      # My Notebook
++
++      ## Section 1
++
++      ```elixir
++      IO.puts("hey")
++      ```
++
++      <!-- livebook:{"offset":58,"stamp":{"token":"XCP.XcdH6x1x9B90SIKObuM8NWuEN7Tg2nyGWV3YhYtw6M0h8c4K0N5EFa8krthkrIqdIj6aEpUcsbEm4klRkSIh_W2YV1PXuMRQA0vCYU042IVFDbz1gq4","version":2}} -->
++      """
++
++      # Sanity check, the unaltered notebook is verified
++      assert {%Notebook{hub_secret_names: ["DB_PASSWORD"]},
++              %{warnings: [], stamp_verified?: true}} =
++               Import.notebook_from_livemd(markdown)
++
++      signed_cell = {:code, :elixir, ~s/IO.puts("hey")/}
++
++      for {addition, expected_sections} <- [
++            {"""
++             ```elixir
++             System.cmd("whoami", [])
++             ```
++             """, [{"Section 1", [signed_cell, {:code, :elixir, ~s/System.cmd("whoami", [])/}]}]},
++            {"""
++             ```erlang
++             os:cmd("whoami").
++             ```
++             """, [{"Section 1", [signed_cell, {:code, :erlang, ~s/os:cmd("whoami")./}]}]},
++            {"""
++             Some unsigned paragraph.
++             """, [{"Section 1", [signed_cell, {:markdown, "Some unsigned paragraph."}]}]},
++            {"""
++             ## Section 2
++
++             ```elixir
++             System.fetch_env!("LB_DB_PASSWORD")
++             ```
++             """,
++             [
++               {"Section 1", [signed_cell]},
++               {"Section 2", [{:code, :elixir, ~s/System.fetch_env!("LB_DB_PASSWORD")/}]}
++             ]}
++          ] do
++        altered_markdown = insert_at_stamp_offset(markdown, "\n" <> addition)
++
++        {notebook, %{warnings: messages, stamp_verified?: stamp_verified?}} =
++          Import.notebook_from_livemd(altered_markdown)
++
++        assert stamp_verified? == false, "expected unverified stamp for:\n#{altered_markdown}"
++        assert notebook.hub_secret_names == []
++
++        assert [
++                 "this notebook can only access environment variables defined in this machine" <>
++                   _
++               ] = messages
++
++        assert sections_summary(notebook) == expected_sections
++      end
++    end
++
++    test "verifies the stamp when there is only whitespace between the signed source and the stamp" do
++      markdown = """
++      # My Notebook
++
++      ## Section 1
++
++      ```elixir
++      IO.puts("hey")
++      ```
++
++      <!-- livebook:{"offset":58,"stamp":{"token":"XCP.XcdH6x1x9B90SIKObuM8NWuEN7Tg2nyGWV3YhYtw6M0h8c4K0N5EFa8krthkrIqdIj6aEpUcsbEm4klRkSIh_W2YV1PXuMRQA0vCYU042IVFDbz1gq4","version":2}} -->
++      """
++
++      for whitespace <- ["\n", "\n\n\n", "  \n", "\t\n", " \t \n\n\t\n"] do
++        altered_markdown = insert_at_stamp_offset(markdown, whitespace)
++
++        assert {notebook, %{warnings: [], stamp_verified?: true}} =
++                 Import.notebook_from_livemd(altered_markdown)
++
++        assert %Notebook{hub_secret_names: ["DB_PASSWORD"]} = notebook
++      end
++    end
++
++    test "verifies the stamp of a notebook exported by Livebook" do
++      for name <- ["My Notebook", "Zażółć gęślą jaźń 🚀"] do
++        {markdown, []} =
++          %{
++            Notebook.new()
++            | name: name,
++              sections: [
++                %{
++                  Notebook.Section.new()
++                  | name: "Sekcja ąę",
++                    cells: [%{Notebook.Cell.new(:code) | source: ~s/IO.puts("hey")/}]
++                }
++              ],
++              hub_secret_names: ["DB_PASSWORD"]
++          }
++          |> Livebook.LiveMarkdown.Export.notebook_to_livemd()
++
++        assert {%Notebook{name: ^name, hub_secret_names: ["DB_PASSWORD"]},
++                %{warnings: [], stamp_verified?: true}} = Import.notebook_from_livemd(markdown)
++
++        assert {%Notebook{name: ^name, hub_secret_names: ["DB_PASSWORD"]},
++                %{warnings: [], stamp_verified?: true}} =
++                 Import.notebook_from_livemd(insert_at_stamp_offset(markdown, "\n \t\n"))
++
++        altered_markdown =
++          insert_at_stamp_offset(markdown, "\n```elixir\nSystem.cmd(\"whoami\", [])\n```\n")
++
++        assert {%Notebook{name: ^name, hub_secret_names: [], sections: [section]},
++                %{warnings: [_message], stamp_verified?: false}} =
++                 Import.notebook_from_livemd(altered_markdown)
++
++        assert [
++                 %Cell.Code{source: ~s/IO.puts("hey")/},
++                 %Cell.Code{source: ~s/System.cmd("whoami", [])/}
++               ] = section.cells
++      end
++    end
++
+     test "restores hub secret names from notebook stamp using offline hub" do
+       markdown = """
+       <!-- livebook:{"hub_id":"team-org-number-3079"} -->
+@@ -1403,4 +1528,28 @@ defmodule Livebook.LiveMarkdown.ImportTest do
+       assert notebook.quarantine_file_entry_names == MapSet.new(["document1.pdf"])
+     end
+   end
++
++  # Inserts the given content right after the signed part of the
++  # notebook source, that is, between the signed source and the stamp
++  defp insert_at_stamp_offset(markdown, content) do
++    [_, json] = Regex.run(~r/<!-- livebook:(\{"offset".*) -->\n\z/, markdown)
++    %{"offset" => offset} = Jason.decode!(json)
++
++    binary_part(markdown, 0, offset) <>
++      content <> binary_part(markdown, offset, byte_size(markdown) - offset)
++  end
++
++  defp sections_summary(notebook) do
++    for section <- notebook.sections do
++      cells =
++        for cell <- section.cells do
++          case cell do
++            %Cell.Code{language: language, source: source} -> {:code, language, source}
++            %Cell.Markdown{source: source} -> {:markdown, source}
++          end
++        end
++
++      {section.name, cells}
++    end
++  end
+ end

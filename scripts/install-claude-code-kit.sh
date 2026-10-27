@@ -35,11 +35,9 @@ while :; do
   [ "$dir" = "/" ] && break
   dir="$(dirname "$dir")"
 done
-if [ -e "$target/.mcp.json" ]; then echo "Refusing: remove $target/.mcp.json first" >&2; exit 1; fi
-
-# Replace the whole .claude folder so stale or extra files cannot survive.
-rm -rf "$target/.claude"
-(cd "$source" && find .claude -type f -not -path '*/__pycache__/*' | sort) | while read -r file; do
+# Replace the whole .claude folder and .mcp.json so stale or extra files cannot survive.
+rm -rf "$target/.claude" "$target/.mcp.json"
+(cd "$source" && { echo .mcp.json; find .claude -type f -not -path '*/__pycache__/*' | sort; }) | while read -r file; do
   mkdir -p "$target/$(dirname "$file")"
   sed "s|__EAB_CONTROLLER_URL__|$url|g" "$source/$file" > "$target/$file"
 done

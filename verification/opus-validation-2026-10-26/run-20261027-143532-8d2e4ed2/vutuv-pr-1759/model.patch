@@ -1,0 +1,995 @@
+diff --git a/docs/architecture/mentions.md b/docs/architecture/mentions.md
+index 3f1e93a..6f4aa62 100644
+--- a/docs/architecture/mentions.md
++++ b/docs/architecture/mentions.md
+@@ -187,6 +187,37 @@ like any other body error.
+ - Posts only. A DM already goes to one recipient, and the other mention
+   surfaces (headline, descriptions, ads) notify nobody.
+ 
++## The editor's `@`-picker
++
++The editor asks the server two things while a member writes, both as JSON for
++the signed-in member (`VutuvWeb.MentionController`, in the login-required
++`/system` scope; a signed-out request gets the usual redirect to `/`). Neither
++ever fails on its input: a missing, short or odd query is an empty answer.
++
++**`GET /system/mentions/suggest?q=`** answers `Mentions.suggest/3` (8 rows) as
++`{"results": [{kind, handle, name, avatar, initials}]}`. A member matches by
++handle prefix or by a first/last/"first last" name containing the term, a page
++by root-handle prefix or by name; the term (2 characters at least) is literal
++text, never a `LIKE` pattern. Nobody the member or the site ruled out is offered
++— the member themself, blocks in either direction, unconfirmed or
++moderation-hidden members, pages without a root handle or not publicly visible —
++because a mention is a notification. One order for both kinds: followed accounts
++first (a muted follow counts), then handle-prefix matches, then the lowercased
++name, then the handle, compared **by code point** (`COLLATE "C"`), so `max_b`
++sorts before `maxa` and `é` after `z`. Ranking and exclusions run in SQL before
++the limit, so an excluded account never takes a place.
++
++**`GET /system/mentions/check?handles=a,b`** answers `Mentions.check_handles/1`
++as `{"known", "checked"}`: `checked` is the normalized, de-duplicated handles
++(at most 50, so "not looked at" never reads as "unknown"), `known` those that
++`VutuvWeb.Markdown.render/1` will link. The renderer answers that itself
++(`VutuvWeb.Markdown.linked_handles/1`): it runs `@handle` through the same
++Markdown pass and the same lookups, so the check and the page cannot disagree.
++That is narrower than the save-time existence check on purpose — a hidden page
++may still be named, but it is not linked — and it catches what Markdown takes
++apart: `@max_mustermann_` renders as `@max` and an emphasised `mustermann`, so
++it is not known even when a member holds the handle.
++
+ ## Availability (anti-hijack)
+ 
+ A handle is only claimable if `Mentions.mentioned_in_posts?/1` is false — it is
+@@ -242,7 +273,9 @@ posts (the newest five, plus an "and N more" count).
+ ## Key files & tests
+ 
+ - `lib/vutuv/mentions.ex` — the chokepoint (grammar, rewrite, validation, scan,
+-  `mentioned_users/2`).
++  `mentioned_users/2`, the picker's `suggest/3` and `check_handles/1`).
++- `lib/vutuv_web/controllers/mention_controller.ex` — the picker's two JSON
++  endpoints.
+ - `lib/vutuv/posts.ex` — `sync_mentions/1`, the `post_mentions` reconcile.
+ - `lib/vutuv/posts/post_mention.ex` — the resolved index row.
+ - `lib/vutuv/activity.ex` — `mention_events/1` + the `"mention"` feed source.
+@@ -253,7 +286,8 @@ posts (the newest five, plus an "and N more" count).
+ - `test/vutuv/mentions_test.exs`, `mentions_local_address_test.exs`,
+   `vutuv_web/markdown_local_address_test.exs`, `vutuv_web/mention_form_test.exs`,
+   `mention_existence_test.exs`,
+-  `mention_limit_test.exs`,
++  `mention_limit_test.exs`, `mention_suggestions_test.exs`,
++  `vutuv_web/controllers/mention_controller_test.exs`,
+   `mention_notifications_test.exs`, `handle_availability_test.exs`,
+   `accounts/handle_change_propagation_test.exs`,
+   `vutuv_web/live/handle_change_notification_test.exs`.
+diff --git a/lib/vutuv/mentions.ex b/lib/vutuv/mentions.ex
+index e937184..cef6b2a 100644
+--- a/lib/vutuv/mentions.ex
++++ b/lib/vutuv/mentions.ex
+@@ -4,7 +4,7 @@ defmodule Vutuv.Mentions do
+ 
+   A mention is plain text `@handle` inside a Markdown body — nothing structured
+   is stored, it becomes a profile link only at render time
+-  (`VutuvWeb.Markdown`). Five concerns therefore have to agree on *what counts
++  (`VutuvWeb.Markdown`). Six concerns therefore have to agree on *what counts
+   as a mention*, so they share one definition here:
+ 
+     * **Rendering** — `VutuvWeb.Markdown` links each local `@handle` and calls
+@@ -33,6 +33,10 @@ defmodule Vutuv.Mentions do
+       new handle is only claimable when it is used in no content
+       (`used_in_content?/1`), so a rename cannot hijack someone else's existing
+       `@new` links.
++    * **Composition** — the editor's `@`-picker offers accounts for a
++      half-typed handle (`suggest/3`) and asks which handles of a draft will
++      become links (`check_handles/1`, answered by the renderer itself so the
++      editor never promises a link the page does not draw).
+ 
+   What counts is decided by the **host**, not by the shape (issue #1560).
+   `@handle` and `@handle@<our own host>` name the same member — the second is
+@@ -56,6 +60,8 @@ defmodule Vutuv.Mentions do
+   """
+ 
+   import Ecto.Query
++  import Vutuv.Moderation.Query, only: [account_confirmed_row: 1, account_hidden_row: 1]
++  import Vutuv.Organizations.Query, only: [organization_public_row: 1]
+ 
+   alias Ecto.Changeset
+   alias Vutuv.Accounts.User
+@@ -71,6 +77,9 @@ defmodule Vutuv.Mentions do
+   alias Vutuv.Profiles.WorkExperience
+   alias Vutuv.Repo
+   alias Vutuv.SearchText
++  alias Vutuv.Social.Block
++  alias Vutuv.Social.Follow
++  alias VutuvWeb.Markdown
+ 
+   # The canonical `@`/`#` entity grammar. It lives here (not in the renderer) so
+   # rendering, validation and rewriting share ONE definition; `VutuvWeb.Markdown`
+@@ -138,6 +147,16 @@ defmodule Vutuv.Mentions do
+   # a mailing tool.
+   @max_post_mentions 5
+ 
++  # The editor's `@`-picker (`suggest/3`, `check_handles/1`). Two typed
++  # characters before anything is offered: one letter matches half the
++  # membership by name and tells the ranking nothing. Eight rows fit the picker
++  # without scrolling. Fifty handles per check is ten times what one post may
++  # mention (`@max_post_mentions`), so a real draft never reaches it, while a
++  # crafted request cannot turn one call into an unbounded lookup.
++  @suggest_min_term_length 2
++  @suggest_limit 8
++  @max_checked_handles 50
++
+   @doc "The canonical entity regex, so the renderer shares this module's grammar."
+   def entity_regex, do: @entity
+ 
+@@ -162,6 +181,15 @@ defmodule Vutuv.Mentions do
+   @doc "The `{schema, field}` mention surfaces scanned and rewritten by this module."
+   def surfaces, do: @surfaces
+ 
++  @doc "How many characters a normalized term needs before `suggest/3` answers."
++  def suggest_min_term_length, do: @suggest_min_term_length
++
++  @doc "How many accounts `suggest/3` offers when the caller names no limit."
++  def suggest_limit, do: @suggest_limit
++
++  @doc "How many distinct handles one `check_handles/1` call looks at."
++  def max_checked_handles, do: @max_checked_handles
++
+   ## Detection --------------------------------------------------------------
+ 
+   @doc """
+@@ -281,6 +309,102 @@ defmodule Vutuv.Mentions do
+     end
+   end
+ 
++  ## The editor's @-picker -------------------------------------------------
++
++  @doc """
++  The accounts to offer `viewer` for a half-typed `@term`, best match first:
++  at most `limit` `%User{}` and `%Organization{}` structs, ranked together.
++
++  The term is normalized like any typed handle (`Vutuv.Handles.normalize/1`:
++  trimmed, a leading `@` dropped, lowercased) and matched **literally** — `%`,
++  `_` and `\\` are text, not wildcards. A term shorter than
++  `suggest_min_term_length/0` answers `[]`.
++
++  A **member** matches when their handle starts with the term or their first
++  name, last name or "first last" contains it; a **page** when its root handle
++  starts with the term or its name contains it. A handle that merely contains
++  the term further in does not match, because nobody types the middle of a
++  handle.
++
++  Never offered: the viewer, a member blocked in either direction, an
++  unconfirmed or moderation-hidden member (`Vutuv.Moderation.Query`), a page
++  without a root handle (it cannot be mentioned) or one that is not publicly
++  visible. A mention is a notification, so offering somebody the member or the
++  site has already ruled out would be handing them a way to reach that person.
++
++  The order — one order for both kinds:
++
++    1. accounts the viewer follows (a muted follow still counts),
++    2. then a handle-prefix match before a name-only match,
++    3. then the lowercased name (a member's first and last name without
++       honorifics, a page's name),
++    4. then the lowercased handle,
++
++  with names and handles compared **by code point** (`COLLATE "C"`, which is
++  byte order and so code-point order for UTF-8), not by the database's
++  linguistic collation: spaces and punctuation count like any character, so
++  `"ada zed"` sorts before `"adam bee"` and `max_b` before `maxa`, and `é`
++  sorts after `z`. Ranking and exclusions run in SQL before the limit is taken,
++  so the answer is the top of the full ranked list and an excluded account
++  never takes a place.
++  """
++  def suggest(viewer, term, limit \\ @suggest_limit)
++
++  def suggest(%User{id: viewer_id}, term, limit) when is_integer(limit) do
++    term = normalize(term)
++
++    if limit < 1 or not queryable?(term) or String.length(term) < @suggest_min_term_length do
++      []
++    else
++      patterns = %{
++        term: term,
++        prefix: SearchText.escape_like(term) <> "%",
++        contains: SearchText.contains(term)
++      }
++
++      (member_suggestions(viewer_id, patterns, limit) ++
++         page_suggestions(viewer_id, patterns, limit))
++      |> Enum.sort_by(&suggestion_rank/1)
++      |> Enum.take(limit)
++      |> Enum.map(&elem(&1, 0))
++    end
++  end
++
++  @doc """
++  Which of `handles` will become mention links: `{checked, resolved}`.
++
++  `checked` is the handles normalized like a typed handle, blanks dropped,
++  duplicates removed in order of first appearance and capped at the first
++  `max_checked_handles/0`, so a caller can tell "not looked at" apart from
++  "unknown". `resolved` is the `MapSet` of those that
++  `VutuvWeb.Markdown.render/1` links when the handle is written as `@handle` —
++  decided by the renderer itself (`VutuvWeb.Markdown.linked_handles/1`), so the
++  two cannot disagree:
++
++    * a member's handle resolves whatever the member's state — the renderer
++      links every member and the profile decides what it shows;
++    * a page's root handle resolves only while the page is publicly visible;
++    * a handle Markdown takes apart before mentions are linked does not
++      resolve: `_` is emphasis, so `@max_mustermann_` renders as `@max` and an
++      emphasised `mustermann`, and no link to `max_mustermann_` appears.
++
++  Deliberately narrower than the save-time existence check
++  (`validate_mentions_exist/2`), which accepts any held handle: a hidden page
++  may still be named, but it is not resolved because it will not be linked.
++  No viewer is involved; the answer is the same for everyone.
++  """
++  def check_handles(handles) when is_list(handles) do
++    checked =
++      handles
++      |> Enum.filter(&is_binary/1)
++      |> Enum.map(&normalize/1)
++      |> Enum.reject(&(&1 == ""))
++      |> Enum.uniq()
++      |> Enum.take(@max_checked_handles)
++
++    {checked, Markdown.linked_handles(checked)}
++  end
++
+   ## Display form ----------------------------------------------------------
+ 
+   @doc """
+@@ -760,4 +884,113 @@ defmodule Vutuv.Mentions do
+   defp normalize(value) when is_binary(value), do: Handles.normalize(value)
+ 
+   defp normalize(_), do: ""
++
++  # Text that is not valid UTF-8 or carries a NUL byte can be no handle and no
++  # name: Postgres text holds neither, and would refuse the query with an error
++  # rather than answer it. Such a term simply matches nothing.
++  defp queryable?(term), do: String.valid?(term) and not String.contains?(term, <<0>>)
++
++  # Each row is `{account, followed?, handle_prefix?, name_key, handle_key}`,
++  # and both queries order by exactly that, so merging the two top-`limit`
++  # lists in Elixir gives the top of the whole ranked set. The keys are the
++  # database's `lower(...)` values and Erlang compares binaries byte by byte —
++  # the same order as their `COLLATE "C"` in SQL, so the merge cannot reorder
++  # what either query ranked.
++  defp suggestion_rank({_account, followed?, prefix?, name_key, handle_key}),
++    do: {not followed?, not prefix?, name_key, handle_key}
++
++  # A member's name as the ranking reads it: first and last name joined by one
++  # space with a blank part skipped (the site's "first last", as on the avatar
++  # tile), no honorifics, lowercased.
++  defmacrop member_name_key(u) do
++    quote do
++      fragment(
++        "lower(concat_ws(' ', nullif(?, ''), nullif(?, '')))",
++        unquote(u).first_name,
++        unquote(u).last_name
++      )
++    end
++  end
++
++  defp member_suggestions(viewer_id, patterns, limit) do
++    %{prefix: prefix} = patterns
++
++    from(u in User,
++      as: :member,
++      left_join: f in Follow,
++      on: f.followee_id == u.id and f.follower_id == ^viewer_id,
++      where: u.id != ^viewer_id and not is_nil(u.username),
++      where: account_confirmed_row(u) and not account_hidden_row(u),
++      where: ^member_match(patterns),
++      where: not exists(blocks_with_member(viewer_id)),
++      select:
++        {u, not is_nil(f.id), ilike(u.username, ^prefix), member_name_key(u),
++         fragment("lower(?)", u.username)},
++      order_by: [
++        desc: not is_nil(f.id),
++        desc: ilike(u.username, ^prefix),
++        asc: fragment("? COLLATE \"C\"", member_name_key(u)),
++        asc: fragment("lower(?) COLLATE \"C\"", u.username)
++      ],
++      limit: ^limit
++    )
++    |> Repo.all()
++  end
++
++  defp page_suggestions(viewer_id, patterns, limit) do
++    %{prefix: prefix, contains: contains} = patterns
++
++    from(o in Organization,
++      left_join: f in Follow,
++      on: f.followee_organization_id == o.id and f.follower_id == ^viewer_id,
++      where: not is_nil(o.username) and o.username != "",
++      where: organization_public_row(o),
++      where: ilike(o.username, ^prefix) or ilike(o.name, ^contains),
++      select:
++        {o, not is_nil(f.id), ilike(o.username, ^prefix),
++         fragment("lower(coalesce(?, ''))", o.name), fragment("lower(?)", o.username)},
++      order_by: [
++        desc: not is_nil(f.id),
++        desc: ilike(o.username, ^prefix),
++        asc: fragment("lower(coalesce(?, '')) COLLATE \"C\"", o.name),
++        asc: fragment("lower(?) COLLATE \"C\"", o.username)
++      ],
++      limit: ^limit
++    )
++    |> Repo.all()
++  end
++
++  # Handle prefix, or the term inside the first name, the last name or
++  # "first last". Without a space in the term, "first last" contains it only
++  # where the first or the last name already does, so the concatenation arm —
++  # an expression no trigram index covers, which turns the whole OR into a
++  # sequential scan (see `Vutuv.Directory`) — is added only for a term that
++  # spans the space.
++  defp member_match(%{term: term, prefix: prefix, contains: contains}) do
++    columns =
++      dynamic(
++        [u],
++        ilike(u.username, ^prefix) or ilike(u.first_name, ^contains) or
++          ilike(u.last_name, ^contains)
++      )
++
++    if String.contains?(term, " ") do
++      dynamic(
++        [u],
++        ^columns or ilike(fragment("? || ' ' || ?", u.first_name, u.last_name), ^contains)
++      )
++    else
++      columns
++    end
++  end
++
++  # A block in either direction, against the member row of the outer query.
++  defp blocks_with_member(viewer_id) do
++    from(b in Block,
++      where:
++        (b.blocker_id == ^viewer_id and b.blocked_id == parent_as(:member).id) or
++          (b.blocked_id == ^viewer_id and b.blocker_id == parent_as(:member).id),
++      select: 1
++    )
++  end
+ end
+diff --git a/lib/vutuv_web/components/ui.ex b/lib/vutuv_web/components/ui.ex
+index 8e745fa..56bee40 100644
+--- a/lib/vutuv_web/components/ui.ex
++++ b/lib/vutuv_web/components/ui.ex
+@@ -2150,9 +2150,16 @@ defmodule VutuvWeb.UI do
+     """
+   end
+ 
+-  # A page's monogram is deliberately ONE letter — the shipped look of every
+-  # organization tile — where a member's `name_initials/1` takes two.
+-  defp organization_initial(name) do
++  @doc """
++  The monogram an organization tile shows when the page has no logo: the
++  uppercased first letter of its `name`, or `?` for a blank one.
++
++  Deliberately ONE letter — the shipped look of every organization tile —
++  where a member's `name_initials/1` takes two. Public so a client drawing the
++  same tile (the editor's `@`-picker, `VutuvWeb.MentionController`) shows the
++  same letter.
++  """
++  def organization_initial(name) when is_binary(name) do
+     name
+     |> String.trim()
+     |> String.first()
+@@ -2160,6 +2167,8 @@ defmodule VutuvWeb.UI do
+     |> String.upcase()
+   end
+ 
++  def organization_initial(_name), do: "?"
++
+   @doc """
+   A **stack of overlapping avatars**, each linking to that member's profile and
+   carrying their name as its tooltip, with the rest collapsing into a trailing
+diff --git a/lib/vutuv_web/controllers/mention_controller.ex b/lib/vutuv_web/controllers/mention_controller.ex
+new file mode 100644
+index 0000000..1f42c2b
+--- /dev/null
++++ b/lib/vutuv_web/controllers/mention_controller.ex
+@@ -0,0 +1,106 @@
++defmodule VutuvWeb.MentionController do
++  @moduledoc """
++  The two JSON answers behind the editor's `@`-picker, for the signed-in member
++  who is writing (`/system/mentions/*`):
++
++    * `suggest` — which accounts to offer for a half-typed handle, best match
++      first (`Vutuv.Mentions.suggest/3`), as
++      `{"results": [{kind, handle, name, avatar, initials}]}`;
++    * `check` — which handles of a draft will become mention links when it is
++      rendered (`Vutuv.Mentions.check_handles/1`), as `{"known", "checked"}`.
++
++  Both live in the login-required `/system` scope (the settings pipeline): a
++  signed-out request is redirected to the start page like every other member
++  page and never sees JSON. Neither ever fails on its input — a missing, short
++  or odd query is an empty answer, not an error, because the editor asks on
++  every keystroke and has nothing useful to do with a 4xx.
++
++  The routes sit in the `:browser` pipeline, whose `accepts` list has no
++  `json`, so the editor fetches without an `Accept` header (fetch's default
++  `*/*`), like the other JSON endpoints there (see `assets/js/util.js`).
++  """
++  use VutuvWeb, :controller
++
++  alias Vutuv.Accounts.User
++  alias Vutuv.Avatar
++  alias Vutuv.Mentions
++  alias Vutuv.Organizations.Organization
++  alias Vutuv.Organizations.OrganizationImage
++  alias VutuvWeb.UI
++
++  @doc "`GET /system/mentions/suggest?q=<term>`"
++  def suggest(conn, params) do
++    results =
++      conn.assigns.current_user
++      |> Mentions.suggest(text_param(params, "q"))
++      |> Enum.map(&suggestion_row/1)
++
++    json(conn, %{results: results})
++  end
++
++  @doc "`GET /system/mentions/check?handles=<comma-separated handles>`"
++  def check(conn, params) do
++    {checked, resolved} = params |> handles_param() |> Mentions.check_handles()
++
++    json(conn, %{known: Enum.filter(checked, &MapSet.member?(resolved, &1)), checked: checked})
++  end
++
++  # Anything but a plain string (`q[]=…`, `q[a]=…`) is no text at all.
++  defp text_param(params, key) do
++    case Map.get(params, key) do
++      value when is_binary(value) -> value
++      _ -> ""
++    end
++  end
++
++  # The handles arrive as one comma-separated value. A repeated `handles[]=`
++  # list is read the same way, item by item, rather than refused.
++  defp handles_param(params) do
++    case Map.get(params, "handles") do
++      value when is_binary(value) ->
++        String.split(value, ",")
++
++      values when is_list(values) ->
++        values |> Enum.filter(&is_binary/1) |> Enum.flat_map(&String.split(&1, ","))
++
++      _ ->
++        []
++    end
++  end
++
++  defp suggestion_row(%User{} = user) do
++    %{
++      kind: "user",
++      handle: user.username,
++      name: member_name(user),
++      # The thumbnail URL, or nil: no picture, or one still held for moderation
++      # review (`Vutuv.Uploads.url/3` answers nil for both). Never the inline
++      # placeholder `Vutuv.Avatar.display_url/2` falls back to — that is a
++      # stand-in, not the member's picture, and the picker draws initials then.
++      avatar: Avatar.url({user.avatar, user}, :thumb),
++      initials: UI.name_initials(user)
++    }
++  end
++
++  defp suggestion_row(%Organization{} = organization) do
++    %{
++      kind: "organization",
++      handle: organization.username,
++      name: organization.name,
++      # The logo at the version every organization tile draws it at
++      # (`VutuvWeb.UI.organization_logo/1`): `thumb` is a centre-cropped square,
++      # which cuts the sides off a wordmark. Nil without a logo.
++      avatar: OrganizationImage.token_url(organization.logo, "feed"),
++      initials: UI.organization_initial(organization.name)
++    }
++  end
++
++  # The full name with honorifics ("Dr. Ada Lovelace"), each blank part skipped
++  # so no double space is left where one is missing.
++  defp member_name(user) do
++    [user.honorific_prefix, user.first_name, user.last_name, user.honorific_suffix]
++    |> Enum.map(&(&1 |> to_string() |> String.trim()))
++    |> Enum.reject(&(&1 == ""))
++    |> Enum.join(" ")
++  end
++end
+diff --git a/lib/vutuv_web/markdown.ex b/lib/vutuv_web/markdown.ex
+index 8f8d098..49a2cc2 100644
+--- a/lib/vutuv_web/markdown.ex
++++ b/lib/vutuv_web/markdown.ex
+@@ -102,6 +102,55 @@ defmodule VutuvWeb.Markdown do
+ 
+   def render(_), do: Phoenix.HTML.raw("")
+ 
++  @doc """
++  The `handles` (lowercased local handles, without the `@`) that `render/1`
++  turns into a mention link when one is written on its own as `@handle` — as a
++  `MapSet`. The answer behind the editor's mention check
++  (`Vutuv.Mentions.check_handles/1`), asked of the renderer itself so the two
++  cannot drift apart.
++
++  Two things must both hold, and both are decided by the code `render/1` runs:
++
++    * the handle survives the Markdown pass **whole** — Earmark reads `_` as
++      emphasis, so `@max_mustermann_` comes out as `@max` followed by an
++      emphasised `mustermann`, and the entity pass then sees `@max`, not the
++      handle that was typed. That pass is DB-free, so it is run for real
++      rather than predicted;
++    * an account the renderer links holds it: any member, whatever their
++      state, or a publicly visible page (`mention_targets/1`, the same two
++      batched lookups a rendered body makes).
++  """
++  def linked_handles(handles) when is_list(handles) do
++    case Enum.filter(handles, &renders_whole_mention?/1) do
++      [] ->
++        MapSet.new()
++
++      whole ->
++        targets = mention_targets(whole)
++
++        whole
++        |> Enum.filter(&Map.has_key?(targets, String.downcase(&1)))
++        |> MapSet.new()
++    end
++  end
++
++  # Whether `@handle` alone still reads as that one bare mention once it has
++  # been through `render/1`'s Markdown and link passes — the exact text the
++  # entity pass then scans. Only the handle grammar can survive at all, so
++  # anything else is turned away before Earmark is asked.
++  defp renders_whole_mention?(handle) when is_binary(handle) do
++    Regex.match?(~r/\A[A-Za-z0-9_]+\z/, handle) and
++      ("@" <> handle)
++      |> render_pipeline()
++      |> open_links_in_new_tab()
++      |> tokenize_html()
++      |> entity_candidates()
++      |> elem(0)
++      |> Enum.member?(String.downcase(handle))
++  end
++
++  defp renders_whole_mention?(_handle), do: false
++
+   @doc """
+   Render a post's Markdown (`Phoenix.HTML.safe()`).
+ 
+diff --git a/lib/vutuv_web/router.ex b/lib/vutuv_web/router.ex
+index 7145a8a..d26a343 100644
+--- a/lib/vutuv_web/router.ex
++++ b/lib/vutuv_web/router.ex
+@@ -1522,6 +1522,13 @@ defmodule VutuvWeb.Router do
+ 
+     get("/welcome", WelcomeController, :show)
+     post("/welcome", WelcomeController, :create)
++
++    # The editor's `@`-picker (VutuvWeb.MentionController): which accounts to
++    # offer for a half-typed handle, and which handles of a draft will become
++    # mention links. JSON for the signed-in member who is writing, so it rides
++    # the same login-required pipeline as the page above.
++    get("/mentions/suggest", MentionController, :suggest)
++    get("/mentions/check", MentionController, :check)
+   end
+ 
+   # The member's own editing world, user-agnostic: every /settings/* page
+diff --git a/test/vutuv/mention_suggestions_test.exs b/test/vutuv/mention_suggestions_test.exs
+new file mode 100644
+index 0000000..f5483d6
+--- /dev/null
++++ b/test/vutuv/mention_suggestions_test.exs
+@@ -0,0 +1,263 @@
++defmodule Vutuv.MentionSuggestionsTest do
++  @moduledoc """
++  The server half of the editor's `@`-picker: `Vutuv.Mentions.suggest/3` (which
++  accounts to offer for a half-typed handle, best match first) and
++  `Vutuv.Mentions.check_handles/1` (which handles of a draft will become
++  mention links).
++
++  The suggestions are a notification channel in waiting, so the tests that
++  matter most are the exclusions (nobody the member or the site ruled out is
++  ever offered, and nobody excluded takes a place) and the ranking applying to
++  the whole match set before the limit. The check is only worth having if it
++  agrees with `VutuvWeb.Markdown.render/1` in both directions, so it is
++  measured against the renderer rather than against a list of expectations.
++  """
++  use Vutuv.DataCase, async: true
++
++  alias Vutuv.Mentions
++  alias Vutuv.Social.Block
++  alias VutuvWeb.Markdown
++
++  defp member(username, first, last, attrs \\ []) do
++    insert(
++      :activated_user,
++      Keyword.merge([username: username, first_name: first, last_name: last], attrs)
++    )
++  end
++
++  defp page(username, name, attrs \\ []) do
++    insert(:organization, Keyword.merge([username: username, name: name], attrs))
++  end
++
++  defp follow_page!(viewer, page, muted),
++    do: insert(:follow, follower: viewer, followee_organization: page, muted: muted)
++
++  defp block!(blocker, blocked),
++    do: Repo.insert!(%Block{blocker_id: blocker.id, blocked_id: blocked.id})
++
++  defp handles(accounts), do: Enum.map(accounts, & &1.username)
++
++  defp suggest(viewer, term, limit \\ 8), do: viewer |> Mentions.suggest(term, limit) |> handles()
++
++  defp past,
++    do: NaiveDateTime.add(NaiveDateTime.utc_now(), -86_400) |> NaiveDateTime.truncate(:second)
++
++  defp future,
++    do: NaiveDateTime.add(NaiveDateTime.utc_now(), 86_400) |> NaiveDateTime.truncate(:second)
++
++  setup do
++    {:ok, viewer: member("viewer", "Vera", "Viewer")}
++  end
++
++  describe "suggest/3 ranking" do
++    test "the documented example: followed first, then handle prefix, then name", %{
++      viewer: viewer
++    } do
++      adaclub = page("adaclub", "Ada Club")
++      kfriend = member("kfriend", "Ada", "Friend")
++      follow_page!(viewer, adaclub, true)
++      follow!(viewer, kfriend)
++
++      member("adams", "Bea", "Adams")
++      page("adalab", "Ada Lab")
++      member("lovelace", "Ada", "Lovelace")
++      page("techhub", "Hub of Ada")
++
++      assert suggest(viewer, "ada") == ~w(adaclub kfriend adalab adams lovelace techhub)
++    end
++
++    test "names and handles compare by code point, spaces and punctuation included", %{
++      viewer: viewer
++    } do
++      # Every one of these is a name-only match for "zz", so the name decides.
++      member("bee_zz", "Adam", "Bee zz")
++      member("zed_zz", "Ada", "Zed zz")
++      member("emile_zz", "Émile", "zz")
++      member("zoe_zz", "Zoe", "zz")
++
++      # The database's own collation (en_US) would put "adam bee" first, since
++      # it ignores the space, and "émile" among the e's.
++      assert suggest(viewer, "zz") == ~w(zed_zz bee_zz zoe_zz emile_zz)
++    end
++
++    test "the same name falls back to the handle, by code point", %{viewer: viewer} do
++      member("maxa", "Max", "Same")
++      member("max_b", "Max", "Same")
++
++      # `_` (0x5F) sorts before `a` (0x61); a linguistic collation skips it.
++      assert suggest(viewer, "max") == ~w(max_b maxa)
++    end
++
++    test "a followed member who only matches by name beats fifty handle-prefix strangers", %{
++      viewer: viewer
++    } do
++      for n <- 1..50, do: member("ann#{n}", "Stranger", "Number#{n}")
++      friend = member("kfriend", "Hannah", "Friend")
++      follow!(viewer, friend)
++
++      assert [first | _] = suggest(viewer, "ann")
++      assert first == "kfriend"
++    end
++
++    test "a smaller limit is the top of a larger one", %{viewer: viewer} do
++      for {handle, first} <- [{"ada_one", "Zora"}, {"ada_two", "Yuri"}, {"xyz", "Ada"}],
++          do: member(handle, first, "Test")
++
++      page("ada_page", "Ada Page")
++      page("other_page", "Adaptive Org")
++      follow!(viewer, Vutuv.Repo.get_by!(Vutuv.Accounts.User, username: "xyz"))
++
++      full = suggest(viewer, "ada", 100)
++      assert length(full) == 5
++
++      for limit <- 1..5, do: assert(suggest(viewer, "ada", limit) == Enum.take(full, limit))
++    end
++  end
++
++  describe "suggest/3 matching" do
++    test "normalizes the term like a typed handle", %{viewer: viewer} do
++      member("adalove", "Ada", "Love")
++
++      for term <- ["@Ada", " ada ", "ADA", "ad"], do: assert(suggest(viewer, term) == ["adalove"])
++    end
++
++    test "a term under two characters answers nothing", %{viewer: viewer} do
++      member("adalove", "Ada", "Love")
++
++      for term <- ["", "   ", "a", "@a", nil], do: assert(Mentions.suggest(viewer, term) == [])
++    end
++
++    test "matches a handle prefix and names, never the middle of a handle", %{viewer: viewer} do
++      member("adalove", "Ada", "Lovelace")
++      member("xadax", "Nobody", "Here")
++
++      assert suggest(viewer, "lovel") == ["adalove"]
++      assert suggest(viewer, "a lov") == ["adalove"]
++      assert suggest(viewer, "ada") == ["adalove"]
++    end
++
++    test "the term is literal text, not a LIKE pattern", %{viewer: viewer} do
++      member("ada_x", "First", "Person")
++      member("adaline", "Second", "Person")
++      member("pct", "Has 100%a", "Percent")
++
++      assert suggest(viewer, "ada_") == ["ada_x"]
++      assert suggest(viewer, "%a") == ["pct"]
++      assert suggest(viewer, "\\a") == []
++    end
++
++    test "a page matches by root handle prefix or by name", %{viewer: viewer} do
++      page("acme", "Acme GmbH")
++      page("rocket", "The Acme Rockets")
++      page("xacme", "Somebody Else")
++
++      assert suggest(viewer, "acme") == ["acme", "rocket"]
++    end
++  end
++
++  describe "suggest/3 exclusions" do
++    test "never offers the viewer or a member blocked in either direction", %{viewer: viewer} do
++      blocked = member("adablocked", "Ada", "Blocked")
++      blocker = member("adablocker", "Ada", "Blocker")
++      member("adaok", "Ada", "Fine")
++      block!(viewer, blocked)
++      block!(blocker, viewer)
++
++      assert suggest(viewer, "ada") == ["adaok"]
++      assert suggest(viewer, "vera") == []
++    end
++
++    test "never offers unconfirmed or moderation-hidden members", %{viewer: viewer} do
++      insert(:user, username: "ada_unconfirmed", first_name: "X", last_name: "Y")
++      member("ada_frozen", "X", "Y", frozen_at: past())
++      member("ada_deactivated", "X", "Y", deactivated_at: past())
++      member("ada_unreachable", "X", "Y", unreachable_at: past())
++      member("ada_suspended", "X", "Y", suspended_until: future())
++
++      member("ada_legacy", "X", "Y", email_confirmed?: nil)
++      member("ada_served", "X", "Z", suspended_until: past())
++
++      assert suggest(viewer, "ada") == ["ada_legacy", "ada_served"]
++    end
++
++    test "never offers a page without a root handle or one that is not public", %{
++      viewer: viewer
++    } do
++      page(nil, "Ada Without Handle")
++      page("ada_pending", "Pending", status: "pending")
++      page("ada_archived", "Archived", status: "archived")
++      page("ada_frozen", "Frozen", frozen_at: past())
++      page("ada_public", "Public")
++
++      assert suggest(viewer, "ada") == ["ada_public"]
++    end
++
++    test "excluded accounts never use up the limit", %{viewer: viewer} do
++      for n <- 1..30, do: block!(viewer, member("ada#{n}", "Ada", "Blocked#{n}"))
++      member("zzz", "Ada", "Zulu")
++
++      assert suggest(viewer, "ada", 1) == ["zzz"]
++    end
++  end
++
++  describe "check_handles/1" do
++    test "normalizes, drops blanks and duplicates in order of first appearance" do
++      assert {["ada", "bob"], _} = Mentions.check_handles(["@Ada", "ada", "  ", "BOB"])
++    end
++
++    test "keeps only the first fifty distinct handles" do
++      handles = for n <- 1..60, do: "h#{n}"
++      {checked, _} = Mentions.check_handles(handles ++ ["h1"])
++
++      assert checked == Enum.take(handles, 50)
++    end
++
++    test "the documented example" do
++      member("ada", "Ada", "Lovelace")
++      insert(:user, username: "bob", first_name: "Bob", last_name: "Unconfirmed")
++      page("acme", "Acme GmbH")
++      page("hidden", "Hidden AG", status: "pending")
++
++      assert Mentions.check_handles(["@ADA", "bob", "acme", "hidden", "ghost"]) ==
++               {["ada", "bob", "acme", "hidden", "ghost"], MapSet.new(["ada", "bob", "acme"])}
++    end
++
++    test "a handle Markdown takes apart does not resolve, even though a member holds it" do
++      member("max_mustermann_", "Max", "Mustermann")
++      member("max", "Max", "Short")
++
++      assert {_, resolved} = Mentions.check_handles(["max_mustermann_", "max"])
++      assert resolved == MapSet.new(["max"])
++    end
++
++    test "agrees with the renderer for every handle, in both directions" do
++      for handle <- ~w(ada_x _ada_ __ada__ a_b_ a_b_c moderated frozen_page) do
++        member(handle, "Some", "One")
++      end
++
++      member("held_back", "Some", "One", frozen_at: past(), email_confirmed?: false)
++      page("open_page", "Open")
++      page("pending_pg", "Pending", status: "pending")
++      page("frozen_pg", "Frozen", frozen_at: past())
++
++      handles =
++        ~w(ada_x _ada_ __ada__ a_b_ a_b_c moderated frozen_page held_back open_page pending_pg
++           frozen_pg ghost user-1 a.b)
++
++      {checked, resolved} = Mentions.check_handles(handles)
++      assert checked == handles
++
++      for handle <- handles do
++        html = ("@" <> handle) |> Markdown.render() |> Phoenix.HTML.safe_to_string()
++        linked? = html =~ ~s(class="mention">@#{handle}</a>)
++
++        assert MapSet.member?(resolved, handle) == linked?,
++               "#{handle}: check says #{MapSet.member?(resolved, handle)}, renderer #{html}"
++      end
++
++      assert MapSet.member?(resolved, "held_back")
++      refute MapSet.member?(resolved, "pending_pg")
++      refute MapSet.member?(resolved, "a_b_")
++    end
++  end
++end
+diff --git a/test/vutuv_web/controllers/mention_controller_test.exs b/test/vutuv_web/controllers/mention_controller_test.exs
+new file mode 100644
+index 0000000..fedf9aa
+--- /dev/null
++++ b/test/vutuv_web/controllers/mention_controller_test.exs
+@@ -0,0 +1,141 @@
++defmodule VutuvWeb.MentionControllerTest do
++  @moduledoc """
++  The editor's two JSON endpoints under `/system/mentions/`: the `@`-picker's
++  suggestions and the draft's mention check. Both are for the signed-in member
++  who is writing, so a signed-out request must get the usual redirect and no
++  JSON, and a signed-in one must get a 200 for any text at all — the editor
++  asks on every keystroke.
++  """
++  use VutuvWeb.ConnCase, async: true
++
++  alias Vutuv.Organizations.OrganizationImage
++
++  setup %{conn: conn} do
++    {conn, user} = create_and_login_user(conn)
++    {:ok, conn: conn, user: user}
++  end
++
++  defp suggest(conn, query), do: get(conn, "/system/mentions/suggest?" <> query)
++  defp check(conn, query), do: get(conn, "/system/mentions/check?" <> query)
++
++  describe "GET /system/mentions/suggest" do
++    test "answers ranked rows of exactly five keys for members and pages", %{conn: conn} do
++      insert(:activated_user,
++        username: "adalovelace",
++        honorific_prefix: "Dr.",
++        first_name: "Ada",
++        last_name: "Lovelace"
++      )
++
++      insert(:organization, username: "adalab", name: "Ada Lab", logo: "logotoken123")
++
++      assert %{"results" => [lab, ada]} = conn |> suggest("q=%40Ada") |> json_response(200)
++
++      assert ada == %{
++               "kind" => "user",
++               "handle" => "adalovelace",
++               "name" => "Dr. Ada Lovelace",
++               "avatar" => nil,
++               "initials" => "AL"
++             }
++
++      assert lab == %{
++               "kind" => "organization",
++               "handle" => "adalab",
++               "name" => "Ada Lab",
++               "avatar" => OrganizationImage.token_url("logotoken123", "feed"),
++               "initials" => "A"
++             }
++
++      assert lab["avatar"] =~ ~r{\A/organization_images/logotoken123/}
++    end
++
++    test "a member's avatar is their thumbnail, or null while it awaits moderation", %{
++      conn: conn
++    } do
++      insert(:activated_user,
++        username: "pictured",
++        first_name: "Pia",
++        last_name: "Pictured",
++        avatar: "original.jpg",
++        avatar_fingerprint: "0123456789ab"
++      )
++
++      insert(:activated_user,
++        username: "pictured_held",
++        first_name: "Pia",
++        last_name: "Held",
++        avatar: "original.jpg",
++        avatar_fingerprint: "0123456789ab",
++        avatar_moderation: "pending"
++      )
++
++      assert %{"results" => [held, shown]} =
++               conn |> suggest("q=pictured") |> json_response(200)
++
++      assert held["handle"] == "pictured_held"
++      assert held["avatar"] == nil
++      assert shown["handle"] == "pictured"
++      assert shown["avatar"] =~ ~r{\A/avatars/.+pictured-thumb-0123456789ab}
++    end
++
++    test "a missing, short or odd query is an empty answer, never an error", %{conn: conn} do
++      for query <- ["", "q=", "q=a", "q=%40a", "q=%00ab", "q[]=ada", "q[x]=ada"] do
++        assert conn |> suggest(query) |> json_response(200) == %{"results" => []},
++               "expected no results for #{inspect(query)}"
++      end
++
++      for query <- ["q=%25%25", "q=__", "q=%5C%5C", "q=" <> String.duplicate("x", 2_000)] do
++        assert %{"results" => _} = conn |> suggest(query) |> json_response(200)
++      end
++    end
++
++    test "never offers the member who is asking", %{conn: conn, user: user} do
++      assert conn |> suggest("q=" <> user.username) |> json_response(200) == %{"results" => []}
++    end
++  end
++
++  describe "GET /system/mentions/check" do
++    test "answers the checked handles and the ones that will become links", %{conn: conn} do
++      insert(:activated_user, username: "ada")
++      insert(:organization, username: "acme")
++      insert(:organization, username: "hidden", status: "pending")
++
++      body = conn |> check("handles=%40ADA,ghost,acme,hidden,ada,,") |> json_response(200)
++
++      assert Map.keys(body) |> Enum.sort() == ["checked", "known"]
++      assert body["checked"] == ["ada", "ghost", "acme", "hidden"]
++      assert Enum.sort(body["known"]) == ["acme", "ada"]
++    end
++
++    test "only the first fifty distinct handles are checked", %{conn: conn} do
++      handles = for n <- 1..60, do: "h#{n}"
++
++      body = conn |> check("handles=" <> Enum.join(handles, ",")) |> json_response(200)
++
++      assert body["checked"] == Enum.take(handles, 50)
++      assert body["known"] == []
++    end
++
++    test "a missing or odd list is an empty answer", %{conn: conn} do
++      for query <- ["", "handles=", "handles=,,%20,", "handles[x]=ada"] do
++        assert conn |> check(query) |> json_response(200) == %{"known" => [], "checked" => []},
++               "expected an empty answer for #{inspect(query)}"
++      end
++
++      assert %{"known" => [], "checked" => ["a\u0000b"]} =
++               conn |> check("handles=a%00b") |> json_response(200)
++    end
++  end
++
++  describe "signed out" do
++    test "both endpoints redirect to the home page and send no JSON" do
++      for path <- ["/system/mentions/suggest?q=ada", "/system/mentions/check?handles=ada"] do
++        conn = get(build_conn(), path)
++
++        assert redirected_to(conn) == "/"
++        refute List.first(get_resp_header(conn, "content-type")) =~ "json"
++      end
++    end
++  end
++end

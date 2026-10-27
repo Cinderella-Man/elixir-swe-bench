@@ -50,12 +50,18 @@ Recurring gaps:
 - **Short, plain inputs only.** Every reason was under 90 characters with no markup; every code block was one line. A truncated store, an unescaped render and a blank-line-dropping formatter all passed. Use long, multi-line inputs with reserved characters.
 - **A change but never a change back.** A cache that keeps a stale entry beside a fresh one passes a single update. Change the value, then change it back.
 - **The reference sharing the model's defect.** A router macro that imported `Phoenix.Router` with `only:` broke every route declared after it, in the reference and in Opus's patch alike, because every check put the macro last. Exercise what the ticket allows after and around a construct, not only the ticket's example layout.
+- **Only some of what a text lists.** The ticket said `%`, `_` and `\` are literal; only the first two were tested. Test every item a text enumerates, and the edges of counts and widths: a one-character non-ASCII term, a message ending in a newline, item 1000.
+- **A fixture that removes half a feature.** The "no Media Session API" browser deleted `navigator.mediaSession` but kept `window.MediaMetadata`, so a correct solution that detects the API by its constructor failed. Make a missing-feature fixture match a real environment without that feature.
+- **Waiting on the browser instead of the server.** After a resume click the audio played at once, but the server had not yet handled the event, so the next click (handled by another LiveView) could overtake it. Wait for what the server's reply changes, such as a button label, before the next action.
+- **A widened test under its old name.** Adding a second input to a test named for long, reserved-character messages would blame a trimming solution on the wrong behaviour. Add a test with its own name instead.
 
-Each later model run finds new gaps, because a different solution takes a different wrong turn. The second Opus review still changed 15 cases and the third 9, though most findings were low or medium severity. Run a reviewer's claimed wrong solution before acting on it: one claimed patch called a function that does not exist and failed for that reason alone, and one confirmation test missed a second wrong solution that a change back catches.
+Each later model run finds new gaps, because a different solution takes a different wrong turn. The second Opus review still changed 15 cases, the third 9 and the fourth 8, though most findings were low or medium severity. Agree a final batch with the user, or validation never ends. Run a reviewer's claimed wrong solution before acting on it: one claimed patch called a function that does not exist and failed for that reason alone, and one confirmation test missed a second wrong solution that a change back catches.
 
 Make every new check deterministic on the starting source too. Global broadcasts reach every test running at the same time, so filter them by this test's own data. A supervisor restart leaves a gap, so retry in a monitored process. Wait for the operation that carries a value before asserting on it. Run a new check several times, under different seeds, before relying on its starting-failure status.
 
 The grader's own reporter needs the same care: every record it prints must start on its own line, or a progress dot printed just before it hides it from the parser.
+
+Read each attempt's logs as well as its patch. No grade showed them, but the logs of the fourth run showed a parallel solver losing a tool call's answer, the controller staging the solver's edits so its `git diff` came back empty, and PostgreSQL killed for memory in one case's full suite.
 
 ## Diagnose qualification before repeating expensive work
 

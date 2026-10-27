@@ -7,7 +7,5 @@ tools: mcp__eab_workspace__read, mcp__eab_workspace__bash, mcp__eab_workspace__e
 disallowedTools: Agent, Task, Skill, WebFetch, WebSearch, Bash, Read, Write, Edit, Glob, Grep, NotebookEdit, TodoWrite, ToolSearch
 omitClaudeMd: true
 mcpServers:
-  - eab_workspace:
-      type: http
-      url: __EAB_CONTROLLER_URL__/claude-code/mcp
+  - eab_workspace
 ---

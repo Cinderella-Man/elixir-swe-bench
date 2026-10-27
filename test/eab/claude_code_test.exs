@@ -117,10 +117,17 @@ defmodule Eab.ClaudeCodeTest do
       assert String.split(tools, ", ") ==
                Enum.map(~w(read bash edit write), &"mcp__eab_workspace__#{&1}")
 
-      # Claude Code 2.1.308 only connects inline agent MCP servers given as a YAML list.
-      assert frontmatter =~ "\nmcpServers:\n  - eab_workspace:\n      type: http\n"
-      assert frontmatter =~ "url: #{@url}/claude-code/mcp"
+      # Named, not inline: Claude Code shares one connection between solvers whose inline
+      # server configs match and closes it when any of them finishes.
+      assert String.ends_with?(frontmatter, "\nmcpServers:\n  - eab_workspace")
+      refute frontmatter =~ "url:"
     end
+
+    assert Jason.decode!(kit[".mcp.json"]) == %{
+             "mcpServers" => %{
+               "eab_workspace" => %{"type" => "http", "url" => "#{@url}/claude-code/mcp"}
+             }
+           }
 
     assert Enum.map(ClaudeCode.profiles(), &{&1["agent"], &1["effort"]}) == [
              {"eab-opus-5-5-xhigh", "xhigh"},
@@ -139,6 +146,7 @@ defmodule Eab.ClaudeCodeTest do
     assert settings["env"]["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"
     assert settings["env"]["CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK"] == "1"
     assert settings["disableClaudeAiConnectors"] == true
+    assert settings["enabledMcpjsonServers"] == ["eab_workspace"]
     assert settings["env"]["CLAUDE_CODE_FORK_SUBAGENT"] == "0"
     refute Enum.any?(Map.values(kit), &String.contains?(&1, "__EAB_CONTROLLER_URL__"))
     assert Map.has_key?(kit, ".claude/commands/solve-run.md")
@@ -159,15 +167,19 @@ defmodule Eab.ClaudeCodeTest do
     assert output =~ "Installed"
 
     installed =
-      Path.wildcard(Path.join(target, ".claude/**/*"), match_dot: true)
+      [
+        Path.join(target, ".mcp.json")
+        | Path.wildcard(Path.join(target, ".claude/**/*"), match_dot: true)
+      ]
       |> Enum.filter(&File.regular?/1)
       |> Map.new(&{Path.relative_to(&1, target), Inventory.hash_file(&1)})
 
     assert installed == ClaudeCode.kit_files(@url)
     assert ClaudeCode.kit_problems(%{"files" => installed}, @url) == []
 
-    # Reinstalling removes stray files.
+    # Reinstalling removes stray files and replaces an edited server list.
     File.write!(Path.join(target, ".claude/agents/extra.md"), "x")
+    File.write!(Path.join(target, ".mcp.json"), ~s({"mcpServers": {}}))
 
     {_, 0} =
       System.cmd("bash", ["scripts/install-claude-code-kit.sh", "--url", @url, target],
@@ -175,6 +187,7 @@ defmodule Eab.ClaudeCodeTest do
       )
 
     refute File.exists?(Path.join(target, ".claude/agents/extra.md"))
+    assert Inventory.hash_file(Path.join(target, ".mcp.json")) == installed[".mcp.json"]
 
     File.mkdir_p!(Path.join(dir, "repo/.git"))
 

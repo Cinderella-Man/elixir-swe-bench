@@ -38,9 +38,10 @@ defmodule Eab.Sandbox do
     network = if services["postgres"], do: "container:#{box.name}-db", else: "none"
 
     if services["postgres"] do
+      # 512 MB let the kernel kill PostgreSQL backends during vutuv's full suite.
       Command.run!(
         "docker",
-        ["run", "-d", "--name", box.name <> "-db", "--network=none", "--memory=512m", "--cpus=1"] ++
+        ["run", "-d", "--name", box.name <> "-db", "--network=none", "--memory=1g", "--cpus=1"] ++
           labels ++ ["-e", "POSTGRES_PASSWORD=postgres", services["postgres"]]
       )
 
@@ -168,9 +169,15 @@ defmodule Eab.Sandbox do
   end
 
   # Agents snapshot the patch after every tool call; echoing it would repeat the
-  # whole diff in the activity log each time.
+  # whole diff in the activity log each time. The snapshot stages into a copy of the
+  # index, so the agent's own `git diff`, `git checkout` and `git stash` see its edits
+  # as unstaged changes.
   def patch(box) do
-    command!(box, "git add -A && git diff --cached --binary HEAD",
+    command!(
+      box,
+      ~S|index=$(mktemp -u) && trap 'rm -f "$index"' EXIT && | <>
+        ~S|cp "$(git rev-parse --git-path index)" "$index" 2>/dev/null; | <>
+        ~S|export GIT_INDEX_FILE="$index" && git add -A && git diff --cached --binary HEAD|,
       limit: 1_048_576,
       timeout: 60,
       quiet: true

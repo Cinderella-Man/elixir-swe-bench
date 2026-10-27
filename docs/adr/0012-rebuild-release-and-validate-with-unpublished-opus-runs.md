@@ -22,6 +22,10 @@ The second complete run passed 18 of 20 as graded. accent-pr-183's only failure 
 
 The third complete run, the first with two parallel attempts under [ADR 0014](0014-run-a-runs-attempts-in-parallel.md), passed 18 of 20. Its reviews found 9 more cases where a wrong solution the reviewers built passes every check, a text promises more than the reference, or a reference breaks a stated requirement (two got curator corrections). Each gap was run before anything changed, and the cases were corrected the same way. livebook-pr-2800 failed because Opus built an error message in a way that raises on the non-ASCII text the ticket names; replacing that one call makes its patch pass. The user kept it on the same terms as ash-pr-3031: a sound case that measures model quality, not a case at fault. See the [validation record](../../verification/opus-validation-2026-10-26/README.md).
 
+## Amendment, 2026-10-27: the fourth validation run and the final batch
+
+The fourth complete run passed 19 of 20; ash-pr-3031 failed on the same requirements as before and stays on the user's terms. Its reviews accepted 12 cases as they are. 8 got one more check or a narrower text, each backed by a wrong solution that passed the released checks; no reference changed. Two harness faults and one environment fault turned up in the logs and were fixed with them. The user made this the final strengthening batch: in the two runs that follow, a case changes only for a failure the case is at fault for, and new minor gaps a review finds are recorded rather than reopening validation. Without that stop, each review of a pass keeps finding smaller gaps (16, 15, 9 and 8 cases in four batches), and validation would never end. See the [validation record](../../verification/opus-validation-2026-10-26/README.md).
+
 ## Considered options
 
 - **Keep upstream pins under a recorded exception**: no fork work, but cases would keep two kinds of source and overlay handling.

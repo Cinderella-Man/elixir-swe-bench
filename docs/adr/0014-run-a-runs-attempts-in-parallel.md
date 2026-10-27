@@ -10,9 +10,16 @@ The Claude Code harness serves several attempts from the one solver session and 
 
 This amends [ADR 0004](0004-overlap-preparation-and-grading.md), which kept model conversations serial with one waiting workspace and one grading lane, and [ADR 0010](0010-run-subscription-claude-through-claude-code-harness.md), where one Claude Code attempt runs at a time.
 
+## Amendment, 2026-10-27: one workspace server for the whole solver session
+
+In validation runs D and E, some running workspace tool calls lost their answers (3 and 4 calls): when one solver finished, Claude Code closed a connection the other solver was still using. Claude Code keeps one connection per server name and settings, so subagents whose agent files declare identical inline servers share it, and each closes it when it finishes. The other solver then saw "connection closed before the tool call was answered" and could run the command again. A toy server reproduced this on Claude Code 2.1.308, and its tool did run twice. The kit now declares the workspace server once, in the solver folder's `.mcp.json`, approved by the kit's settings, and each agent file only names it. A named server belongs to the session, so no solver closes it; the same experiment answered every call exactly once. The hook still adds each solver's id to its calls, so routing does not change.
+
+The kit changed again, so attempts before and after belong to different harness identities, and all twenty cases collect their two validation passes under this kit. The final case fixes after run E already needed two fresh passes for eight cases, so this adds no validation run.
+
 ## Considered options
 
 - **Several runs at once instead of several cases per run**: no help for a single validation run, and it would need several solver sessions and a second active-run slot.
 - **Several solver sessions, one attempt each**: the same protocol work plus a manual step per session.
 - **A fixed number of slot agents in the kit**, each with its own tool address: works without per-subagent identity, but caps the setting and records the slot in the agent name. Kept as the fallback if Claude Code stops reporting `agent_id` on subagent tool calls.
 - **Record times for every run and show the setting beside them**: simpler, but invites comparing times taken under different contention.
+- **Run one attempt at a time** to avoid the shared connection: no kit change, but it gives up the speed this decision is for.

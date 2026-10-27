@@ -1,0 +1,485 @@
+diff --git a/lib/plausible/application.ex b/lib/plausible/application.ex
+index 2bae31a..b83b269 100644
+--- a/lib/plausible/application.ex
++++ b/lib/plausible/application.ex
+@@ -164,7 +164,9 @@ defmodule Plausible.Application do
+           adapter_opts: [
+             n_lock_partitions: 1,
+             ttl_check_interval: false,
+-            ets_options: [:bag, read_concurrency: true]
++            # :TRICKY: Must not be a `:bag` - there's exactly one script per
++            # tracker script configuration id and every update must replace it.
++            ets_options: [read_concurrency: true]
+           ],
+           warmers: [
+             refresh_all:
+diff --git a/lib/plausible/cache.ex b/lib/plausible/cache.ex
+index c03c96b..2fc45f4 100644
+--- a/lib/plausible/cache.ex
++++ b/lib/plausible/cache.ex
+@@ -64,17 +64,46 @@ defmodule Plausible.Cache do
+       alias Plausible.Cache.Adapter
+       require Logger
+ 
++      @doc """
++      Puts the item into the cache on this node and on all the connected nodes.
++
++      The local cache is updated synchronously, so that the new value is visible
++      as soon as this function returns and consecutive puts of the same key are
++      applied in order. Other nodes are updated asynchronously - should any of them
++      miss or reorder an update, the periodic cache refresh brings them up to date.
++      """
+       @spec broadcast_put(any(), any(), Keyword.t()) :: :ok
+       def broadcast_put(key, value, opts \\ []) do
+         cache_name = Keyword.get(opts, :cache_name, name())
+         multicall_timeout = Keyword.get(opts, :multicall_timeout, :timer.seconds(5))
+ 
+-        {:ok, _} =
+-          Task.start(fn ->
+-            :rpc.multicall(Adapter, :put, [cache_name, key, value, opts], multicall_timeout)
+-          end)
++        try do
++          Adapter.put(cache_name, key, value, opts)
++        catch
++          kind, reason ->
++            Logger.error(
++              "Error putting a key to '#{inspect(cache_name)}' - #{inspect({kind, reason})}"
++            )
++        end
+ 
+-        :ok
++        case Node.list() do
++          [] ->
++            :ok
++
++          nodes ->
++            {:ok, _} =
++              Task.start(fn ->
++                :rpc.multicall(
++                  nodes,
++                  Adapter,
++                  :put,
++                  [cache_name, key, value, opts],
++                  multicall_timeout
++                )
++              end)
++
++            :ok
++        end
+       end
+ 
+       @spec get(any(), Keyword.t()) :: any() | nil
+@@ -174,6 +203,8 @@ defmodule Plausible.Cache do
+         Adapter.child_spec(cache_name, child_id, opts)
+       end
+ 
++      defoverridable child_spec: 1
++
+       @doc """
+       Ensures the cache has non-zero size unless no items exist.
+       Useful for orchestrating app startup to prevent the service
+diff --git a/lib/plausible_web/tracker.ex b/lib/plausible_web/tracker.ex
+index 6003613..0555e04 100644
+--- a/lib/plausible_web/tracker.ex
++++ b/lib/plausible_web/tracker.ex
+@@ -76,26 +76,34 @@ defmodule PlausibleWeb.Tracker do
+   end
+ 
+   def update_script_configuration(site, config_update, changeset_type) do
+-    Repo.transact(fn ->
+-      with {:ok, original_config} <- get_or_create_tracker_script_configuration(site),
+-           changeset <- changeset(original_config, config_update, changeset_type),
+-           {:ok, updated_config} <-
+-             Repo.update(changeset),
+-           %TrackerScriptConfiguration{} = reloaded_config <-
+-             maybe_reload_tracker_script_configuration(updated_config) do
+-        sync_goals(site, original_config, reloaded_config)
+-
+-        on_ee do
+-          if should_purge_cache?(changeset) do
+-            purge_cache!(reloaded_config.id)
++    result =
++      Repo.transact(fn ->
++        with {:ok, original_config} <- get_or_create_tracker_script_configuration(site),
++             changeset <- changeset(original_config, config_update, changeset_type),
++             {:ok, updated_config} <-
++               Repo.update(changeset),
++             %TrackerScriptConfiguration{} = reloaded_config <-
++               maybe_reload_tracker_script_configuration(updated_config) do
++          sync_goals(site, original_config, reloaded_config)
++
++          on_ee do
++            if should_purge_cache?(changeset) do
++              purge_cache!(reloaded_config.id)
++            end
+           end
+-        else
+-          :ok = broadcast_script_upsert(reloaded_config)
++
++          {:ok, reloaded_config}
+         end
++      end)
+ 
+-        {:ok, reloaded_config}
++    on_ce do
++      # Only cache the script once the update has been successfully persisted
++      with {:ok, %TrackerScriptConfiguration{} = reloaded_config} <- result do
++        :ok = broadcast_script_upsert(reloaded_config)
+       end
+-    end)
++    end
++
++    result
+   end
+ 
+   on_ee do
+@@ -136,22 +144,29 @@ defmodule PlausibleWeb.Tracker do
+     if configuration do
+       {:ok, configuration}
+     else
+-      Repo.transact(fn ->
+-        with {:ok, created_config} <-
+-               Repo.insert(
+-                 TrackerScriptConfiguration.installation_changeset(
+-                   %TrackerScriptConfiguration{site_id: site.id},
+-                   params
+-                 )
+-               ),
+-             %TrackerScriptConfiguration{} = reloaded_config <-
+-               maybe_reload_tracker_script_configuration(created_config) do
+-          sync_goals(site, %{}, reloaded_config)
++      result =
++        Repo.transact(fn ->
++          with {:ok, created_config} <-
++                 Repo.insert(
++                   TrackerScriptConfiguration.installation_changeset(
++                     %TrackerScriptConfiguration{site_id: site.id},
++                     params
++                   )
++                 ),
++               %TrackerScriptConfiguration{} = reloaded_config <-
++                 maybe_reload_tracker_script_configuration(created_config) do
++            sync_goals(site, %{}, reloaded_config)
++
++            {:ok, reloaded_config}
++          end
++        end)
+ 
+-          :ok = broadcast_script_upsert(reloaded_config)
+-          {:ok, reloaded_config}
+-        end
+-      end)
++      # Only cache the script once the configuration has been successfully persisted
++      with {:ok, %TrackerScriptConfiguration{} = reloaded_config} <- result do
++        :ok = broadcast_script_upsert(reloaded_config)
++      end
++
++      result
+     end
+   end
+ 
+diff --git a/lib/plausible_web/tracker_script_cache.ex b/lib/plausible_web/tracker_script_cache.ex
+index 89e894d..9209fec 100644
+--- a/lib/plausible_web/tracker_script_cache.ex
++++ b/lib/plausible_web/tracker_script_cache.ex
+@@ -20,6 +20,29 @@ defmodule PlausibleWeb.TrackerScriptCache do
+   @impl true
+   def child_id(), do: :cache_tracker_script
+ 
++  @doc """
++  There's exactly one cached item per tracker script configuration id, and
++  every configuration update or cache refresh must replace it. A `:bag`
++  (or `:duplicate_bag`) table would instead accumulate all the versions
++  of the script under the same id, so the table type is always a set.
++  """
++  def child_spec(opts) do
++    opts =
++      case Keyword.fetch(opts, :ets_options) do
++        {:ok, ets_options} ->
++          Keyword.put(
++            opts,
++            :ets_options,
++            Enum.reject(ets_options, &(&1 in [:bag, :duplicate_bag]))
++          )
++
++        :error ->
++          opts
++      end
++
++    super(opts)
++  end
++
+   on_ee do
+     @doc "Caches that the config exists"
+     def cache_content(%TrackerScriptConfiguration{} = _tracker_script_configuration), do: true
+diff --git a/test/plausible/cache_test.exs b/test/plausible/cache_test.exs
+index b8c62be..71465a1 100644
+--- a/test/plausible/cache_test.exs
++++ b/test/plausible/cache_test.exs
+@@ -124,6 +124,27 @@ defmodule Plausible.CacheTest do
+                {ExampleCache.get("item1", cache_name: test, force?: true) == :item1, :ok}
+              end)
+     end
++
++    test "broadcast_put replaces the local value immediately and in order", %{test: test} do
++      {:ok, _} = start_test_cache(test)
++
++      for value <- [:first, :second, :first, :third, :first] do
++        :ok = ExampleCache.broadcast_put("item1", value, cache_name: test)
++        assert ExampleCache.get("item1", cache_name: test, force?: true) == value
++      end
++
++      assert ExampleCache.size(test) == 1
++    end
++
++    test "broadcast_put does not crash the caller when the cache is not running" do
++      log =
++        capture_log(fn ->
++          assert :ok = ExampleCache.broadcast_put("item1", :item1, cache_name: NonExistingCache)
++        end)
++
++      assert log =~ "Error putting a key to"
++      assert log =~ "NonExistingCache"
++    end
+   end
+ 
+   describe "warming the cache" do
+diff --git a/test/plausible_web/plugs/tracker_plug_test.exs b/test/plausible_web/plugs/tracker_plug_test.exs
+index 488b5b2..4a0d0f4 100644
+--- a/test/plausible_web/plugs/tracker_plug_test.exs
++++ b/test/plausible_web/plugs/tracker_plug_test.exs
+@@ -135,3 +135,171 @@ defmodule PlausibleWeb.TrackerPlugTest do
+     |> response(200)
+   end
+ end
++
++defmodule PlausibleWeb.TrackerPlugCacheEnabledTest do
++  @moduledoc """
++  Exercises the dedicated tracker script endpoint with the application cache
++  enabled, as it is in a running Community Edition instance.
++
++  Not async, because it toggles the global `Plausible.Cache` flag and works
++  with the application-wide `:tracker_script_cache`.
++  """
++  use PlausibleWeb.ConnCase, async: false
++
++  import Ecto.Query
++
++  alias Plausible.Repo
++  alias Plausible.Site.TrackerScriptConfiguration
++  alias PlausibleWeb.Tracker
++  alias PlausibleWeb.TrackerScriptCache
++
++  @moduletag :ce_build_only
++
++  @base_config %{
++    installation_type: :manual,
++    track_404_pages: false,
++    hash_based_routing: false,
++    file_downloads: false,
++    outbound_links: false,
++    pageview_props: false,
++    tagged_events: false,
++    revenue_tracking: false,
++    form_submissions: false
++  }
++
++  setup do
++    previous = Application.fetch_env!(:plausible, Plausible.Cache)
++    Application.put_env(:plausible, Plausible.Cache, Keyword.put(previous, :enabled, true))
++    on_exit(fn -> Application.put_env(:plausible, Plausible.Cache, previous) end)
++
++    assert Plausible.Cache.enabled?()
++    assert Process.whereis(TrackerScriptCache.name())
++
++    :ok
++  end
++
++  test "script is current after creation and after every configuration update", %{conn: conn} do
++    site = new_site()
++    other_site = new_site()
++
++    config = Tracker.get_or_create_tracker_script_configuration!(site, @base_config)
++    other_config = Tracker.get_or_create_tracker_script_configuration!(other_site, @base_config)
++
++    assert_script_eventually(conn, config.id, site.domain, %{
++      file_downloads: false,
++      outbound_links: false
++    })
++
++    assert_script_eventually(conn, other_config.id, other_site.domain, %{
++      file_downloads: false,
++      outbound_links: false
++    })
++
++    other_script = fetch_script(conn, other_config.id)
++
++    for settings <- [
++          %{file_downloads: true, outbound_links: false},
++          %{file_downloads: false, outbound_links: true},
++          %{file_downloads: true, outbound_links: true},
++          %{file_downloads: false, outbound_links: false},
++          %{file_downloads: true, outbound_links: false},
++          %{file_downloads: false, outbound_links: false}
++        ] do
++      updated =
++        Tracker.update_script_configuration!(
++          site,
++          Map.merge(@base_config, settings),
++          :installation
++        )
++
++      assert updated.id == config.id
++      assert_script_eventually(conn, config.id, site.domain, settings)
++      assert fetch_script(conn, other_config.id) == other_script
++    end
++  end
++
++  test "cache refresh brings scripts up to date with configurations changed elsewhere", %{
++    conn: conn
++  } do
++    site = new_site()
++    other_site = new_site()
++
++    config = Tracker.get_or_create_tracker_script_configuration!(site, @base_config)
++    other_config = Tracker.get_or_create_tracker_script_configuration!(other_site, @base_config)
++
++    :ok = TrackerScriptCache.refresh_all()
++
++    assert_script(conn, config.id, site.domain, %{file_downloads: false, outbound_links: false})
++
++    other_script = fetch_script(conn, other_config.id)
++
++    for {settings, refresh} <- [
++          {%{file_downloads: true, outbound_links: false}, :refresh_updated_recently},
++          {%{file_downloads: false, outbound_links: true}, :refresh_all},
++          {%{file_downloads: false, outbound_links: false}, :refresh_updated_recently},
++          {%{file_downloads: true, outbound_links: true}, :refresh_all},
++          {%{file_downloads: false, outbound_links: false}, :refresh_all},
++          {%{file_downloads: true, outbound_links: false}, :refresh_updated_recently}
++        ] do
++      # simulates a change made directly in the database or by another node
++      {1, _} =
++        Repo.update_all(
++          from(c in TrackerScriptConfiguration, where: c.id == ^config.id),
++          set: Map.to_list(settings) ++ [updated_at: NaiveDateTime.utc_now()]
++        )
++
++      for _ <- 1..3 do
++        :ok = apply(TrackerScriptCache, refresh, [[]])
++        assert_script(conn, config.id, site.domain, settings)
++        assert fetch_script(conn, other_config.id) == other_script
++      end
++    end
++  end
++
++  test "unknown dedicated tracker script id is not found", %{conn: conn} do
++    :ok = TrackerScriptCache.refresh_all()
++
++    assert {404, _} = request_script(conn, "pa-a14125a2-000-000-0000-000000000000")
++  end
++
++  defp assert_script_eventually(conn, id, domain, settings) do
++    eventually(
++      fn ->
++        {status, body} = request_script(conn, id)
++        {status == 200 and script_matches?(body, domain, settings), {status, body}}
++      end,
++      20,
++      15
++    )
++
++    assert_script(conn, id, domain, settings)
++  end
++
++  defp assert_script(conn, id, domain, settings) do
++    assert {200, body} = request_script(conn, id)
++    assert String.starts_with?(body, "!function(){var")
++    assert String.contains?(body, "domain:#{JSON.encode!(domain)}")
++    assert String.contains?(body, "fileDownloads:!0") == settings.file_downloads
++    assert String.contains?(body, "outboundLinks:!0") == settings.outbound_links
++  end
++
++  defp script_matches?(body, domain, settings) do
++    String.contains?(body, "domain:#{JSON.encode!(domain)}") and
++      String.contains?(body, "fileDownloads:!0") == settings.file_downloads and
++      String.contains?(body, "outboundLinks:!0") == settings.outbound_links
++  end
++
++  defp fetch_script(conn, id) do
++    assert {200, body} = request_script(conn, id)
++    body
++  end
++
++  # Errors raised while serving the script are reported as a server error
++  # rather than crashing the test, so that they show up as failed assertions.
++  defp request_script(conn, id) do
++    conn = get(conn, "/js/#{id}.js")
++    {conn.status, conn.resp_body}
++  rescue
++    e -> {500, e |> Exception.message() |> String.slice(0, 200)}
++  end
++end
+diff --git a/test/plausible_web/tracker_script_cache_test.exs b/test/plausible_web/tracker_script_cache_test.exs
+index a7fb7ca..ac92f06 100644
+--- a/test/plausible_web/tracker_script_cache_test.exs
++++ b/test/plausible_web/tracker_script_cache_test.exs
+@@ -56,6 +56,58 @@ defmodule PlausibleWeb.TrackerScriptCacheTest do
+       refute TrackerScriptCache.get(old_config.id, cache_opts)
+       assert TrackerScriptCache.get(new_config.id, cache_opts)
+     end
++
++    test "refreshes replace cached items of changed configurations, even if a bag table is requested",
++         %{test: test} do
++      %{start: {m, f, a}} =
++        TrackerScriptCache.child_spec(
++          cache_name: test,
++          ets_options: [:bag, read_concurrency: true]
++        )
++
++      {:ok, _} = apply(m, f, a)
++
++      assert :ets.info(ConCache.ets(test), :type) == :set
++
++      site = new_site()
++      other_site = new_site()
++      config = create_config(site, file_downloads: false)
++      other_config = create_config(other_site)
++
++      cache_opts = [cache_name: test, force?: true]
++      :ok = TrackerScriptCache.refresh_all(cache_opts)
++      other_item = TrackerScriptCache.get(other_config.id, cache_opts)
++
++      for {file_downloads, refresh} <- [
++            {true, :refresh_all},
++            {false, :refresh_updated_recently},
++            {true, :refresh_updated_recently},
++            {false, :refresh_all}
++          ] do
++        # simulates a change made directly in the database or by another node
++        {1, _} =
++          Repo.update_all(
++            from(c in TrackerScriptConfiguration, where: c.id == ^config.id),
++            set: [file_downloads: file_downloads, updated_at: NaiveDateTime.utc_now()]
++          )
++
++        for _ <- 1..2 do
++          :ok = apply(TrackerScriptCache, refresh, [cache_opts])
++
++          assert result = TrackerScriptCache.get(config.id, cache_opts)
++          assert TrackerScriptCache.get(other_config.id, cache_opts) == other_item
++          assert TrackerScriptCache.size(test) == 2
++
++          on_ee do
++            assert result == true
++          else
++            assert is_binary(result)
++            assert result =~ ~r/domain:\"#{site.domain}\"/
++            assert String.contains?(result, "fileDownloads:!0") == file_downloads
++          end
++        end
++      end
++    end
+   end
+ 
+   defp start_test_cache(cache_name) do

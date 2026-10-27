@@ -215,10 +215,11 @@ defmodule Eab.PipelineTest do
     assert_receive {:grade, "a", grade_a}, 3000
     assert_receive {:attempt, "d", pi_d}, 3000
 
-    # Two graders are busy, so c's and d's submissions queue until one frees.
+    # Two graders are busy, so c's and d's submissions queue until one frees. Submissions
+    # grade in the order they arrive; c's arrives first.
     send(pi_c, :continue)
-    send(pi_d, :continue)
     assert_receive {:closed, "c"}, 3000
+    send(pi_d, :continue)
     assert_receive {:closed, "d"}, 3000
     refute_receive {:grade, _, _}
     send(grade_b, :continue)

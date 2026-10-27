@@ -120,7 +120,12 @@ defmodule Eab.ClaudeCode do
   def kit(url \\ controller_url()) do
     root = path("kit")
 
-    Path.wildcard(Path.join(root, ".claude/**/*"), match_dot: true)
+    # The folder's .mcp.json declares the workspace server once for the session; agent
+    # files only name it, so concurrent solvers never close each other's connection.
+    [
+      Path.join(root, ".mcp.json")
+      | Path.wildcard(Path.join(root, ".claude/**/*"), match_dot: true)
+    ]
     |> Enum.filter(&(File.regular?(&1) and "__pycache__" not in Path.split(&1)))
     |> Map.new(fn file ->
       body = File.read!(file) |> String.replace("__EAB_CONTROLLER_URL__", url)
