@@ -14,6 +14,10 @@ The first complete validation run passed 19 of 20 cases. Its reviews found somet
 
 The user kept ash-pr-3031 although Opus missed one of its stated requirements: the case is sound, the reference's fix is two lines, and it shows that frontier models still miss stated behaviour. This is an explicit exception to the drop rule above. The case keeps its validation attempts, so a later pass is still recorded.
 
+## Amendment, 2026-10-27: what the second validation run changed
+
+The second complete run passed 18 of 20 as graded. accent-pr-183's only failure came from the grader: one of the model's test files could not compile on the starting source and hid its other files from the coverage probe, which now runs each file on its own in that case. Re-graded, the patch passes. Reviewing the passes found a further 15 cases with checks a plausible wrong solution still passes, texts that claim more than the reference delivers, or references that fail a stated input; six references got curator corrections. These were corrected the same way and start their two attempts again, so this amendment keeps the rule rather than relaxing it. Two of the second run's passes (vutuv-pr-1759 and guardian-pr-748) would fail the corrected checks, which is why a pass is reviewed rather than trusted. See the [validation record](../../verification/opus-validation-2026-10-26/README.md).
+
 ## Considered options
 
 - **Keep upstream pins under a recorded exception**: no fork work, but cases would keep two kinds of source and overlay handling.

@@ -15,13 +15,16 @@ A reason is recorded only when the download job actually attempts a download and
 | yt-dlp exits with an error, for example `ERROR: [youtube] abc123: Private video` | yt-dlp's error message, exactly as reported |
 | yt-dlp reports that the media isn't downloadable yet (an active or still-processing live stream) | A non-empty message saying the item isn't ready to be downloaded yet. The wording is up to you. |
 | An error that isn't text, for example the runner returning `{:error, :connection_reset}` | A readable string that includes the printed error term, for example `Unknown error: {:error, :connection_reset}`. Never the raw term and never an empty string. |
+| yt-dlp downloads the media, but the item can't be updated with the downloaded details, for example because the downloaded title is `youtube video #abc123`, which media items don't accept | A readable, non-empty message. The wording is up to you. |
 | A recoverable yt-dlp error (`Unable to communicate with SponsorBlock`) where Pinchflat still saves the details of what it downloaded | yt-dlp's message. The item keeps the saved file details and counts as failed until a later download succeeds. |
-| A recoverable error where that recovery fails | yt-dlp's message |
+| A recoverable error where that recovery fails, including when the item rejects the recovered details as above | yt-dlp's message |
 | An error that is never retried (`Video unavailable`, `Sign in to confirm`, members-only) | yt-dlp's message |
 
 These are **not** download attempts and leave any recorded reason exactly as it was: the job skips the download because the source is set to not download media, the item's download is prevented ("manually ignored"), the item is no longer pending, or a user script vetoes it.
 
 Failures of re-downloads count too: a forced download or a quality upgrade that fails records its reason on an item that already has a file.
+
+Whether an unexpected exception raised during an attempt, outside the situations above, records a reason is not specified.
 
 ## What is recorded
 

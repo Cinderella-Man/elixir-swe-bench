@@ -42,8 +42,8 @@ Members and pages are ranked together in one order:
 
 1. Accounts the viewer follows come first. Following a member and following a page both count, and a muted follow still counts as following.
 2. Within each of those two groups, accounts whose handle starts with the term come before accounts that only match by name.
-3. Then alphabetically by name, ignoring case. A member's name here is their first and last name joined by a space, without honorifics. A page's name is its name.
-4. Accounts with the same name are ordered alphabetically by handle.
+3. Then by name, ignoring case. A member's name here is their first and last name joined by a space, without honorifics. A page's name is its name. Names are compared after lowercasing, character by character by Unicode code point, with spaces and punctuation counting like any other character: `"ada zed"` comes before `"adam bee"`, because a space comes before `m`, and `"zoe"` comes before `"émile"`, because `é` comes after `z`.
+4. Accounts with the same name are ordered by handle, compared the same way: `max_b` comes before `maxa`, because `_` comes before `a`.
 
 The ranking and every exclusion apply to **all** matching accounts before `limit` is taken. The result is the top `limit` of the full ranked list. A followee who only matches by name still comes first when fifty strangers' handles start with the term. Excluded accounts never use up a place, so if thirty blocked members match ahead of one visible account, the visible account is still returned.
 

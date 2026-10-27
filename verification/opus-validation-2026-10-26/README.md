@@ -8,6 +8,7 @@ Unpublished validation runs under [ADR 0012](../../docs/adr/0012-rebuild-release
 | --- | --- | --- |
 | `20261026-160718-4102f1f8` | all 20 cases | Stopped after the transcript upload race (fixed in `78a375d8`). plausible-pr-5939 and plausible-pr-5956 had passed. It does not count toward validation: the harness kit changed before the next run, so its attempts do not share frozen inputs with later ones. |
 | `20261026-162844-07bb9eac` | all 20 cases | Completed: **19 of 20 passed**. ash-pr-3031 failed. Per-case grade summaries and the sealed patches are in [`run-20261026-162844-07bb9eac/`](run-20261026-162844-07bb9eac/). |
+| `20261026-224602-11868a92` | all 20 cases | Completed: **18 of 20 passed** as graded. accent-pr-183 failed only on a grader defect and passes when re-graded; ash-pr-3031 failed. Per-case grade summaries and the sealed patches are in [`run-20261026-224602-11868a92/`](run-20261026-224602-11868a92/). |
 
 Raw transcripts stay in the controller's data volume: they carry the solver's environment block and account details.
 
@@ -20,9 +21,23 @@ Every passing patch was reviewed against its ticket, requirements, reference and
 - **16 cases had checks or texts that a wrong or partial solution could slip past, or a reference that failed its own requirement.** All were corrected; see [the case fixes](../case-fixes-2026-10-26/README.md). Four needed curator corrections to the reference: livebook-pr-2663, plausible-pr-6449, cachex-pr-341 and vutuv-pr-1759.
 - **The grader's trusted formatter could lose a failure-phase, failure-type or excluded-tags record.** It printed those records without a leading newline, so ExUnit's progress dots could land before one and hide it from the parser. That could misjudge starting failures, a model's own tests, or a permitted exclusion. Fixed in `ada3d61c`. It was found when the revised livebook-pr-2663 failed qualification for exactly this reason.
 
+## What the reviews of run 11868a92 found
+
+The same method as for the first run: every passing patch was reviewed against its ticket, requirements, reference and hidden tests, and every finding was checked by running it before anything changed.
+
+- **All 18 passes are genuine, and so is accent-pr-183's.** No solution weakened or deleted an existing test, special-cased hidden data or edited outside the allowed prefixes.
+- **accent-pr-183 failed on a grader defect.** One of its six new test files ran a doctest on a module the starting source lacks, so the joint ExUnit run of its tests on the starting source never compiled and the coverage probe saw nothing. Its other files' tests catch the bug. The probe now runs each file on its own when the joint run does not complete (`lib/eab/grader.ex`). Re-graded under the fixed grader, the sealed patch passes every stage: [record](run-20261026-224602-11868a92/accent-pr-183/regrade-fixed-coverage-probe.json). All 20 cases re-qualified under the fixed grader.
+- **ash-pr-3031 failed again, on two stated requirements.** Opus again let a normalized literal be converted twice inside a typed comparison beside an expression argument, and this time also crashed on an array argument given an expression (it unpacks the array before checking for an expression). 13 of 15 hidden checks pass. Probing showed the ticket also implied literal-only typed comparisons keep their values, which the reference does not do; the wording was narrowed.
+- **15 cases had checks a plausible wrong solution still passes, texts that claim more than the reference delivers, or a reference that fails a stated input.** All were corrected; six needed curator corrections to the reference. See [the second case-fix batch](../case-fixes-2026-10-27/README.md).
+- **Harness:** the activity logs no longer repeat the patch after every tool call, and no run left orphaned processes or hit the process limit.
+
+Raw transcripts and activity logs stay in the controller's data volume.
+
 ## Validation ledger
 
-A case stays in the release after two reviewed passes under the same frozen inputs (ADR 0012).
+A case stays in the release after two reviewed passes under the same case version (ADR 0012). A changed case starts its two attempts again.
 
-- **Unchanged cases** have one reviewed pass from run 07bb9eac and need one more: plausible-pr-5939, plausible-pr-5956, livebook-pr-2822. ash-pr-3031 has one failure and stays by the user's decision.
-- **Changed cases** start again with two fresh attempts on their new versions; run 07bb9eac's passes were on the old versions. These are the 16 cases in the case-fix record.
+- **Validated, two reviewed passes:** plausible-pr-5939 and plausible-pr-5956 (runs 07bb9eac and 11868a92, unchanged since).
+- **One reviewed pass on the current version, one more needed:** livebook-pr-2219, livebook-pr-2663 and operately-pr-1205 (run 11868a92; unchanged by the second batch).
+- **Changed by the second batch, two fresh attempts needed:** absinthe-pr-1176, accent-pr-183, ash-pr-3031, beacon-pr-687, cachex-pr-341, guardian-pr-748, livebeats-pr-37, livebook-pr-2527, livebook-pr-2800, livebook-pr-2822, livebook-pr-3076, operately-pr-1069, pinchflat-pr-610, plausible-pr-6449 and vutuv-pr-1759.
+- **ash-pr-3031** stays by the user's decision whatever its results; Opus has missed stated requirements in both attempts so far.

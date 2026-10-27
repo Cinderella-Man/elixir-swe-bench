@@ -73,7 +73,7 @@ end
   - A published page with unpublished draft changes is listed as published, with its published path and published `lastmod`. For example, if the draft renames `/news` to `/news-2025`, the sitemap still shows `/news` until the page is published again.
 - Every published page is listed, however many the site has. A site can have hundreds of pages, and the sitemap is not paginated.
 - The order of `url` entries is not significant.
-- The document is always well-formed XML. Characters in a page path that XML reserves are escaped. For example, `/q&a` appears as `<loc>http://example.com/q&amp;a</loc>`, and `/a<b` as `<loc>http://example.com/a&lt;b</loc>`. Percent-encoding those characters (`/q%26a`) is also acceptable.
+- The document is well-formed XML. Characters in a page path that XML reserves are escaped. For example, `/q&a` appears as `<loc>http://example.com/q&amp;a</loc>`, and `/a<b` as `<loc>http://example.com/a&lt;b</loc>`. Percent-encoding those characters (`/q%26a`) is also acceptable. Control characters that XML cannot represent at all are percent-encoded: the path `"/a\x01b"` (with U+0001) appears as `<loc>http://example.com/a%01b</loc>`.
 - A site with no published pages responds `200` with an empty `urlset`.
 
 ## robots.txt
@@ -124,6 +124,7 @@ Sitemap: http://example.com/blog/sitemap.xml
 - Only the exact `<mount path>/sitemap.xml` and `<mount path>/robots.txt` paths are new. A page whose path is `/sitemap` or `/robots`, and every other page path, still renders as a page.
 - Two sites mounted at the same path on different hosts each serve their own files. In the example, `http://example.com/sitemap.xml` is `:home`'s and `https://shop.example.com/sitemap.xml` is `:shop`'s.
 - Whether a page whose path has dynamic segments (`/posts/:id`, `/*rest`) is listed is not specified.
+- Whether the sitemap is well-formed when a page path contains the Unicode noncharacters U+FFFE or U+FFFF is not specified.
 
 ## Compatibility
 

@@ -43,6 +43,10 @@ Recurring gaps:
 - **"Nothing is saved" never submitted.** A test that only changes a form proves nothing about saving; submit it.
 - **Whole files left out of preservation.** When a few existing tests change on purpose, keep their files in the hidden stage with only those assertions updated, instead of dropping the files.
 - **Requirement texts that claim more than the reference does.** Fix the reference when the claim is inside the task; narrow the text only when it is outside.
+- **Only one actor or one input shape.** Every title test acted in the browser that played the song; every foreign segment came from a site in another team; every Markdown-split handle had the same shape. Add a second actor, a sibling in the same team, a second shape.
+- **Absolute words in texts.** "Always", "every", "leaves no state behind" and "everything is rolled back" were each false for some input on the reference. Probe such sentences with a throwaway test on the reference and the starting source before keeping them.
+
+Each later model run finds new gaps, because a different solution takes a different wrong turn. The second Opus review still changed 15 cases, though most findings were low severity.
 
 Make every new check deterministic on the starting source too. Global broadcasts reach every test running at the same time, so filter them by this test's own data. A supervisor restart leaves a gap, so retry in a monitored process. Wait for the operation that carries a value before asserting on it. Run a new check several times, under different seeds, before relying on its starting-failure status.
 

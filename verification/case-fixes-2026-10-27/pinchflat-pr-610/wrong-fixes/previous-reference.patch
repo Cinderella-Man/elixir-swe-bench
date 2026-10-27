@@ -1,0 +1,643 @@
+diff --git a/lib/pinchflat/downloading/downloading_helpers.ex b/lib/pinchflat/downloading/downloading_helpers.ex
+index eae187c..5a085b8 100644
+--- a/lib/pinchflat/downloading/downloading_helpers.ex
++++ b/lib/pinchflat/downloading/downloading_helpers.ex
+@@ -39,6 +39,25 @@ defmodule Pinchflat.Downloading.DownloadingHelpers do
+     :ok
+   end
+ 
++  @doc """
++  Starts tasks for retrying the download of a source's _failed_ media items (see
++  `MediaQuery.failed`). The downloads are forced so they're attempted even if a media
++  item is no longer pending, such as when re-downloading existing media failed.
++  A media item keeps its recorded error until a download succeeds. Jobs are not
++  enqueued if the source is set to not download media.
++
++  Returns :ok
++  """
++  def enqueue_failed_download_tasks(%Source{download_media: true} = source) do
++    source
++    |> Media.list_failed_media_items_for()
++    |> Enum.each(&MediaDownloadWorker.kickoff_with_task(&1, %{force: true}))
++  end
++
++  def enqueue_failed_download_tasks(%Source{download_media: false}) do
++    :ok
++  end
++
+   @doc """
+   Deletes ALL pending tasks for a source's media items.
+ 
+diff --git a/lib/pinchflat/downloading/media_download_worker.ex b/lib/pinchflat/downloading/media_download_worker.ex
+index 6ed5787..a0fbceb 100644
+--- a/lib/pinchflat/downloading/media_download_worker.ex
++++ b/lib/pinchflat/downloading/media_download_worker.ex
+@@ -105,13 +105,13 @@ defmodule Pinchflat.Downloading.MediaDownloadWorker do
+ 
+         :ok
+ 
+-      {:recovered, _} ->
++      {:recovered, _media_item, _message} ->
+         {:error, :retry}
+ 
+-      {:error, :unsuitable_for_download} ->
++      {:error, :unsuitable_for_download, _message} ->
+         {:ok, :non_retry}
+ 
+-      {:error, message} ->
++      {:error, _error_atom, message} ->
+         action_on_error(message)
+     end
+   end
+diff --git a/lib/pinchflat/downloading/media_downloader.ex b/lib/pinchflat/downloading/media_downloader.ex
+index 1103abc..312c149 100644
+--- a/lib/pinchflat/downloading/media_downloader.ex
++++ b/lib/pinchflat/downloading/media_downloader.ex
+@@ -10,6 +10,7 @@ defmodule Pinchflat.Downloading.MediaDownloader do
+   alias Pinchflat.Repo
+   alias Pinchflat.Media
+   alias Pinchflat.Media.MediaItem
++  alias Pinchflat.Utils.StringUtils
+   alias Pinchflat.Metadata.NfoBuilder
+   alias Pinchflat.Metadata.MetadataParser
+   alias Pinchflat.Metadata.MetadataFileHelpers
+@@ -20,16 +21,53 @@ defmodule Pinchflat.Downloading.MediaDownloader do
+ 
+   @doc """
+   Downloads media for a media item, updating the media item based on the metadata
+-  returned by yt-dlp. Also saves the entire metadata response to the associated
+-  media_metadata record.
++  returned by yt-dlp. Encountered errors are saved to the Media Item record. Saves
++  the entire metadata response to the associated media_metadata record.
+ 
+-  NOTE: related methods (like the download worker) won't download if the media item's source
++  NOTE: related methods (like the download worker) won't download if Pthe media item's source
+   is set to not download media. However, I'm not enforcing that here since I need this for testing.
+   This may change in the future but I'm not stressed.
+ 
+-  Returns {:ok, %MediaItem{}} | {:error, any, ...any}
++  Returns {:ok, %MediaItem{}} | {:error, atom(), String.t()} | {:recovered, %MediaItem{}, String.t()}
+   """
+   def download_for_media_item(%MediaItem{} = media_item, override_opts \\ []) do
++    case attempt_download_and_update_for_media_item(media_item, override_opts) do
++      {:ok, media_item} ->
++        # Returns {:ok, %MediaItem{}}
++        Media.update_media_item(media_item, %{last_error: nil})
++
++      {:error, error_atom, message} ->
++        Media.update_media_item(media_item, %{last_error: StringUtils.wrap_string(message)})
++
++        {:error, error_atom, message}
++
++      {:recovered, media_item, message} ->
++        {:ok, updated_media_item} = Media.update_media_item(media_item, %{last_error: StringUtils.wrap_string(message)})
++
++        {:recovered, updated_media_item, message}
++    end
++  end
++
++  # Looks complicated, but here's the key points:
++  # - download_with_options runs a pre-check to see if the media item is suitable for download.
++  # - If the media item fails the precheck, it returns {:error, :unsuitable_for_download, message}
++  # - If the precheck passes but the download fails, it normally returns {:error, :download_failed, message}
++  #   - However, there are some errors we can recover from (eg: failure to communicate with SponsorBlock).
++  #     In this case, we attempt the download anyway and update the media item with what details we do have.
++  #     This case returns {:recovered, updated_media_item, message}
++  #   - If we attempt a retry but it fails, we return {:error, :unrecoverable, message}
++  # - If there is an unknown error unrelated to the above, we return {:error, :unknown, message}
++  # - Finally, if there is no error, we update the media item with the parsed JSON and return {:ok, updated_media_item}
++  #
++  # Restated, here are the return values for each case:
++  # - On success: {:ok, updated_media_item}
++  # - On initial failure but successfully recovered: {:recovered, updated_media_item, message}
++  # - On error: {:error, error_atom, message} where error_atom is one of:
++  #   - `:unsuitable_for_download` if the media item fails the precheck
++  #   - `:unrecoverable` if there was an initial failure and the recovery attempt failed
++  #   - `:download_failed` for all other yt-dlp-related downloading errors
++  #   - `:unknown` for any other errors, including those not related to yt-dlp
++  defp attempt_download_and_update_for_media_item(media_item, override_opts) do
+     output_filepath = FilesystemUtils.generate_metadata_tmpfile(:json)
+     media_with_preloads = Repo.preload(media_item, [:metadata, source: :media_profile])
+ 
+@@ -38,31 +76,30 @@ defmodule Pinchflat.Downloading.MediaDownloader do
+         update_media_item_from_parsed_json(media_with_preloads, parsed_json)
+ 
+       {:error, :unsuitable_for_download} ->
+-        Logger.warning(
++        message =
+           "Media item ##{media_with_preloads.id} isn't suitable for download yet. May be an active or processing live stream"
+-        )
+ 
+-        {:error, :unsuitable_for_download}
++        Logger.warning(message)
++
++        {:error, :unsuitable_for_download, message}
+ 
+       {:error, message, _exit_code} ->
+         Logger.error("yt-dlp download error for media item ##{media_with_preloads.id}: #{inspect(message)}")
+ 
+         if String.contains?(to_string(message), recoverable_errors()) do
+-          attempt_update_media_item(media_with_preloads, output_filepath)
+-
+-          {:recovered, message}
++          attempt_recovery_from_error(media_with_preloads, output_filepath, message)
+         else
+-          {:error, message}
++          {:error, :download_failed, message}
+         end
+ 
+       err ->
+         Logger.error("Unknown error downloading media item ##{media_with_preloads.id}: #{inspect(err)}")
+ 
+-        {:error, "Unknown error: #{inspect(err)}"}
++        {:error, :unknown, "Unknown error: #{inspect(err)}"}
+     end
+   end
+ 
+-  defp attempt_update_media_item(media_with_preloads, output_filepath) do
++  defp attempt_recovery_from_error(media_with_preloads, output_filepath, error_message) do
+     with {:ok, contents} <- File.read(output_filepath),
+          {:ok, parsed_json} <- Phoenix.json_library().decode(contents) do
+       Logger.info("""
+@@ -71,12 +108,13 @@ defmodule Pinchflat.Downloading.MediaDownloader do
+       anyway
+       """)
+ 
+-      update_media_item_from_parsed_json(media_with_preloads, parsed_json)
++      {:ok, updated_media_item} = update_media_item_from_parsed_json(media_with_preloads, parsed_json)
++      {:recovered, updated_media_item, error_message}
+     else
+       err ->
+         Logger.error("Unable to recover error for media item ##{media_with_preloads.id}: #{inspect(err)}")
+ 
+-        {:error, :retry_failed}
++        {:error, :unrecoverable, error_message}
+     end
+   end
+ 
+diff --git a/lib/pinchflat/media/media.ex b/lib/pinchflat/media/media.ex
+index e1d8d7d..3a51658 100644
+--- a/lib/pinchflat/media/media.ex
++++ b/lib/pinchflat/media/media.ex
+@@ -66,6 +66,19 @@ defmodule Pinchflat.Media do
+     |> Repo.all()
+   end
+ 
++  @doc """
++  Returns a list of failed media_items for a given source, where
++  failed means the media_item satisfies `MediaQuery.failed`: its most
++  recent download attempt recorded an error and its download isn't prevented.
++
++  Returns [%MediaItem{}, ...].
++  """
++  def list_failed_media_items_for(%Source{} = source) do
++    MediaQuery.new()
++    |> where(^dynamic(^MediaQuery.for_source(source) and ^MediaQuery.failed()))
++    |> Repo.all()
++  end
++
+   @doc """
+   For a given media_item, tells you if it is pending download. This is defined as
+   the media_item satisfying `MediaQuery.pending` which you should really check out.
+diff --git a/lib/pinchflat/media/media_item.ex b/lib/pinchflat/media/media_item.ex
+index 8eeb97e..ced8e8c 100644
+--- a/lib/pinchflat/media/media_item.ex
++++ b/lib/pinchflat/media/media_item.ex
+@@ -40,6 +40,7 @@ defmodule Pinchflat.Media.MediaItem do
+     :thumbnail_filepath,
+     :metadata_filepath,
+     :nfo_filepath,
++    :last_error,
+     # These are user or system controlled fields
+     :prevent_download,
+     :prevent_culling,
+@@ -88,6 +89,7 @@ defmodule Pinchflat.Media.MediaItem do
+     # Will very likely revisit because I can't leave well-enough alone.
+     field :subtitle_filepaths, {:array, {:array, :string}}, default: []
+ 
++    field :last_error, :string
+     field :prevent_download, :boolean, default: false
+     field :prevent_culling, :boolean, default: false
+     field :culled_at, :utc_datetime
+diff --git a/lib/pinchflat/media/media_query.ex b/lib/pinchflat/media/media_query.ex
+index 840e82c..81e91ca 100644
+--- a/lib/pinchflat/media/media_query.ex
++++ b/lib/pinchflat/media/media_query.ex
+@@ -34,6 +34,7 @@ defmodule Pinchflat.Media.MediaQuery do
+   def download_prevented, do: dynamic([mi], mi.prevent_download == true)
+   def culling_prevented, do: dynamic([mi], mi.prevent_culling == true)
+   def redownloaded, do: dynamic([mi], not is_nil(mi.media_redownloaded_at))
++  def has_error, do: dynamic([mi], not is_nil(mi.last_error))
+   def upload_date_matches(other_date), do: dynamic([mi], fragment("date(?) = date(?)", mi.uploaded_at, ^other_date))
+ 
+   def upload_date_after_source_cutoff do
+@@ -136,6 +137,14 @@ defmodule Pinchflat.Media.MediaQuery do
+     )
+   end
+ 
++  def failed do
++    dynamic(
++      [mi],
++      ^has_error() and
++        not (^download_prevented())
++    )
++  end
++
+   def upgradeable do
+     dynamic(
+       [mi, source],
+diff --git a/lib/pinchflat/utils/string_utils.ex b/lib/pinchflat/utils/string_utils.ex
+index 49328b2..66efc5e 100644
+--- a/lib/pinchflat/utils/string_utils.ex
++++ b/lib/pinchflat/utils/string_utils.ex
+@@ -35,4 +35,13 @@ defmodule Pinchflat.Utils.StringUtils do
+   def double_brace(string) do
+     "{{ #{string} }}"
+   end
++
++  @doc """
++  Wraps a string in quotes if it's not already a string. Useful for working with
++  error messages whose types can vary.
++
++  Returns binary()
++  """
++  def wrap_string(message) when is_binary(message), do: message
++  def wrap_string(message), do: "#{inspect(message)}"
+ end
+diff --git a/lib/pinchflat_web/components/custom_components/button_components.ex b/lib/pinchflat_web/components/custom_components/button_components.ex
+index f1f3470..95f16cf 100644
+--- a/lib/pinchflat_web/components/custom_components/button_components.ex
++++ b/lib/pinchflat_web/components/custom_components/button_components.ex
+@@ -3,6 +3,7 @@ defmodule PinchflatWeb.CustomComponents.ButtonComponents do
+   use Phoenix.Component, global_prefixes: ~w(x-)
+ 
+   alias PinchflatWeb.CoreComponents
++  alias PinchflatWeb.CustomComponents.TextComponents
+ 
+   @doc """
+   Render a button
+@@ -104,7 +105,7 @@ defmodule PinchflatWeb.CustomComponents.ButtonComponents do
+ 
+   def icon_button(assigns) do
+     ~H"""
+-    <div class="group relative inline-block">
++    <TextComponents.tooltip position="bottom" tooltip={@tooltip} tooltip_class="text-nowrap">
+       <button
+         class={[
+           "flex justify-center items-center rounded-lg ",
+@@ -117,18 +118,7 @@ defmodule PinchflatWeb.CustomComponents.ButtonComponents do
+       >
+         <CoreComponents.icon name={@icon_name} class="text-stroke" />
+       </button>
+-      <div
+-        :if={@tooltip}
+-        class={[
+-          "hidden absolute left-1/2 top-full z-20 mt-3 -translate-x-1/2 whitespace-nowrap rounded-md",
+-          "px-4.5 py-1.5 text-sm font-medium opacity-0 drop-shadow-4 group-hover:opacity-100 group-hover:block bg-meta-4"
+-        ]}
+-      >
+-        <span class="border-light absolute -top-1 left-1/2 -z-10 h-2 w-2 -translate-x-1/2 rotate-45 rounded-sm bg-meta-4">
+-        </span>
+-        <span>{@tooltip}</span>
+-      </div>
+-    </div>
++    </TextComponents.tooltip>
+     """
+   end
+ end
+diff --git a/lib/pinchflat_web/components/custom_components/text_components.ex b/lib/pinchflat_web/components/custom_components/text_components.ex
+index 2145bae..3be3647 100644
+--- a/lib/pinchflat_web/components/custom_components/text_components.ex
++++ b/lib/pinchflat_web/components/custom_components/text_components.ex
+@@ -146,4 +146,60 @@ defmodule PinchflatWeb.CustomComponents.TextComponents do
+     <.localized_number number={@num} /> {@suffix}
+     """
+   end
++
++  @doc """
++  Renders a tooltip with the given content
++  """
++
++  attr :tooltip, :string, required: true
++  attr :position, :string, default: ""
++  attr :tooltip_class, :any, default: ""
++  attr :tooltip_arrow_class, :any, default: ""
++  slot :inner_block
++
++  def tooltip(%{position: "bottom-right"} = assigns) do
++    ~H"""
++    <.tooltip tooltip={@tooltip} tooltip_class={@tooltip_class} tooltip_arrow_class={["-top-1", @tooltip_arrow_class]}>
++      {render_slot(@inner_block)}
++    </.tooltip>
++    """
++  end
++
++  def tooltip(%{position: "bottom"} = assigns) do
++    ~H"""
++    <.tooltip
++      tooltip={@tooltip}
++      tooltip_class={["left-1/2 -translate-x-1/2", @tooltip_class]}
++      tooltip_arrow_class={["-top-1 left-1/2 -translate-x-1/2", @tooltip_arrow_class]}
++    >
++      {render_slot(@inner_block)}
++    </.tooltip>
++    """
++  end
++
++  def tooltip(assigns) do
++    ~H"""
++    <div class="group relative inline-block cursor-pointer">
++      <div>
++        {render_slot(@inner_block)}
++      </div>
++      <div
++        :if={@tooltip}
++        class={[
++          "hidden absolute top-full z-20 mt-3 whitespace-nowrap rounded-md",
++          "p-1.5 text-sm font-medium opacity-0 drop-shadow-4 group-hover:opacity-100 group-hover:block bg-meta-4",
++          "border border-form-strokedark text-wrap",
++          @tooltip_class
++        ]}
++      >
++        <span class={[
++          "border-t border-l border-form-strokedark absolute -z-10 h-2 w-2 rotate-45 rounded-sm bg-meta-4",
++          @tooltip_arrow_class
++        ]}>
++        </span>
++        <div class="px-3">{@tooltip}</div>
++      </div>
++    </div>
++    """
++  end
+ end
+diff --git a/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex b/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex
+index a8b812a..f531731 100644
+--- a/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex
++++ b/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex
+@@ -16,7 +16,7 @@
+     </.link>
+   </nav>
+ </div>
+-<div class="rounded-sm border border-stroke bg-white py-5 pt-6 shadow-default dark:border-strokedark dark:bg-boxdark px-7.5">
++<div class="rounded-sm border py-5 pt-6 shadow-default border-strokedark bg-boxdark px-7.5">
+   <div class="max-w-full">
+     <.tabbed_layout>
+       <:tab_append>
+@@ -24,7 +24,15 @@
+       </:tab_append>
+ 
+       <:tab title="Media" id="media">
+-        <div class="flex flex-col gap-10 dark:text-white">
++        <div class="flex flex-col gap-10 text-white">
++          <section :if={@media_item.last_error} class="mt-6">
++            <div class="flex items-center gap-1 mb-2">
++              <.icon name="hero-exclamation-circle-solid" class="text-red-500" />
++              <h3 class="font-bold text-xl">Last Error</h3>
++            </div>
++            <span>{@media_item.last_error}</span>
++          </section>
++
+           <%= if media_file_exists?(@media_item) do %>
+             <section class="grid grid-cols-1 xl:gap-6 mt-6">
+               <div>
+@@ -54,19 +62,21 @@
+             </section>
+           <% end %>
+ 
+-          <h3 class="font-bold text-xl mt-6">Raw Attributes</h3>
+           <section>
+-            <strong>Source:</strong>
+-            <.subtle_link href={~p"/sources/#{@media_item.source_id}"}>
+-              {@media_item.source.custom_name}
+-            </.subtle_link>
+-            <.list_items_from_map map={Map.from_struct(@media_item)} />
++            <h3 class="font-bold text-xl mb-2">Raw Attributes</h3>
++            <section>
++              <strong>Source:</strong>
++              <.subtle_link href={~p"/sources/#{@media_item.source_id}"}>
++                {@media_item.source.custom_name}
++              </.subtle_link>
++              <.list_items_from_map map={Map.from_struct(@media_item)} />
++            </section>
+           </section>
+         </div>
+       </:tab>
+       <:tab title="Tasks" id="tasks">
+         <%= if match?([_|_], @media_item.tasks) do %>
+-          <.table rows={@media_item.tasks} table_class="text-black dark:text-white">
++          <.table rows={@media_item.tasks} table_class="text-white">
+             <:col :let={task} label="Worker">
+               {task.job.worker}
+             </:col>
+diff --git a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/show.html.heex b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/show.html.heex
+index d08237f..641296e 100644
+--- a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/show.html.heex
++++ b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/show.html.heex
+@@ -25,8 +25,10 @@
+ 
+       <:tab title="Media Profile" id="media-profile">
+         <div class="flex flex-col gap-10 text-white">
+-          <h3 class="font-bold text-xl mt-6">Raw Attributes</h3>
+-          <.list_items_from_map map={Map.from_struct(@media_profile)} />
++          <section>
++            <h3 class="font-bold text-xl mt-6 mb-2">Raw Attributes</h3>
++            <.list_items_from_map map={Map.from_struct(@media_profile)} />
++          </section>
+         </div>
+       </:tab>
+       <:tab title="Sources" id="sources">
+diff --git a/lib/pinchflat_web/controllers/pages/page_html/history_table_live.ex b/lib/pinchflat_web/controllers/pages/page_html/history_table_live.ex
+index d2cab17..6c104aa 100644
+--- a/lib/pinchflat_web/controllers/pages/page_html/history_table_live.ex
++++ b/lib/pinchflat_web/controllers/pages/page_html/history_table_live.ex
+@@ -28,10 +28,22 @@ defmodule Pinchflat.Pages.HistoryTableLive do
+       </span>
+       <div class="max-w-full overflow-x-auto">
+         <.table rows={@records} table_class="text-white">
+-          <:col :let={media_item} label="Title" class="truncate max-w-xs">
+-            <.subtle_link href={~p"/sources/#{media_item.source_id}/media/#{media_item}"}>
+-              {media_item.title}
+-            </.subtle_link>
++          <:col :let={media_item} label="Title" class="max-w-xs">
++            <section class="flex items-center space-x-1">
++              <.tooltip
++                :if={media_item.last_error}
++                tooltip={media_item.last_error}
++                position="bottom-right"
++                tooltip_class="w-64"
++              >
++                <.icon name="hero-exclamation-circle-solid" class="text-red-500" />
++              </.tooltip>
++              <span class="truncate">
++                <.subtle_link href={~p"/sources/#{media_item.source_id}/media/#{media_item.id}"}>
++                  {media_item.title}
++                </.subtle_link>
++              </span>
++            </section>
+           </:col>
+           <:col :let={media_item} label="Upload Date">
+             {DateTime.to_date(media_item.uploaded_at)}
+diff --git a/lib/pinchflat_web/controllers/sources/source_controller.ex b/lib/pinchflat_web/controllers/sources/source_controller.ex
+index 678618b..a2c9bff 100644
+--- a/lib/pinchflat_web/controllers/sources/source_controller.ex
++++ b/lib/pinchflat_web/controllers/sources/source_controller.ex
+@@ -132,6 +132,15 @@ defmodule PinchflatWeb.Sources.SourceController do
+     )
+   end
+ 
++  def retry_failed_downloads(conn, %{"source_id" => id}) do
++    wrap_forced_action(
++      conn,
++      id,
++      "Retrying failed downloads.",
++      &DownloadingHelpers.enqueue_failed_download_tasks/1
++    )
++  end
++
+   def force_index(conn, %{"source_id" => id}) do
+     wrap_forced_action(
+       conn,
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/actions_dropdown.html.heex b/lib/pinchflat_web/controllers/sources/source_html/actions_dropdown.html.heex
+index ac00877..4abc651 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/actions_dropdown.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/actions_dropdown.html.heex
+@@ -50,6 +50,15 @@
+       Redownload Existing
+     </.link>
+   </:option>
++  <:option :if={@source.download_media}>
++    <.link
++      href={~p"/sources/#{@source}/retry_failed_downloads"}
++      method="post"
++      data-confirm="Are you sure you want to retry all failed downloads? Every media item under the Failed tab will be downloaded again."
++    >
++      Retry Failed Downloads
++    </.link>
++  </:option>
+   <:option>
+     <.link
+       href={~p"/sources/#{@source}/force_index"}
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/media_item_table_live.ex b/lib/pinchflat_web/controllers/sources/source_html/media_item_table_live.ex
+index bbcf681..fe8049d 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/media_item_table_live.ex
++++ b/lib/pinchflat_web/controllers/sources/source_html/media_item_table_live.ex
+@@ -46,10 +46,22 @@ defmodule PinchflatWeb.Sources.MediaItemTableLive do
+         </div>
+       </header>
+       <.table rows={@records} table_class="text-white">
+-        <:col :let={media_item} label="Title" class="truncate max-w-xs">
+-          <.subtle_link href={~p"/sources/#{@source.id}/media/#{media_item.id}"}>
+-            {media_item.title}
+-          </.subtle_link>
++        <:col :let={media_item} label="Title" class="max-w-xs">
++          <section class="flex items-center space-x-1">
++            <.tooltip
++              :if={media_item.last_error}
++              tooltip={media_item.last_error}
++              position="bottom-right"
++              tooltip_class="w-64"
++            >
++              <.icon name="hero-exclamation-circle-solid" class="text-red-500" />
++            </.tooltip>
++            <span class="truncate">
++              <.subtle_link href={~p"/sources/#{@source.id}/media/#{media_item.id}"}>
++                {media_item.title}
++              </.subtle_link>
++            </span>
++          </section>
+         </:col>
+         <:col :let={media_item} :if={@media_state == "other"} label="Manually Ignored?">
+           <.icon name={if media_item.prevent_download, do: "hero-check", else: "hero-x-mark"} />
+@@ -197,6 +209,12 @@ defmodule PinchflatWeb.Sources.MediaItemTableLive do
+     )
+   end
+ 
++  defp generate_base_query(source, "failed") do
++    MediaQuery.new()
++    |> select(^select_fields())
++    |> where(^dynamic(^MediaQuery.for_source(source) and ^MediaQuery.failed()))
++  end
++
+   defp filtered_base_query(base_query, search_term) do
+     base_query
+     |> MediaQuery.require_assoc(:media_items_search_index)
+@@ -205,6 +223,6 @@ defmodule PinchflatWeb.Sources.MediaItemTableLive do
+ 
+   # Selecting only what we need GREATLY speeds up queries on large tables
+   defp select_fields do
+-    [:id, :title, :uploaded_at, :prevent_download]
++    [:id, :title, :uploaded_at, :prevent_download, :last_error]
+   end
+ end
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/show.html.heex b/lib/pinchflat_web/controllers/sources/source_html/show.html.heex
+index 855b52e..31a871a 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/show.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/show.html.heex
+@@ -24,16 +24,18 @@
+       </:tab_append>
+ 
+       <:tab title="Source" id="source">
+-        <div class="flex flex-col gap-10 text-white">
+-          <h3 class="font-bold text-xl mt-6">Raw Attributes</h3>
++        <div class="flex flex-col text-white gap-10">
+           <section>
+-            <strong>Media Profile:</strong>
+-            <.subtle_link href={~p"/media_profiles/#{@source.media_profile_id}"}>
+-              {@source.media_profile.name}
+-            </.subtle_link>
+-          </section>
++            <h3 class="font-bold text-xl mb-2 mt-6">Raw Attributes</h3>
++            <section>
++              <strong>Media Profile:</strong>
++              <.subtle_link href={~p"/media_profiles/#{@source.media_profile_id}"}>
++                {@source.media_profile.name}
++              </.subtle_link>
++            </section>
+ 
+-          <.list_items_from_map map={Map.from_struct(@source)} />
++            <.list_items_from_map map={Map.from_struct(@source)} />
++          </section>
+         </div>
+       </:tab>
+       <:tab title="Pending" id="pending">
+@@ -57,6 +59,13 @@
+           session: %{"source_id" => @source.id, "media_state" => "other"}
+         )}
+       </:tab>
++      <:tab title="Failed" id="failed">
++        {live_render(
++          @conn,
++          PinchflatWeb.Sources.MediaItemTableLive,
++          session: %{"source_id" => @source.id, "media_state" => "failed"}
++        )}
++      </:tab>
+       <:tab title="Tasks" id="tasks">
+         <%= if match?([_|_], @pending_tasks) do %>
+           <.table rows={@pending_tasks} table_class="text-black dark:text-white">
+diff --git a/lib/pinchflat_web/router.ex b/lib/pinchflat_web/router.ex
+index bdbb17e..572c466 100644
+--- a/lib/pinchflat_web/router.ex
++++ b/lib/pinchflat_web/router.ex
+@@ -54,6 +54,7 @@ defmodule PinchflatWeb.Router do
+     resources "/sources", Sources.SourceController do
+       post "/force_download_pending", Sources.SourceController, :force_download_pending
+       post "/force_redownload", Sources.SourceController, :force_redownload
++      post "/retry_failed_downloads", Sources.SourceController, :retry_failed_downloads
+       post "/force_index", Sources.SourceController, :force_index
+       post "/force_metadata_refresh", Sources.SourceController, :force_metadata_refresh
+       post "/sync_files_on_disk", Sources.SourceController, :sync_files_on_disk
+diff --git a/priv/repo/migrations/20250210201413_add_last_error_to_media_item.exs b/priv/repo/migrations/20250210201413_add_last_error_to_media_item.exs
+new file mode 100644
+index 0000000..d8723ba
+--- /dev/null
++++ b/priv/repo/migrations/20250210201413_add_last_error_to_media_item.exs
+@@ -0,0 +1,9 @@
++defmodule Pinchflat.Repo.Migrations.AddLastErrorToMediaItem do
++  use Ecto.Migration
++
++  def change do
++    alter table(:media_items) do
++      add :last_error, :string
++    end
++  end
++end

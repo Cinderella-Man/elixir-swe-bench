@@ -1,0 +1,185 @@
+diff --git a/test/benchmark/probe2_test.exs b/test/benchmark/probe2_test.exs
+new file mode 100644
+index 0000000..01164b1
+--- /dev/null
++++ b/test/benchmark/probe2_test.exs
+@@ -0,0 +1,179 @@
++defmodule Guardian.Benchmark.Probe2Test do
++  @moduledoc false
++  use ExUnit.Case, async: false
++
++  import Plug.Conn
++  import Plug.Test
++
++  alias Guardian.Plug.Pipeline
++  alias Guardian.Plug.VerifyHeader
++  alias Guardian.Plug.VerifySession
++
++  @resource %{id: "erin"}
++
++  defmodule Fetcher do
++    @moduledoc false
++    use Guardian.Token.Jwt.SecretFetcher
++
++    def fetch_signing_secret(_mod, opts), do: fetch(:sign, opts)
++    def fetch_verifying_secret(_mod, _headers, opts), do: fetch(:verify, opts)
++
++    defp fetch(purpose, opts) do
++      send(self(), {:probe_fetcher, purpose, Keyword.fetch(opts, :secret)})
++      {:ok, Guardian.Config.resolve_value(Keyword.get(opts, :secret)) || "probe2-fetcher-fallback"}
++    end
++  end
++
++  defmodule Impl do
++    @moduledoc false
++    use Guardian,
++      otp_app: :guardian,
++      token_module: Guardian.Token.Jwt,
++      secret_key: "probe2-application-secret",
++      allowed_algos: ["HS512"]
++
++    def subject_for_token(%{id: id}, _claims), do: {:ok, id}
++    def resource_from_claims(%{"sub" => id}), do: {:ok, %{id: id}}
++  end
++
++  defmodule FetcherImpl do
++    @moduledoc false
++    use Guardian,
++      otp_app: :guardian,
++      token_module: Guardian.Token.Jwt,
++      secret_key: "probe2-application-secret",
++      secret_fetcher: Guardian.Benchmark.Probe2Test.Fetcher,
++      allowed_algos: ["HS512"]
++
++    def subject_for_token(%{id: id}, _claims), do: {:ok, id}
++    def resource_from_claims(%{"sub" => id}), do: {:ok, %{id: id}}
++  end
++
++  defmodule Handler do
++    @moduledoc false
++    import Plug.Conn
++    @behaviour Guardian.Plug.ErrorHandler
++
++    @impl Guardian.Plug.ErrorHandler
++    def auth_error(conn, {type, reason}, _opts) do
++      send(self(), {:probe_auth_error, type, reason})
++      send_resp(conn, 401, inspect({type, reason}))
++    end
++  end
++
++  def missing(_conn), do: nil
++  def tenant(conn), do: conn.assigns[:tenant_secret]
++  def mfa_missing, do: nil
++  def mfa_present, do: "probe2-mfa-secret"
++
++  defp request(mod, assigns \\ %{}) do
++    conn = :get |> conn("/") |> Pipeline.put_module(mod) |> Pipeline.put_error_handler(Handler)
++    Enum.reduce(assigns, conn, fn {k, v}, acc -> assign(acc, k, v) end)
++  end
++
++  defp report(label, fun) do
++    result =
++      try do
++        conn = fun.()
++
++        {:returned, halted: conn.halted, status: conn.status, token: Guardian.Plug.current_token(conn) != nil,
++         claims_typ: (Guardian.Plug.current_claims(conn) || %{})["typ"]}
++      rescue
++        e -> {:raised, e.__struct__}
++      end
++
++    IO.puts("PROBE #{label}: #{inspect(result)} msgs=#{inspect(drain([]))}")
++  end
++
++  defp drain(acc) do
++    receive do
++      {:plug_conn, :sent} -> drain(acc)
++      {ref, _} when is_reference(ref) -> drain(acc)
++      msg -> drain([msg | acc])
++    after
++      0 -> Enum.reverse(acc)
++    end
++  end
++
++  test "what a custom fetcher receives under :secret" do
++    {:ok, token, _} = FetcherImpl.encode_and_sign(@resource, %{}, secret: "probe2-fetcher-fallback")
++    drain([])
++    header = fn conn -> put_req_header(conn, "authorization", "Bearer " <> token) end
++
++    for {label, secret} <- [
++          {"explicit nil", nil},
++          {"fn -> nil", &__MODULE__.missing/1},
++          {"fn -> value", &__MODULE__.tenant/1},
++          {"static value", "probe2-static"},
++          {"mfa -> nil", {__MODULE__, :mfa_missing, []}},
++          {"mfa -> value", {__MODULE__, :mfa_present, []}}
++        ] do
++      report("fetcher VerifyHeader #{label}", fn ->
++        request(FetcherImpl, %{tenant_secret: "probe2-tenant"}) |> header.() |> VerifyHeader.call(VerifyHeader.init(secret: secret))
++      end)
++
++      report("fetcher sign_in #{label}", fn ->
++        FetcherImpl.Plug.sign_in(request(FetcherImpl, %{tenant_secret: "probe2-tenant"}), @resource, %{}, secret: secret)
++      end)
++    end
++
++    IO.puts("PROBE fetcher API decode mfa -> nil: #{inspect(elem(FetcherImpl.decode_and_verify(token, %{}, secret: {__MODULE__, :mfa_missing, []}), 0))} msgs=#{inspect(drain([]))}")
++  end
++
++  test "refresh_from_cookie and a secret that is not found" do
++    {:ok, access, _} = Impl.encode_and_sign(@resource)
++    {:ok, refresh, _} = Impl.encode_and_sign(@resource, %{}, token_type: "refresh")
++    {:ok, access_a, _} = Impl.encode_and_sign(@resource, %{}, secret: "k-a")
++    {:ok, refresh_a, _} = Impl.encode_and_sign(@resource, %{}, token_type: "refresh", secret: "k-a")
++    missing = &__MODULE__.missing/1
++    tenant = &__MODULE__.tenant/1
++    header = fn conn, t -> put_req_header(conn, "authorization", "Bearer " <> t) end
++    cookie = fn conn, t -> conn |> put_req_cookie("guardian_default_token", t) |> fetch_cookies() end
++
++    report("control VerifyHeader nil, no refresh option", fn ->
++      request(Impl) |> header.(access) |> VerifyHeader.call(VerifyHeader.init(secret: missing))
++    end)
++
++    report("VerifyHeader nil, refresh [secret: nil fn], no cookie", fn ->
++      request(Impl) |> header.(access) |> fetch_cookies() |> VerifyHeader.call(VerifyHeader.init(secret: missing, refresh_from_cookie: [secret: missing]))
++    end)
++
++    report("VerifyHeader nil, refresh [secret: nil fn], app refresh cookie", fn ->
++      request(Impl) |> header.(access) |> cookie.(refresh) |> VerifyHeader.call(VerifyHeader.init(secret: missing, refresh_from_cookie: [secret: missing]))
++    end)
++
++    report("VerifyHeader nil, refresh [] (own secret omitted), app refresh cookie", fn ->
++      request(Impl) |> header.(access) |> cookie.(refresh) |> VerifyHeader.call(VerifyHeader.init(secret: missing, refresh_from_cookie: []))
++    end)
++
++    report("VerifyHeader nil, refresh true, no cookie", fn ->
++      request(Impl) |> header.(access) |> fetch_cookies() |> VerifyHeader.call(VerifyHeader.init(secret: missing, refresh_from_cookie: true))
++    end)
++
++    report("VerifySession nil, refresh [secret: nil fn], no cookie", fn ->
++      request(Impl)
++      |> init_test_session(%{"guardian_default_token" => access})
++      |> fetch_cookies()
++      |> VerifySession.call(VerifySession.init(secret: missing, refresh_from_cookie: [secret: missing]))
++    end)
++
++    report("VerifySession nil, refresh [secret: nil fn], app refresh cookie", fn ->
++      request(Impl)
++      |> init_test_session(%{"guardian_default_token" => access})
++      |> cookie.(refresh)
++      |> VerifySession.call(VerifySession.init(secret: missing, refresh_from_cookie: [secret: missing]))
++    end)
++
++    report("control VerifyHeader k-b vs k-a token, no refresh option", fn ->
++      request(Impl, %{tenant_secret: "k-b"}) |> header.(access_a) |> VerifyHeader.call(VerifyHeader.init(secret: tenant))
++    end)
++
++    report("VerifyHeader k-b vs k-a token, refresh [secret: tenant], no cookie", fn ->
++      request(Impl, %{tenant_secret: "k-b"}) |> header.(access_a) |> fetch_cookies() |> VerifyHeader.call(VerifyHeader.init(secret: tenant, refresh_from_cookie: [secret: tenant]))
++    end)
++
++    report("VerifyHeader k-b vs k-a token, refresh [secret: tenant], k-a refresh cookie", fn ->
++      request(Impl, %{tenant_secret: "k-b"}) |> header.(access_a) |> cookie.(refresh_a) |> VerifyHeader.call(VerifyHeader.init(secret: tenant, refresh_from_cookie: [secret: tenant]))
++    end)
++  end
++end

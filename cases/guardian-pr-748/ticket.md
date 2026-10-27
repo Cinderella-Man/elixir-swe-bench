@@ -17,7 +17,7 @@ Let the `:secret` option be chosen per request from the connection, everywhere G
 | `{module, function, args}` | Call it without the connection, as today. |
 | A one-argument function | Call it with the current `Plug.Conn`. Its return value is the secret for that operation. |
 
-A `:secret` function of any other arity is a configuration error. It raises `ArgumentError` when the plug or function runs. It is not reported to the error handler as an authentication failure.
+A `:secret` function of any other arity is a configuration error. It raises `ArgumentError` where a one-argument function would be called (see Resolution timing). It is not reported to the error handler as an authentication failure.
 
 Exceptions raised inside a `:secret` function propagate to the caller. They are not turned into authentication errors and never cause a fallback.
 
@@ -45,7 +45,7 @@ Resolution timing:
 
 ## Fail closed
 
-A `:secret` that is given explicitly but is `nil`, or that resolves to `nil` (from a function or from `{m, f, a}`), means "no secret found". It never falls back to `:secret_key`. Only an omitted `:secret` uses `:secret_key`.
+A `:secret` that is given explicitly but is `nil`, or that resolves to `nil` (from a function or from `{m, f, a}`), means "no secret found". It never falls back to `:secret_key`. Only an omitted `:secret` uses `:secret_key`. A custom `secret_fetcher` instead receives under `:secret` the explicit `nil`, the `nil` returned by a one-argument function, or the unresolved `{m, f, a}` tuple, and decides the outcome; the outcomes below are those of the default fetcher.
 
 | Where | Outcome when the secret is not found |
 | --- | --- |
@@ -56,6 +56,8 @@ A `:secret` that is given explicitly but is `nil`, or that resolves to `nil` (fr
 | `Guardian.Token.Jwt.decode_token/3` | `{:error, :secret_not_found}`, no longer collapsed into `{:error, :invalid_token}`. A bad signature is still `{:error, :invalid_token}`. |
 
 A secret that is found but is wrong is an ordinary verification failure. A token signed for another tenant is rejected with `{:invalid_token, :invalid_token}`.
+
+With `:refresh_from_cookie`, `VerifyHeader` and `VerifySession` hand either failure to the cookie refresh, as they do every other verification failure, and the refresh decides the outcome: with no refresh cookie the request continues without a token and the error handler is not called.
 
 ## Examples
 
@@ -81,12 +83,13 @@ plug Guardian.Plug.SlidingCookie, secret: &MyApp.Secrets.for_conn/1
 - The tenant is assigned with key `"k-a"`. A token signed with `"k-a"` is accepted, and its claims are put on the connection. `sign_in` produces a token that verifies with `"k-a"` but not with `:secret_key`.
 - No tenant is assigned, so `for_conn/1` returns `nil`. A token signed with the application's `:secret_key` is rejected with `{:invalid_token, :secret_not_found}`. `sign_in` issues nothing, and the error handler receives `{:unauthenticated, {:error, :secret_not_found}}`. `SlidingCookie` leaves the cookie alone and does not re-sign it with `:secret_key`.
 - The assigned tenant uses `"k-b"`, but the token was signed with `"k-a"`. The token is rejected with `{:invalid_token, :invalid_token}`.
+- Because this pipeline sets `refresh_from_cookie`, `VerifyHeader` hands the rejected header tokens above to the cookie refresh, which verifies the refresh cookie with its own `:secret`. With no refresh cookie the request continues unauthenticated and the error handler is not called.
 
 ## Compatibility
 
 - Applications that omit `:secret`, or that pass a static or `{m, f, a}` secret, behave exactly as before for both verifying and issuing.
 - Existing error tuples are kept: a bad signature is still `:invalid_token`, an expired token is still handled as before, and the issuing functions keep their existing error reporting.
-- Custom `secret_fetcher` modules keep working. They receive the resolved value under `:secret`.
+- Custom `secret_fetcher` modules keep working. They receive `:secret` as before, except that a one-argument function is replaced by its result.
 - The one intended behaviour change: an explicit `nil` secret, or an `{m, f, a}` resolving to `nil`, used to fall back to `:secret_key` and now fails with `:secret_not_found`.
 
 ## Non-goals

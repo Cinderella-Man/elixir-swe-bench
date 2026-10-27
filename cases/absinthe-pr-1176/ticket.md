@@ -163,6 +163,8 @@ All of these are raised when the schema module is compiled.
 - Extensions do not add or change descriptions.
 - GraphQL introspection does not expose applied directives, and this task does not add them.
 - Macro schemas keep choosing their roots from the `query`, `mutation` and `subscription` macros. SDL schemas keep choosing theirs from the declaration, or by the type names `Query`, `Mutation` and `Subscription`.
+- A schema whose query root has a name other than `Query` or `RootQueryType` cannot be introspected today. Changing that is out of scope.
+- Schema providers other than the default one and `Absinthe.Schema.PersistentTerm` are out of scope.
 
 ## Compatibility
 

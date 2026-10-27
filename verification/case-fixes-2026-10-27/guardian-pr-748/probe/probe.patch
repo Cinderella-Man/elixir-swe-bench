@@ -1,0 +1,176 @@
+diff --git a/test/benchmark/probe_test.exs b/test/benchmark/probe_test.exs
+new file mode 100644
+index 0000000..2e99b16
+--- /dev/null
++++ b/test/benchmark/probe_test.exs
+@@ -0,0 +1,170 @@
++defmodule Guardian.Benchmark.ProbeTest do
++  @moduledoc false
++  use ExUnit.Case, async: false
++
++  import Plug.Conn
++  import Plug.Test
++
++  alias Guardian.Plug.Pipeline
++  alias Guardian.Plug.SlidingCookie
++  alias Guardian.Plug.VerifyCookie
++  alias Guardian.Plug.VerifyHeader
++  alias Guardian.Plug.VerifySession
++
++  @resource %{id: "dave"}
++  @fallback "probe-fetcher-fallback-secret"
++
++  defmodule Fetcher do
++    @moduledoc false
++    use Guardian.Token.Jwt.SecretFetcher
++
++    def fetch_signing_secret(_mod, opts) do
++      send(self(), {:probe_fetcher, :sign, Keyword.fetch(opts, :secret)})
++      {:ok, Keyword.get(opts, :secret) || "probe-fetcher-fallback-secret"}
++    end
++
++    def fetch_verifying_secret(_mod, _headers, opts) do
++      send(self(), {:probe_fetcher, :verify, Keyword.fetch(opts, :secret)})
++      {:ok, Keyword.get(opts, :secret) || "probe-fetcher-fallback-secret"}
++    end
++  end
++
++  defmodule Impl do
++    @moduledoc false
++    use Guardian,
++      otp_app: :guardian,
++      token_module: Guardian.Token.Jwt,
++      secret_key: "probe-application-secret",
++      allowed_algos: ["HS512"]
++
++    def subject_for_token(%{id: id}, _claims), do: {:ok, id}
++    def resource_from_claims(%{"sub" => id}), do: {:ok, %{id: id}}
++    def sliding_cookie(_claims, _resource, _opts), do: {:ok, %{"slid" => true}}
++  end
++
++  defmodule FetcherImpl do
++    @moduledoc false
++    use Guardian,
++      otp_app: :guardian,
++      token_module: Guardian.Token.Jwt,
++      secret_key: "probe-application-secret",
++      secret_fetcher: Guardian.Benchmark.ProbeTest.Fetcher,
++      allowed_algos: ["HS512"]
++
++    def subject_for_token(%{id: id}, _claims), do: {:ok, id}
++    def resource_from_claims(%{"sub" => id}), do: {:ok, %{id: id}}
++  end
++
++  defmodule Handler do
++    @moduledoc false
++    import Plug.Conn
++    @behaviour Guardian.Plug.ErrorHandler
++
++    @impl Guardian.Plug.ErrorHandler
++    def auth_error(conn, {type, reason}, _opts) do
++      send(self(), {:probe_auth_error, type, reason})
++      send_resp(conn, 401, inspect({type, reason}))
++    end
++  end
++
++  def missing(_conn), do: nil
++
++  defp request(mod \\ Impl) do
++    :get |> conn("/") |> Pipeline.put_module(mod) |> Pipeline.put_error_handler(Handler)
++  end
++
++  defp outcome(fun) do
++    try do
++      conn = fun.()
++      {:returned, halted: conn.halted, status: conn.status, token: Guardian.Plug.current_token(conn) != nil,
++       resp_cookie: Map.has_key?(conn.resp_cookies, "guardian_default_token")}
++    rescue
++      e -> {:raised, e.__struct__}
++    end
++  end
++
++  defp report(label, fun) do
++    IO.puts("PROBE #{label}: #{inspect(outcome(fun))}")
++    receive_all(label)
++  end
++
++  defp receive_all(label) do
++    receive do
++      msg ->
++        IO.puts("PROBE #{label}   msg: #{inspect(msg)}")
++        receive_all(label)
++    after
++      0 -> :ok
++    end
++  end
++
++  test "wrong arity without a token" do
++    bad = fn -> "x" end
++    {:ok, token, _} = Impl.encode_and_sign(@resource, %{}, secret: "probe-application-secret")
++    {:ok, refresh, _} = Impl.encode_and_sign(@resource, %{}, token_type: "refresh")
++
++    report("header/no-token", fn -> VerifyHeader.call(request(), VerifyHeader.init(secret: bad)) end)
++    report("session/no-token", fn -> request() |> init_test_session(%{}) |> VerifySession.call(VerifySession.init(secret: bad)) end)
++    report("cookie/no-token", fn -> request() |> fetch_cookies() |> VerifyCookie.call(secret: bad) end)
++    report("sliding/no-token", fn -> request() |> fetch_cookies() |> SlidingCookie.call(SlidingCookie.init(sliding_cookie: {2, :hours}, secret: bad)) end)
++
++    report("sliding/token-no-window", fn ->
++      request() |> put_req_cookie("guardian_default_token", refresh) |> fetch_cookies() |> SlidingCookie.call(SlidingCookie.init(secret: bad))
++    end)
++
++    report("header/already-authenticated", fn ->
++      request()
++      |> Guardian.Plug.put_current_token(token)
++      |> put_req_header("authorization", "Bearer " <> token)
++      |> VerifyHeader.call(VerifyHeader.init(secret: bad))
++    end)
++
++    report("header/no-header-refresh-cookie-own-secret", fn ->
++      request()
++      |> put_req_cookie("guardian_default_token", refresh)
++      |> fetch_cookies()
++      |> VerifyHeader.call(VerifyHeader.init(secret: bad, refresh_from_cookie: []))
++    end)
++
++    report("header/with-token (control)", fn ->
++      request() |> put_req_header("authorization", "Bearer " <> token) |> VerifyHeader.call(VerifyHeader.init(secret: bad))
++    end)
++
++    report("sliding/token-and-window (control)", fn ->
++      request() |> put_req_cookie("guardian_default_token", refresh) |> fetch_cookies() |> SlidingCookie.call(SlidingCookie.init(sliding_cookie: {2, :hours}, secret: bad))
++    end)
++  end
++
++  test "custom secret fetcher with a nil secret" do
++    {:ok, fallback_token, _} = FetcherImpl.encode_and_sign(@resource, %{}, secret: @fallback)
++    {:ok, fallback_refresh, _} = FetcherImpl.encode_and_sign(@resource, %{}, token_type: "refresh", secret: @fallback)
++    receive_all("setup")
++
++    report("fetcher/header fn->nil", fn ->
++      request(FetcherImpl) |> put_req_header("authorization", "Bearer " <> fallback_token) |> VerifyHeader.call(VerifyHeader.init(secret: &__MODULE__.missing/1))
++    end)
++
++    report("fetcher/header static nil", fn ->
++      request(FetcherImpl) |> put_req_header("authorization", "Bearer " <> fallback_token) |> VerifyHeader.call(VerifyHeader.init(secret: nil))
++    end)
++
++    report("fetcher/cookie fn->nil", fn ->
++      request(FetcherImpl) |> put_req_cookie("guardian_default_token", fallback_refresh) |> fetch_cookies() |> VerifyCookie.call(secret: &__MODULE__.missing/1)
++    end)
++
++    report("fetcher/sign_in fn->nil", fn ->
++      request(FetcherImpl) |> init_test_session(%{}) |> FetcherImpl.Plug.sign_in(@resource, %{}, secret: &__MODULE__.missing/1)
++    end)
++
++    report("fetcher/remember_me fn->nil", fn ->
++      FetcherImpl.Plug.remember_me(request(FetcherImpl), @resource, %{}, secret: &__MODULE__.missing/1)
++    end)
++
++    IO.puts("PROBE fetcher/api decode secret: nil: #{inspect(FetcherImpl.decode_and_verify(fallback_token, %{}, secret: nil) |> elem(0))}")
++    receive_all("fetcher/api decode")
++    IO.puts("PROBE fetcher/api encode secret: nil: #{inspect(FetcherImpl.encode_and_sign(@resource, %{}, secret: nil) |> elem(0))}")
++    receive_all("fetcher/api encode")
++    IO.puts("PROBE fetcher/api decode_token secret: nil: #{inspect(Guardian.Token.Jwt.decode_token(FetcherImpl, fallback_token, secret: nil) |> elem(0))}")
++    receive_all("fetcher/api decode_token")
++  end
++end

@@ -1,0 +1,271 @@
+diff --git a/lib/livebook/runtime/evaluator.ex b/lib/livebook/runtime/evaluator.ex
+index 2343b84..31d04f9 100644
+--- a/lib/livebook/runtime/evaluator.ex
++++ b/lib/livebook/runtime/evaluator.ex
+@@ -40,8 +40,19 @@ defmodule Livebook.Runtime.Evaluator do
+ 
+   Each evaluation produces a  new context, which may be optionally
+   used by a later evaluation.
++
++  A failed evaluation produces an empty context, marked with the
++  `:errored` flag, which only carries over imports and the process
++  dictionary as they were before the evaluation. Such context never
++  leaves the evaluator, it is only used for merging.
+   """
+-  @type context :: %{binding: Code.binding(), env: Macro.Env.t(), id: binary()}
++  @type context :: %{
++          required(:binding) => Code.binding(),
++          required(:env) => Macro.Env.t(),
++          required(:pdict) => %{optional(term()) => term()},
++          required(:id) => binary(),
++          optional(:errored) => true
++        }
+ 
+   @typedoc """
+   A term used to identify evaluation.
+@@ -464,12 +475,15 @@ defmodule Livebook.Runtime.Evaluator do
+             delete_module(module)
+           end
+ 
++          # The failed evaluation must not leave any state behind, so
++          # we also undo all changes it made to the process dictionary
++          set_pdict(context, state.ignored_pdict_keys)
++
+           result = {:error, kind, error, stacktrace}
+           identifiers_used = :unknown
+           identifiers_defined = %{}
+           identifier_definitions = []
+-          # Empty context
+-          new_context = initial_context()
++          new_context = errored_context(context)
+           {new_context, result, identifiers_used, identifiers_defined, identifier_definitions}
+       end
+ 
+@@ -594,6 +608,35 @@ defmodule Livebook.Runtime.Evaluator do
+     |> Map.replace!(:context_modules, Map.keys(tracer_info.modules_defined))
+   end
+ 
++  # Builds the context for a failed evaluation, given the context the
++  # evaluation started with.
++  #
++  # The context is empty, that is, it has no binding, aliases, requires
++  # and defined modules. However, imports and the process dictionary
++  # are not diffed, each context holds the complete value, so we keep
++  # the values in effect before the failed evaluation. This way,
++  # subsequent evaluations still see imports and process dictionary
++  # from the successful evaluations prior to the failed one.
++  defp errored_context(context) do
++    env =
++      context.env
++      |> Map.replace!(:aliases, [])
++      |> Map.replace!(:requires, [])
++      |> Map.replace!(:context_modules, [])
++      |> Map.replace!(:versioned_vars, %{})
++
++    %{id: random_long_id(), binding: [], env: env, pdict: context.pdict, errored: true}
++  end
++
++  defp merge_context(prev_context, %{errored: true} = context) do
++    # A failed evaluation leaves no state behind, so we keep the
++    # previous context as is. The only exception are imports and the
++    # process dictionary, which the failed context stores as of before
++    # the evaluation (and which are not merged, but replaced)
++    env = %{prev_context.env | functions: context.env.functions, macros: context.env.macros}
++    %{id: random_long_id(), binding: prev_context.binding, env: env, pdict: context.pdict}
++  end
++
+   defp merge_context(prev_context, context) do
+     binding = merge_binding(prev_context.binding, context.binding)
+     env = merge_env(prev_context.env, context.env)
+diff --git a/test/livebook/runtime/evaluator_test.exs b/test/livebook/runtime/evaluator_test.exs
+index 6d2fe89..f0a6ce7 100644
+--- a/test/livebook/runtime/evaluator_test.exs
++++ b/test/livebook/runtime/evaluator_test.exs
+@@ -362,6 +362,46 @@ defmodule Livebook.Runtime.EvaluatorTest do
+                       metadata()}
+     end
+ 
++    test "in case of an error keeps imports and process dictionary from parent evaluations",
++         %{evaluator: evaluator} do
++      code1 = """
++      import ExUnit.Assertions
++      Process.put(:x, 1)
++      """
++
++      code2 = """
++      Process.put(:x, 2)
++      Process.put(:y, 2)
++      assert false
++      """
++
++      code3 = """
++      assert Process.get(:y) == nil
++      Process.get(:x)
++      """
++
++      Evaluator.evaluate_code(evaluator, :elixir, code1, :code_1, [])
++      assert_receive {:runtime_evaluation_response, :code_1, terminal_text(_), metadata()}
++
++      Evaluator.evaluate_code(evaluator, :elixir, code2, :code_2, [:code_1])
++
++      assert_receive {:runtime_evaluation_response, :code_2, error(message), %{errored: true}}
++
++      assert clean_message(message) =~ "ExUnit.AssertionError"
++
++      # Subsequent evaluation with the failed one in parents
++      Evaluator.evaluate_code(evaluator, :elixir, code3, :code_3, [:code_2, :code_1])
++
++      assert_receive {:runtime_evaluation_response, :code_3, terminal_text(ansi_number(1)),
++                      %{errored: false}}
++
++      # Subsequent evaluation with only the failed one as parent
++      Evaluator.evaluate_code(evaluator, :elixir, code3, :code_4, [:code_2])
++
++      assert_receive {:runtime_evaluation_response, :code_4, terminal_text(ansi_number(1)),
++                      %{errored: false}}
++    end
++
+     test "given file option sets it in evaluation environment", %{evaluator: evaluator} do
+       code = """
+       __DIR__
+@@ -1191,6 +1231,140 @@ defmodule Livebook.Runtime.EvaluatorTest do
+ 
+       assert context.pdict == %{x: 1, y: 2}
+     end
++
++    test "failed evaluation leaves no state behind", %{evaluator: evaluator} do
++      """
++      x = 1
++      y = 1
++
++      alias Enum, as: E
++
++      require Integer
++
++      import ExUnit.Assertions
++      import Integer, only: [is_odd: 1, to_string: 2]
++
++      Process.put(:x, 1)
++      Process.put(:y, 1)
++
++      defmodule Livebook.Runtime.EvaluatorTest.Identifiers.FailedEvaluationOne do
++      end
++      """
++      |> eval(evaluator, 0)
++
++      """
++      b = 2
++      y = 2
++
++      alias MapSet, as: S
++
++      require Logger
++
++      Process.put(:y, 2)
++      """
++      |> eval(evaluator, 1)
++
++      code = """
++      a = 3
++      x = 3
++      z = 3
++
++      alias Map, as: E
++      alias String, as: Str
++
++      require Bitwise
++
++      import Integer, except: [is_odd: 1]
++      import Bitwise
++
++      Process.put(:x, 3)
++      Process.delete(:y)
++      Process.put(:z, 3)
++
++      defmodule Livebook.Runtime.EvaluatorTest.Identifiers.FailedEvaluationTwo do
++      end
++
++      assert false
++      """
++
++      Evaluator.evaluate_code(evaluator, :elixir, code, 2, [1, 0])
++
++      assert_receive {:runtime_evaluation_response, 2, error(message),
++                      %{errored: true, identifiers_used: :unknown, identifiers_defined: %{}}}
++
++      assert clean_message(message) =~ "ExUnit.AssertionError"
++
++      refute Code.ensure_loaded?(Livebook.Runtime.EvaluatorTest.Identifiers.FailedEvaluationTwo)
++
++      expected_context = Evaluator.get_evaluation_context(evaluator, [1, 0])
++
++      assert Enum.sort(expected_context.binding) == [b: 2, x: 1, y: 2]
++      assert Enum.sort(expected_context.env.aliases) == [{E, Enum}, {S, MapSet}]
++      assert {Integer, [is_odd: 1]} in expected_context.env.macros
++      assert expected_context.pdict == %{x: 1, y: 2}
++
++      # Context of the failed evaluation
++
++      context = Evaluator.get_evaluation_context(evaluator, [2])
++
++      assert context.binding == []
++      assert context.env.aliases == []
++      assert context.env.versioned_vars == %{}
++      assert context.env.context_modules == []
++
++      assert Integer not in context.env.requires
++      assert Logger not in context.env.requires
++      assert Bitwise not in context.env.requires
++
++      # Imports and process dictionary are those before the failed evaluation
++      assert context.env.functions == expected_context.env.functions
++      assert context.env.macros == expected_context.env.macros
++      assert context.pdict == expected_context.pdict
++
++      # Merged context matches the context prior to the failed evaluation
++
++      context = Evaluator.get_evaluation_context(evaluator, [2, 1, 0])
++
++      assert context.binding == expected_context.binding
++      assert context.env.aliases == expected_context.env.aliases
++      assert context.env.requires == expected_context.env.requires
++      assert context.env.versioned_vars == expected_context.env.versioned_vars
++      assert context.env.context_modules == expected_context.env.context_modules
++      assert context.env.functions == expected_context.env.functions
++      assert context.env.macros == expected_context.env.macros
++      assert context.pdict == expected_context.pdict
++
++      # Subsequent evaluations see the context prior to the failed evaluation
++
++      """
++      assert {x, y, b} == {1, 2, 2}
++      assert is_odd(x)
++      assert to_string(5, 2) == "101"
++      assert E.sum([1, 2]) == 3
++      assert S.new([1]) == MapSet.new([1])
++      assert Integer.is_even(2)
++      assert Process.get(:x) == 1
++      assert Process.get(:y) == 2
++      assert Process.get(:z) == nil
++      assert Code.ensure_loaded?(Livebook.Runtime.EvaluatorTest.Identifiers.FailedEvaluationOne)
++      """
++      |> eval(evaluator, 3)
++
++      Evaluator.evaluate_code(
++        evaluator,
++        :elixir,
++        """
++        assert is_odd(1)
++        assert Process.get(:x) == 1
++        assert Process.get(:y) == 2
++        assert Process.get(:z) == nil
++        """,
++        4,
++        [2]
++      )
++
++      assert_receive {:runtime_evaluation_response, 4, terminal_text(_), %{errored: false}}
++    end
+   end
+ 
+   describe "forget_evaluation/2" do
