@@ -56,6 +56,28 @@ defmodule Eab.GraderTest do
            ) == []
   end
 
+  test "a test file that cannot compile on the starting source neither counts nor hides others" do
+    contract = %{"model_tests" => "behavioral"}
+    submission = Grader.parse(result([{"good", "passed"}, {"doc", "passed"}]))
+    stopped = Grader.parse(result([], code: 1, finish: false, extra: "** (CompileError)"))
+    body = "\nEAB_FAILURE_PHASE:#{Base.encode64("good")}:test"
+    alone = Grader.parse(result([{"good", "failed"}], code: 2, extra: body))
+
+    refute Grader.coverage(contract, stopped, %{}, submission)["passed"]
+    refute Grader.coverage(contract, stopped, %{"doc_test.exs" => stopped}, submission)["passed"]
+
+    coverage =
+      Grader.coverage(
+        contract,
+        stopped,
+        %{"doc_test.exs" => stopped, "good_test.exs" => alone},
+        submission
+      )
+
+    assert coverage["passed"]
+    assert coverage["detected_tests"] == ["good"]
+  end
+
   test "trusted formatter records survive progress dots written between them" do
     Code.require_file(Eab.Inventory.path("priv/fixtures/grade_formatter.exs"))
 

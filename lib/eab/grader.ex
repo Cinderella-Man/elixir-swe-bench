@@ -265,19 +265,19 @@ defmodule Eab.Grader do
             TestAdapter.install(box)
             probe = run_tests(box, TestAdapter.selected(contract["adapter"], changed))
 
-            detected =
-              Enum.filter(
-                behavioral_failures(probe),
-                &(result["submission"]["test_results"][&1] == "passed")
-              )
+            # One added file that cannot compile on the starting source stops the whole
+            # ExUnit run. Probing each file alone keeps it from hiding the others.
+            file_probes =
+              if contract["model_tests"] == "behavioral" and not probe["completed"] and
+                   length(changed) > 1,
+                 do:
+                   Map.new(
+                     changed,
+                     &{&1, run_tests(box, TestAdapter.selected(contract["adapter"], [&1]))}
+                   ),
+                 else: %{}
 
-            %{
-              "passed" => coverage_passed?(contract, probe, detected, result["submission"]),
-              "policy" => contract["model_tests"],
-              "detected_tests" => detected,
-              "test_probe" => probe,
-              "broken_test_probe" => if(contract["model_tests"] == "behavioral", do: probe)
-            }
+            coverage(contract, probe, file_probes, result["submission"])
           end)
         else
           %{"passed" => false, "reason" => "No passing added or changed regression test"}
@@ -291,6 +291,26 @@ defmodule Eab.Grader do
     end
   end
 
+  @doc false
+  def coverage(contract, probe, file_probes, submission) do
+    # A file that cannot compile there counts for nothing; only completed runs do.
+    detected =
+      [probe | Map.values(file_probes)]
+      |> Enum.filter(&(&1["completed"] and &1["returncode"] != 0))
+      |> Enum.flat_map(&behavioral_failures/1)
+      |> Enum.filter(&(submission["test_results"][&1] == "passed"))
+      |> Enum.uniq()
+
+    %{
+      "passed" => coverage_passed?(contract, probe, detected, submission),
+      "policy" => contract["model_tests"],
+      "detected_tests" => detected,
+      "test_probe" => probe,
+      "file_probes" => file_probes,
+      "broken_test_probe" => if(contract["model_tests"] == "behavioral", do: probe)
+    }
+  end
+
   defp coverage_passed?(%{"model_tests" => "preservation"}, probe, _detected, submission) do
     probe["passed"] and
       Enum.any?(probe["test_results"], fn {id, state} ->
@@ -298,8 +318,7 @@ defmodule Eab.Grader do
       end)
   end
 
-  defp coverage_passed?(_, probe, detected, _),
-    do: probe["completed"] and detected != [] and probe["returncode"] != 0
+  defp coverage_passed?(_, _probe, detected, _), do: detected != []
 
   defp restore_tests(box) do
     paths = TaskContract.read(box.spec)["protected_paths"] |> Enum.map_join(" ", &Command.quote/1)
