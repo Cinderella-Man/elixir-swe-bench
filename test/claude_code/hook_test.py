@@ -1,7 +1,10 @@
 # Tests for the solver kit's hook uploader. Run: python3 -I test/claude_code/hook_test.py
 import importlib.util
+import io
 import json
+import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import threading
@@ -36,9 +39,10 @@ def lines(*records):
 
 
 class Controller:
-    def __init__(self):
+    def __init__(self, *replies):
         self.bodies = []
         received = self.bodies
+        replies = list(replies)
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -46,10 +50,11 @@ class Controller:
 
             def do_POST(self):
                 received.append(json.loads(self.rfile.read(int(self.headers["content-length"]))))
+                reply = replies.pop(0) if replies else b"{}"
                 self.send_response(200)
-                self.send_header("content-length", "2")
+                self.send_header("content-length", str(len(reply)))
                 self.end_headers()
-                self.wfile.write(b"{}")
+                self.wfile.write(reply)
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -121,6 +126,131 @@ class UploaderTest(unittest.TestCase):
         self.assertFalse(hook.complete(lines(PROMPT, TOOL, RESULT)))
         self.assertFalse(hook.complete(lines(PROMPT, HANDBACK, DELIVERED)[:-5]))
         self.assertFalse(hook.complete(lines(PROMPT)))
+
+
+class RoutingTest(unittest.TestCase):
+    """Parallel solvers: each workspace tool call names the subagent that made it."""
+
+    def run_hook(self, event):
+        result = subprocess.run([sys.executable, "-I", str(HOOK)], input=json.dumps(event),
+                                capture_output=True, text=True, timeout=30,
+                                env=dict(os.environ, CLAUDE_PROJECT_DIR=str(HOOK.parents[2])))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)["hookSpecificOutput"]
+
+    def test_workspace_calls_carry_the_real_subagent_id(self):
+        output = self.run_hook({"hook_event_name": "PreToolUse", "tool_name": "mcp__eab_workspace__bash",
+                                "agent_id": "a1", "agent_type": "eab-opus-5-5-xhigh",
+                                "tool_input": {"command": "ls", "eab_agent_id": "forged"}})
+        self.assertEqual(output["permissionDecision"], "allow")
+        self.assertEqual(output["updatedInput"], {"command": "ls", "eab_agent_id": "a1"})
+
+    def test_workspace_calls_outside_a_solver_are_refused(self):
+        output = self.run_hook({"hook_event_name": "PreToolUse", "tool_name": "mcp__eab_workspace__read",
+                                "tool_input": {"path": "x"}})
+        self.assertEqual(output["permissionDecision"], "deny")
+        self.assertNotIn("updatedInput", output)
+
+    def test_launch_reports_reach_the_controller_with_the_kit(self):
+        controller = Controller()
+        hook.CONTROLLER = controller.url
+        event = {"hook_event_name": "PostToolUse", "tool_name": "Agent", "tool_use_id": "toolu_1",
+                 "tool_response": {"status": "async_launched", "agentId": "a1"}}
+        old = sys.stdin, sys.stdout, os.environ.get("CLAUDE_PROJECT_DIR")
+        sys.stdin, sys.stdout = io.StringIO(json.dumps(event)), io.StringIO()
+        os.environ["CLAUDE_PROJECT_DIR"] = str(HOOK.parents[2])
+        try:
+            hook.main()
+            printed = sys.stdout.getvalue()
+        finally:
+            sys.stdin, sys.stdout = old[0], old[1]
+            if old[2] is None:
+                os.environ.pop("CLAUDE_PROJECT_DIR")
+            else:
+                os.environ["CLAUDE_PROJECT_DIR"] = old[2]
+            controller.close()
+        self.assertEqual(printed, "")
+        [body] = controller.bodies
+        self.assertEqual(body["event"], event)
+        self.assertIn(".claude/eab/hook.py", body["kit"]["files"])
+
+    def test_a_stopped_solver_is_reported_before_its_transcript(self):
+        controller = Controller()
+        hook.CONTROLLER = controller.url
+        event = {"hook_event_name": "SubagentStop", "agent_id": "a1", "agent_type": "eab-opus-5-5-xhigh"}
+        old = sys.stdin, sys.stdout, os.environ.get("CLAUDE_PROJECT_DIR")
+        sys.stdin, sys.stdout = io.StringIO(json.dumps(event)), io.StringIO()
+        os.environ["CLAUDE_PROJECT_DIR"] = str(HOOK.parents[2])
+        try:
+            hook.main()
+            printed = sys.stdout.getvalue()
+        finally:
+            sys.stdin, sys.stdout = old[0], old[1]
+            if old[2] is None:
+                os.environ.pop("CLAUDE_PROJECT_DIR")
+            else:
+                os.environ["CLAUDE_PROJECT_DIR"] = old[2]
+            controller.close()
+        # Never exit 2 or print a decision here: that would keep the solver running.
+        self.assertEqual(printed, "")
+        [body] = controller.bodies
+        self.assertEqual(body["event"], event)
+        self.assertIs(body["stopping"], True)
+        self.assertNotIn("transcript", body)
+
+    def test_finished_solvers_come_from_claude_codes_subagent_records(self):
+        with tempfile.TemporaryDirectory() as root:
+            session = pathlib.Path(root) / "session.jsonl"
+            agents = pathlib.Path(root) / "session" / "subagents"
+            agents.mkdir(parents=True)
+            (agents / "agent-a1.meta.json").write_text(json.dumps(
+                {"agentType": "eab-opus-5-5-xhigh", "toolUseId": "toolu_1", "finished": True}))
+            (agents / "agent-a2.meta.json").write_text(json.dumps({"agentType": "eab-opus-5-5-xhigh"}))
+            (agents / "agent-a3.meta.json").write_text("{not json")
+            self.assertEqual(hook.finished_solvers({"transcript_path": str(session)}), [
+                {"agent_id": "a1", "agent_type": "eab-opus-5-5-xhigh",
+                 "agent_transcript_path": str(agents / "agent-a1.jsonl")}])
+            self.assertEqual(hook.finished_solvers({}), [])
+
+    def test_an_agent_call_first_recovers_finished_solvers_then_claims(self):
+        decision = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                           "permissionDecisionReason": "busy"}}
+        solver = {"agent_id": "a1", "agent_type": "eab-opus-5-5-xhigh",
+                  "agent_transcript_path": "/t/agent-a1.jsonl"}
+        controller = Controller(json.dumps({"eab_upload": [solver]}).encode(), json.dumps(decision).encode())
+        session = tempfile.TemporaryDirectory()
+        agents = pathlib.Path(session.name) / "s" / "subagents"
+        agents.mkdir(parents=True)
+        (agents / "agent-a1.meta.json").write_text(json.dumps({"agentType": "eab-opus-5-5-xhigh", "finished": True}))
+        hook.CONTROLLER = controller.url
+        uploads = []
+        original = hook.spawn_upload
+        hook.spawn_upload = uploads.append
+        event = {"hook_event_name": "PreToolUse", "tool_name": "Agent", "tool_use_id": "toolu_2",
+                 "transcript_path": str(pathlib.Path(session.name) / "s.jsonl"),
+                 "tool_input": {"subagent_type": "eab-opus-5-5-xhigh"}}
+        old = sys.stdin, sys.stdout, os.environ.get("CLAUDE_PROJECT_DIR")
+        sys.stdin, sys.stdout = io.StringIO(json.dumps(event)), io.StringIO()
+        os.environ["CLAUDE_PROJECT_DIR"] = str(HOOK.parents[2])
+        try:
+            hook.main()
+            printed = sys.stdout.getvalue()
+        finally:
+            hook.spawn_upload = original
+            sys.stdin, sys.stdout = old[0], old[1]
+            if old[2] is None:
+                os.environ.pop("CLAUDE_PROJECT_DIR")
+            else:
+                os.environ["CLAUDE_PROJECT_DIR"] = old[2]
+            controller.close()
+            session.cleanup()
+        # A quick recovery request, then the claim; Claude Code sees only the decision.
+        recover, claim = controller.bodies
+        self.assertEqual([s["agent_id"] for s in recover["recover"]], ["a1"])
+        self.assertNotIn("recover", claim)
+        self.assertEqual(json.loads(printed), decision)
+        [upload] = uploads
+        self.assertEqual(upload["event"], dict(solver, hook_event_name="SubagentStop", recovered=True))
 
 
 if __name__ == "__main__":

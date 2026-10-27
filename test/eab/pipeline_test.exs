@@ -181,6 +181,109 @@ defmodule Eab.PipelineTest do
     assert Enum.all?(results, &(&1["status"] == "completed"))
   end
 
+  test "parallel attempts start together, finish and grade out of order, and keep case order" do
+    start_pipeline(~w(a b c d), parallel: 2, lookahead: 2, preparation_workers: 2)
+
+    # Before the first attempt starts, only the first `parallel` cases prepare.
+    assert_receive {:prepare, "a", prep_a}, 3000
+    assert_receive {:prepare, "b", prep_b}, 3000
+    refute_receive {:prepare, "c", _}
+    send(prep_a, :continue)
+    send(prep_b, :continue)
+    release(:workspace, "a")
+    release(:workspace, "b")
+    assert_receive {:attempt, "a", pi_a}, 3000
+    assert_receive {:attempt, "b", pi_b}, 3000
+
+    # Up to two waiting workspaces, and no third attempt while two run.
+    release(:prepare, "c")
+    release(:prepare, "d")
+    release(:workspace, "c")
+    release(:workspace, "d")
+    refute_receive {:attempt, "c", _}
+
+    # b finishes first: its grading and c's attempt start while a still runs.
+    send(pi_b, :continue)
+    assert_receive {:closed, "b"}, 3000
+    assert_receive {:grade, "b", grade_b}, 3000
+    assert_receive {:attempt, "c", pi_c}, 3000
+    refute_receive {:attempt, "d", _}
+
+    # a finishes: a second grader runs beside b's, and d starts.
+    send(pi_a, :continue)
+    assert_receive {:closed, "a"}, 3000
+    assert_receive {:grade, "a", grade_a}, 3000
+    assert_receive {:attempt, "d", pi_d}, 3000
+
+    # Two graders are busy, so c's and d's submissions queue until one frees.
+    send(pi_c, :continue)
+    send(pi_d, :continue)
+    assert_receive {:closed, "c"}, 3000
+    assert_receive {:closed, "d"}, 3000
+    refute_receive {:grade, _, _}
+    send(grade_b, :continue)
+    assert_receive {:grade, "c", grade_c}, 3000
+    refute_receive {:grade, "d", _}
+    send(grade_a, :continue)
+    assert_receive {:grade, "d", grade_d}, 3000
+    send(grade_d, :continue)
+    send(grade_c, :continue)
+
+    assert_receive {:finished, results}, 3000
+    assert Enum.map(results, & &1["case"]) == ~w(a b c d)
+    assert Enum.all?(results, &(&1["status"] == "completed"))
+  end
+
+  test "a submission waiting for a free grader holds back the next parallel attempt" do
+    start_pipeline(~w(a b c d e), parallel: 2, lookahead: 3, preparation_workers: 2)
+    release(:prepare, "a")
+    release(:prepare, "b")
+    release(:workspace, "a")
+    release(:workspace, "b")
+    assert_receive {:attempt, "a", pi_a}, 3000
+    assert_receive {:attempt, "b", pi_b}, 3000
+    release(:prepare, "c")
+    release(:prepare, "d")
+    release(:prepare, "e")
+    release(:workspace, "c")
+    release(:workspace, "d")
+
+    send(pi_a, :continue)
+    assert_receive {:grade, "a", grade_a}, 3000
+    assert_receive {:attempt, "c", pi_c}, 3000
+    send(pi_b, :continue)
+    assert_receive {:grade, "b", grade_b}, 3000
+    assert_receive {:attempt, "d", pi_d}, 3000
+    release(:workspace, "e")
+
+    # c's submission waits behind two busy graders: e must not start, although only
+    # d is running.
+    send(pi_c, :continue)
+    assert_receive {:closed, "c"}, 3000
+    refute_receive {:attempt, "e", _}
+
+    send(grade_a, :continue)
+    assert_receive {:grade, "c", grade_c}, 3000
+    assert_receive {:attempt, "e", pi_e}, 3000
+
+    send(pi_d, :continue)
+    send(pi_e, :continue)
+    send(grade_b, :continue)
+    send(grade_c, :continue)
+    release(:grade, "d")
+    release(:grade, "e")
+    assert_receive {:finished, results}, 3000
+    assert Enum.map(results, & &1["case"]) == ~w(a b c d e)
+  end
+
+  test "parallel attempts outside 1 to 8 are refused" do
+    for parallel <- [0, 9, "2"] do
+      assert_raise ArgumentError, "Invalid parallel attempts", fn ->
+        Pipeline.init({self(), ~w(a), %{}, [parallel: parallel]})
+      end
+    end
+  end
+
   test "lookahead and preparation worker limits hold independently" do
     start_pipeline(~w(a b c d e f), lookahead: 3, preparation_workers: 2)
     release(:prepare, "a")

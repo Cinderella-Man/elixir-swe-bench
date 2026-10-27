@@ -272,4 +272,47 @@ defmodule Eab.CheckpointsTest do
     assert Checkpoints.completed(run, saved)["calls"] == 47
     assert Checkpoints.completed(run, failed)["grade"]["passed"] == false
   end
+
+  test "a run's parallel attempts reach the pipeline: two attempts run at once", %{run: run} do
+    run = %{run | "cases" => Enum.take(run["cases"], 3)} |> Map.put("parallel_attempts", 2)
+    parent = self()
+
+    runner =
+      Task.async(fn ->
+        Eab.Runner.execute(run, "", fn _ -> :ok end,
+          check_model: fn _, _ -> :ok end,
+          baseline: fn _, _, _, _ -> :ok end,
+          prepare: fn _, _, _, _ -> %{} end,
+          workspace: fn _, _, use -> use.(:synthetic_box) end,
+          submit: fn id, run_id, :synthetic_box, _, _, _, _ ->
+            send(parent, {:pi_started, id, self()})
+
+            receive do
+              :go -> Checkpoints.submit(run_id, id, %{"case" => id}, "diff", "")
+            end
+          end,
+          grade: fn id, run_id, {record, _}, _, _, _, _ ->
+            grade = Evidence.save(run_id, id, %{"passed" => true}, "")
+
+            Checkpoints.complete(
+              run_id,
+              id,
+              Map.merge(record, %{"status" => "completed", "grade" => grade}),
+              ""
+            )
+          end
+        )
+      end)
+
+    [a, b, c] = run["cases"]
+    assert_receive {:pi_started, ^a, pi_a}, 5000
+    assert_receive {:pi_started, ^b, pi_b}, 5000
+    refute_receive {:pi_started, ^c, _}, 300
+    send(pi_b, :go)
+    assert_receive {:pi_started, ^c, pi_c}, 5000
+    send(pi_a, :go)
+    send(pi_c, :go)
+    assert Task.await(runner, 10_000) == :ok
+    assert Enum.all?(run["cases"], &Checkpoints.completed(run, &1)["grade"]["passed"])
+  end
 end

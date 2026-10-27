@@ -40,7 +40,8 @@ defmodule Eab.ClaudeCode.Attempt do
         prompt: prompt,
         emit: emit,
         escape_test: opts[:escape_test] == true,
-        tools: 0
+        tools: 0,
+        agent_id: nil
       })
     after
       Broker.withdraw()
@@ -49,10 +50,22 @@ defmodule Eab.ClaudeCode.Attempt do
 
   defp loop(state) do
     receive do
-      :eab_claimed ->
-        Activity.note("Claude Code solver started")
-        state.emit.("Claude Code solver is working")
+      :eab_launching ->
+        Activity.note("Claude Code solver session launched a solver for this workspace")
         loop(state)
+
+      :eab_requeued ->
+        Activity.note(
+          "Claude Code did not report the launched solver; the workspace is offered again"
+        )
+
+        state.emit.("Waiting for the Claude Code solver (/solve-run)")
+        loop(state)
+
+      {:eab_claimed, agent_id} ->
+        Activity.note("Claude Code solver #{agent_id} started")
+        state.emit.("Claude Code solver is working")
+        loop(%{state | agent_id: agent_id})
 
       {:eab_tool, from, ref, name, arguments} ->
         state = %{state | tools: state.tools + 1}
@@ -65,7 +78,10 @@ defmodule Eab.ClaudeCode.Attempt do
   end
 
   def tool(state, name, arguments) do
-    Activity.note("Claude Code tool call #{state.tools}: #{name} " <> preview(arguments))
+    Activity.note(
+      "Claude Code tool call #{state.tools} from #{Map.get(state, :agent_id)}: #{name} " <>
+        preview(arguments)
+    )
 
     result =
       if name in ~w(read bash edit write) and is_map(arguments) do
@@ -151,6 +167,16 @@ defmodule Eab.ClaudeCode.Attempt do
 
     entries = Transcript.parse(transcript)
 
+    # The transcript and the stop event must belong to the solver bound to this workspace.
+    transcript_agent = Transcript.observed_agent_id(entries)
+
+    unless event["agent_id"] == state.agent_id and transcript_agent in [nil, state.agent_id],
+      do:
+        raise(
+          "Solver identity mismatch: workspace bound to #{inspect(state.agent_id)}, stop event from " <>
+            "#{inspect(event["agent_id"])}, transcript from #{inspect(transcript_agent)}"
+        )
+
     Store.write_text(
       "#{state.prefix}/claude-transcript.jsonl",
       Transcript.without_timing(entries),
@@ -222,7 +248,7 @@ defmodule Eab.ClaudeCode.Attempt do
           summary,
           ~w(claude_code_version entrypoint agent_id resolved_models resolved_efforts safety_stops compactions attachments over_declared_budget final_report)
         )
-        |> Map.put("agent_id", summary["agent_id"] || event["agent_id"])
+        |> Map.put("agent_id", state.agent_id)
         |> Map.put("tool_calls", state.tools)
     })
   end

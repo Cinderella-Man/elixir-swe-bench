@@ -277,60 +277,22 @@ defmodule EabWeb.DashboardTest do
     assert has_element?(view, "#run:not([disabled])")
   end
 
-  test "Claude connects with an API key and offers the selected model's effort levels" do
+  test "the per-token Claude API is not offered, and its address is not contacted" do
     parent = self()
-
-    Application.put_env(:eab, :http_request, fn opts ->
-      send(parent, {:request, opts})
-
-      effort =
-        Map.new(~w(low medium high xhigh max), &{&1, %{"supported" => true}})
-        |> Map.put("supported", true)
-
-      {:ok,
-       %{
-         status: 200,
-         body: %{
-           "data" => [
-             %{
-               "id" => "claude-haiku-5-5",
-               "display_name" => "Claude Haiku 5.5",
-               "max_input_tokens" => 1_000_000,
-               "max_tokens" => 128_000,
-               "capabilities" => %{
-                 "effort" => effort,
-                 "thinking" => %{"types" => %{"adaptive" => %{"supported" => true}}}
-               }
-             }
-           ]
-         }
-       }}
-    end)
-
+    Application.put_env(:eab, :http_request, fn opts -> send(parent, {:request, opts}) end)
     on_exit(fn -> Application.delete_env(:eab, :http_request) end)
     {:ok, view, _} = live(build_conn(), "/")
-    view |> form("#provider-choice", provider: "claude") |> render_change()
-    assert has_element?(view, "#provider-panel[aria-label='Claude settings'] #claude-key-form")
-    refute has_element?(view, "#connection")
-    view |> form("#claude-key-form", claude: %{key: "sk-ant-dashboard"}) |> render_submit()
-    assert render_async(view) =~ "Claude Haiku 5.5"
-    assert_receive {:request, opts}
-    assert opts[:url] == "https://api.anthropic.com/v1/models?limit=100"
-    assert {"x-api-key", "sk-ant-dashboard"} in opts[:headers]
-    assert has_element?(view, "#run[disabled]")
-    view |> form("#claude-model-form", model: "claude-haiku-5-5") |> render_change()
-    assert has_element?(view, "#claude-effort option[value=xhigh]", "Extra high (xhigh)")
-    assert has_element?(view, "#claude-effort option[value=high][selected]")
-    view |> form("#settings", settings: %{reasoning_effort: "xhigh"}) |> render_change()
-    assert has_element?(view, "#claude-effort option[value=xhigh][selected]")
-    assert render(view) =~ "CLAUDE API"
-    assert has_element?(view, "#run:not([disabled])")
+    refute has_element?(view, "#provider-choice input[value=claude]")
+    assert has_element?(view, "#provider-choice input[value=claude_code]")
 
-    # Switching away and back keeps each provider's settings separately.
-    view |> form("#provider-choice", provider: "local") |> render_change()
-    assert has_element?(view, "#connection")
-    view |> form("#provider-choice", provider: "claude") |> render_change()
-    assert render_async(view) =~ "Claude Haiku 5.5"
+    html =
+      view
+      |> form("#connection", connection: %{url: "https://api.anthropic.com", key: "sk-ant-x"})
+      |> render_change()
+
+    assert html =~ "Per-token Claude API runs are not offered"
+    refute_received {:request, _}
+    assert has_element?(view, "#run[disabled]")
   end
 
   test "Claude Code runs start on the website, can be validation runs and show the solver" do
@@ -374,8 +336,17 @@ defmodule EabWeb.DashboardTest do
     view |> form("#validation-form", validation: "true") |> render_change()
     assert has_element?(view, "#validation-run[checked]")
 
+    # Parallel attempts accepts 1 to 8 and ignores anything else.
+    assert has_element?(view, "#parallel-attempts[value='1']")
+    view |> form("#parallel-form", parallel: "9") |> render_change()
+    assert has_element?(view, "#parallel-attempts[value='1']")
+    view |> form("#parallel-form", parallel: "2") |> render_change()
+    assert has_element?(view, "#parallel-attempts[value='2']")
+
     view |> element("#run") |> render_click()
     assert_receive {:started, run}, 15_000
+    assert run["parallel_attempts"] == 2
+    assert has_element?(view, "#run-harness", "Parallel attempts: 2")
     assert run["validation"] == true and run["harness"]["name"] == "claude_code"
     assert run["model"]["model"] == "claude-opus-5-5"
     assert has_element?(view, "#run-harness", "Validation run, never published or scored")
@@ -388,6 +359,9 @@ defmodule EabWeb.DashboardTest do
       snapshot = Eab.Runs.snapshot()
       (is_nil(snapshot.active) and not snapshot.cleaning) || Process.sleep(10)
     end)
+
+    # The page learns of the finished cleanup by broadcast; wait for it, not only the server.
+    Enum.find(1..500, fn _ -> has_element?(view, "#run:not([disabled])") || Process.sleep(10) end)
 
     # An escape test runs the frozen probe in one case's workspace.
     id = hd(Eab.Inventory.all())

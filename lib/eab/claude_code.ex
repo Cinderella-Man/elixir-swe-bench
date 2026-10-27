@@ -111,6 +111,9 @@ defmodule Eab.ClaudeCode do
 
   def tools, do: Inventory.read_json(path("tools.json"))
 
+  @doc "The workspace tool argument through which the kit's hook names the calling subagent."
+  def agent_field, do: "eab_agent_id"
+
   def path(relative), do: Inventory.path("priv/claude_code/" <> relative)
 
   @doc "The solver kit exactly as the installer writes it for this controller's address."

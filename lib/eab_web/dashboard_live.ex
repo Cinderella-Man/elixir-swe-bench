@@ -55,6 +55,7 @@ defmodule EabWeb.DashboardLive do
           "claude_code" => %{}
         },
         validation: false,
+        parallel: 1,
         check_kind: "",
         check_case: "",
         solver: Broker.status(),
@@ -163,7 +164,11 @@ defmodule EabWeb.DashboardLive do
 
       Eab.Anthropic.endpoint?(url) ->
         {:noreply,
-         discover_claude(assign(switch_provider(socket, "claude"), claude_key: key, key: key))}
+         assign(socket,
+           detecting: false,
+           error:
+             "Per-token Claude API runs are not offered. Benchmark Claude through Claude Code with your subscription."
+         )}
 
       true ->
         {:noreply,
@@ -210,6 +215,16 @@ defmodule EabWeb.DashboardLive do
         do: ClaudeCode.endpoint(model)
 
     {:noreply, assign(socket, endpoint: endpoint)}
+  end
+
+  def handle_event("parallel", %{"parallel" => value}, socket) do
+    parallel =
+      case Integer.parse(to_string(value)) do
+        {n, ""} when n in 1..8 -> n
+        _ -> socket.assigns.parallel
+      end
+
+    {:noreply, assign(socket, parallel: parallel)}
   end
 
   def handle_event("validation", params, socket),
@@ -313,6 +328,7 @@ defmodule EabWeb.DashboardLive do
     claude_code = socket.assigns.provider == "claude_code"
 
     opts = [
+      parallel_attempts: socket.assigns.parallel,
       validation: socket.assigns.validation and claude_code,
       series: socket.assigns.contribution && socket.assigns.contribution["series_id"],
       check:
@@ -844,28 +860,6 @@ defmodule EabWeb.DashboardLive do
                   <span>ChatGPT</span>
                 </label>
                 <label
-                  class={["provider-option", @provider == "claude" && "is-selected"]}
-                  title="Claude: use an API key"
-                >
-                  <input
-                    type="radio"
-                    name="provider"
-                    value="claude"
-                    checked={@provider == "claude"}
-                  />
-                  <svg
-                    aria-hidden="true"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="1.6"
-                    stroke-linecap="round"
-                  >
-                    <path d="M12 2.5v19M2.5 12h19M5.3 5.3l13.4 13.4M18.7 5.3 5.3 18.7" />
-                  </svg>
-                  <span>Claude</span>
-                </label>
-                <label
                   class={["provider-option", @provider == "claude_code" && "is-selected"]}
                   title="Claude Code: use your Claude subscription through the solver kit"
                 >
@@ -1043,8 +1037,15 @@ defmodule EabWeb.DashboardLive do
                 <p :if={@solver.kit && @solver.kit["problems"] != []} class="notice error">
                   Solver kit differs: {Enum.join(@solver.kit["problems"], "; ")}. Reinstall it.
                 </p>
-                <p :if={@solver.waiting}>Workspace ready for the solver: {@solver.waiting}</p>
-                <p :if={@solver.active}>Solver working on: {@solver.active}</p>
+                <p :if={@solver.waiting != []}>
+                  Workspaces ready for solvers: {Enum.join(@solver.waiting, ", ")}
+                </p>
+                <p :if={@solver.launching != []}>
+                  Solvers starting: {Enum.join(@solver.launching, ", ")}
+                </p>
+                <p :for={solver <- @solver.active}>
+                  Solver <code>{solver.agent_id}</code> working on {solver.case}
+                </p>
                 <div :if={@solver.pause} class="notice error">
                   {@solver.pause}
                   <button class="secondary" phx-click="release_pause">Release usage-limit pause</button>
@@ -1254,6 +1255,21 @@ defmodule EabWeb.DashboardLive do
                 </div>
               </details>
             </form>
+            <form id="parallel-form" phx-change="parallel">
+              <label for="parallel-attempts">
+                Parallel attempts<input
+                  id="parallel-attempts"
+                  type="number"
+                  min="1"
+                  max="8"
+                  name="parallel"
+                  value={@parallel}
+                />
+              </label>
+              <p class="fine-print">
+                Cases worked on at once. Keep 1 for a model on a single local server; above 1, no elapsed times are recorded.
+              </p>
+            </form>
           </div>
           <button
             id="run"
@@ -1296,9 +1312,13 @@ defmodule EabWeb.DashboardLive do
             </div>
             <h3 class="run-model">{Eab.ModelIdentity.label(@run["model"])}</h3>
             <p id="run-harness" class="fine-print">
-              Harness: {Eab.Harness.label(@run)}<span :if={@run["validation"]}> · Validation run, never published or scored</span><span :if={
-                @run["series"]
-              }> · Contribution to series <code>{String.slice(@run["series"], 0, 12)}</code></span>
+              Harness: {Eab.Harness.label(@run)} · Parallel attempts: {@run["parallel_attempts"] || 1}<span :if={
+                @run["validation"]
+              }> · Validation run, never published or scored</span><span :if={@run["series"]}> · Contribution to series <code>{String.slice(
+                @run["series"],
+                0,
+                12
+              )}</code></span>
             </p>
             <p
               class="run-message"

@@ -7,7 +7,14 @@ defmodule Eab.ClaudeCodeTest do
   @url "http://127.0.0.1:4000"
 
   setup do
-    keys = [:data_dir, :claude_code_workspace, :claude_code_claim_wait_ms]
+    keys = [
+      :data_dir,
+      :claude_code_workspace,
+      :claude_code_claim_wait_ms,
+      :claude_code_launch_timeout_ms,
+      :claude_code_bind_wait_ms
+    ]
+
     old = Map.new(keys, &{&1, Application.get_env(:eab, &1)})
     dir = Path.join(System.tmp_dir!(), "eab-claude-code-#{System.unique_integer([:positive])}")
     Application.put_env(:eab, :data_dir, dir)
@@ -631,10 +638,11 @@ defmodule Eab.ClaudeCodeTest do
     |> post("/claude-code/mcp", Jason.encode!(body))
   end
 
-  defp agent_call(type),
+  defp agent_call(type, tool_use_id \\ "toolu_1"),
     do: %{
       "hook_event_name" => "PreToolUse",
       "tool_name" => "Agent",
+      "tool_use_id" => tool_use_id,
       "tool_input" => %{
         "subagent_type" => type,
         "description" => "x",
@@ -643,25 +651,65 @@ defmodule Eab.ClaudeCodeTest do
       }
     }
 
+  # Claude Code's PostToolUse report of a background launch names the new subagent.
+  defp launched(tool_use_id, agent_id),
+    do:
+      hook(%{
+        "hook_event_name" => "PostToolUse",
+        "tool_name" => "Agent",
+        "tool_use_id" => tool_use_id,
+        "tool_response" => %{
+          "isAsync" => true,
+          "status" => "async_launched",
+          "agentId" => agent_id
+        }
+      })
+
+  # A workspace tool call as the kit's hook forwards it, naming the calling subagent.
+  defp tool_call(agent_id, name, arguments, id \\ 3) do
+    arguments =
+      if agent_id, do: Map.put(arguments, ClaudeCode.agent_field(), agent_id), else: arguments
+
+    mcp(%{
+      "jsonrpc" => "2.0",
+      "id" => id,
+      "method" => "tools/call",
+      "params" => %{"name" => name, "arguments" => arguments}
+    })
+    |> json_response(200)
+    |> Map.fetch!("result")
+  end
+
+  defp stop_event(agent_id, final \\ "Done."),
+    do: %{
+      "hook_event_name" => "SubagentStop",
+      "agent_id" => agent_id,
+      "agent_type" => "eab-opus-5-5-xhigh",
+      "agent_transcript_path" => "/home/user/.claude/x.jsonl",
+      "last_assistant_message" => final
+    }
+
+  defp as_agent(entries, agent_id), do: Enum.map(entries, &Map.put(&1, "agentId", agent_id))
+
   defp await_waiting(id) do
     Enum.find_value(1..200, fn _ ->
-      if Broker.status().waiting == id, do: true, else: Process.sleep(10)
+      if id in Broker.status().waiting, do: true, else: Process.sleep(10)
     end) || flunk("attempt never registered")
   end
 
-  defp start_attempt(prompt, opts \\ []) do
+  defp start_attempt(prompt, opts \\ [], case_id \\ "case-x") do
     parent = self()
 
     Application.put_env(:eab, :claude_code_workspace, %{
       install: fn box -> send(parent, {:installed, box.name}) end,
-      execute: fn _box, name, arguments ->
-        send(parent, {:tool, name, arguments})
+      execute: fn box, name, arguments ->
+        send(parent, {:tool, box.name, name, arguments})
         %{"content" => [%{"type" => "text", "text" => "ran #{name}"}], "isError" => false}
       end,
       patch: fn _box -> "diff --git a/x b/x\n" end
     })
 
-    box = %{name: "eab-box", id: "case-x", run_id: "run-x", runtime: %{}}
+    box = %{name: "eab-box-#{case_id}", id: case_id, run_id: "run-x", runtime: %{}}
     File.mkdir_p!(Store.path("runs/run-x"))
 
     Task.async(fn ->
@@ -671,9 +719,9 @@ defmodule Eab.ClaudeCodeTest do
            box,
            endpoint(),
            "",
-           "runs/run-x/case-x",
+           "runs/run-x/#{case_id}",
            prompt,
-           &send(parent, {:progress, &1}),
+           &send(parent, {:progress, case_id, &1}),
            opts
          )}
       rescue
@@ -685,9 +733,9 @@ defmodule Eab.ClaudeCodeTest do
   test "one waiting attempt is claimed by the solver's Agent call and fed its tools and transcript" do
     prompt = "Frozen prompt\n"
     task = start_attempt(prompt)
-    assert_receive {:installed, "eab-box"}
+    assert_receive {:installed, "eab-box-case-x"}
     await_waiting("case-x")
-    assert_receive {:progress, "Waiting for the Claude Code solver" <> _}
+    assert_receive {:progress, "case-x", "Waiting for the Claude Code solver" <> _}
 
     denied = hook(agent_call("eab-haiku-5-5-max"))
     assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
@@ -698,18 +746,14 @@ defmodule Eab.ClaudeCodeTest do
 
     nested = hook(Map.put(agent_call("eab-opus-5-5-xhigh"), "agent_id", "a"))
     assert nested["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert Broker.status().waiting == "case-x"
 
-    # MCP calls before the claim reach no workspace.
-    early =
-      mcp(%{
-        "jsonrpc" => "2.0",
-        "id" => 1,
-        "method" => "tools/call",
-        "params" => %{"name" => "read", "arguments" => %{}}
-      })
+    anonymous = hook(Map.delete(agent_call("eab-opus-5-5-xhigh"), "tool_use_id"))
+    assert anonymous["hookSpecificOutput"]["permissionDecisionReason"] =~ "no tool_use_id"
+    assert Broker.status().waiting == ["case-x"]
 
-    assert json_response(early, 200)["result"]["isError"]
+    # Workspace calls before the claim, or without a solver identity, reach no workspace.
+    assert tool_call("agent-1", "read", %{"path" => "x"})["isError"]
+    assert tool_call(nil, "read", %{"path" => "x"})["isError"]
 
     allowed = hook(agent_call("eab-opus-5-5-xhigh"))["hookSpecificOutput"]
     assert allowed["permissionDecision"] == "allow"
@@ -717,12 +761,13 @@ defmodule Eab.ClaudeCodeTest do
     assert allowed["updatedInput"] == %{
              "subagent_type" => "eab-opus-5-5-xhigh",
              "description" => "Benchmark attempt",
-             "prompt" => prompt
+             "prompt" => prompt,
+             "run_in_background" => true
            }
 
-    assert Broker.status().active == "case-x"
-    busy = hook(agent_call("eab-opus-5-5-xhigh"))
-    assert busy["hookSpecificOutput"]["permissionDecisionReason"] =~ "already working"
+    assert Broker.status().launching == ["case-x"]
+    assert launched("toolu_1", "agent-1") == %{}
+    assert Broker.status().active == [%{case: "case-x", agent_id: "agent-1"}]
 
     init =
       mcp(%{
@@ -737,31 +782,15 @@ defmodule Eab.ClaudeCodeTest do
     list = json_response(mcp(%{"jsonrpc" => "2.0", "id" => 2, "method" => "tools/list"}), 200)
     assert Enum.map(list["result"]["tools"], & &1["name"]) == ~w(read bash edit write)
 
-    call =
-      mcp(%{
-        "jsonrpc" => "2.0",
-        "id" => 3,
-        "method" => "tools/call",
-        "params" => %{"name" => "bash", "arguments" => %{"command" => "ls"}}
-      })
-
-    assert json_response(call, 200)["result"] == %{
+    # The routing field never reaches the tool.
+    assert tool_call("agent-1", "bash", %{"command" => "ls"}) == %{
              "content" => [%{"type" => "text", "text" => "ran bash"}],
              "isError" => false
            }
 
-    assert_receive {:tool, "bash", %{"command" => "ls"}}
+    assert_receive {:tool, "eab-box-case-x", "bash", %{"command" => "ls"}}
     assert File.read!(Store.path("runs/run-x/case-x/model.patch")) =~ "diff --git"
-
-    unknown =
-      mcp(%{
-        "jsonrpc" => "2.0",
-        "id" => 4,
-        "method" => "tools/call",
-        "params" => %{"name" => "Bash"}
-      })
-
-    assert json_response(unknown, 200)["result"]["isError"]
+    assert tool_call("agent-1", "Bash", %{})["isError"]
 
     browser =
       build_conn()
@@ -774,31 +803,274 @@ defmodule Eab.ClaudeCodeTest do
 
     assert browser.status == 403
 
-    stop = %{
-      "hook_event_name" => "SubagentStop",
-      "agent_id" => "agent-1",
-      "agent_type" => "eab-opus-5-5-xhigh",
-      "agent_transcript_path" => "/home/user/.claude/x.jsonl",
-      "last_assistant_message" => "Done."
-    }
-
-    assert hook(stop, ClaudeCode.kit_files(@url), %{"transcript" => jsonl(transcript(prompt))}) ==
-             %{}
+    assert hook(stop_event("agent-1"), ClaudeCode.kit_files(@url), %{
+             "transcript" => jsonl(transcript(prompt))
+           }) == %{}
 
     assert {:ok, result} = Task.await(task)
     assert result["stop_reason"] == "agent_completed"
     assert result["generated_tokens"] == 60 and result["calls"] == 2
     assert result["claude_code"]["claude_code_version"] == "2.1.308"
     assert result["claude_code"]["tool_calls"] == 2
+    assert result["claude_code"]["agent_id"] == "agent-1"
     refute Map.has_key?(result, "measurement")
     stored = File.read!(Store.path("runs/run-x/case-x/claude-transcript.jsonl"))
     refute stored =~ "timestamp"
     assert File.read!(Store.path("runs/run-x/case-x/harness-prompt.md")) == prompt
     assert ClaudeCode.Attempt.recorded_version("run-x") == "2.1.308"
-    assert Broker.status() |> Map.take([:waiting, :active]) == %{waiting: nil, active: nil}
+
+    assert Broker.status() |> Map.take([:waiting, :launching, :active]) ==
+             %{waiting: [], launching: [], active: []}
 
     assert File.read!(Store.path("runs/run-x/case-x/claude-tool-calls.jsonl")) =~
              ~s("name":"bash")
+
+    log = File.read!(Store.path("runs/run-x/claude-code-hooks.jsonl"))
+
+    for step <- ~w(registered claimed bound finished),
+        do: assert(log =~ ~s("broker":"#{step}"))
+  end
+
+  test "parallel solvers each reach only their own workspace, whatever the order" do
+    task_x = start_attempt("Prompt X\n", [], "case-x")
+    task_y = start_attempt("Prompt Y\n", [], "case-y")
+    await_waiting("case-x")
+    await_waiting("case-y")
+
+    # Workspaces go to Agent calls in registration order.
+    first = hook(agent_call("eab-opus-5-5-xhigh", "toolu_1"))["hookSpecificOutput"]
+    second = hook(agent_call("eab-opus-5-5-xhigh", "toolu_2"))["hookSpecificOutput"]
+    assert first["updatedInput"]["prompt"] == "Prompt X\n"
+    assert second["updatedInput"]["prompt"] == "Prompt Y\n"
+    assert Broker.status().launching == ["case-x", "case-y"]
+
+    # Launch reports may arrive in either order. A tool call that races ahead of its
+    # subagent's report waits for it instead of failing.
+    assert launched("toolu_2", "agent-B") == %{}
+    early = Task.async(fn -> tool_call("agent-A", "read", %{"path" => "a.ex"}, 7) end)
+    Process.sleep(50)
+    refute_received {:tool, _, "read", _}
+    assert launched("toolu_1", "agent-A") == %{}
+    refute Task.await(early)["isError"]
+    assert_receive {:tool, "eab-box-case-x", "read", %{"path" => "a.ex"}}
+
+    assert Broker.status().active == [
+             %{case: "case-x", agent_id: "agent-A"},
+             %{case: "case-y", agent_id: "agent-B"}
+           ]
+
+    for {agent, box, command} <- [
+          {"agent-B", "eab-box-case-y", "y1"},
+          {"agent-A", "eab-box-case-x", "x1"},
+          {"agent-B", "eab-box-case-y", "y2"},
+          {"agent-A", "eab-box-case-x", "x2"}
+        ] do
+      refute tool_call(agent, "bash", %{"command" => command})["isError"]
+      assert_receive {:tool, ^box, "bash", %{"command" => ^command}}
+    end
+
+    # Calls run concurrently: each worker serves its own solver at the same time.
+    calls =
+      for {agent, n} <- [{"agent-A", 1}, {"agent-B", 2}, {"agent-A", 3}, {"agent-B", 4}],
+          do: Task.async(fn -> tool_call(agent, "bash", %{"command" => "c#{n}"}, 10 + n) end)
+
+    assert Enum.all?(Task.await_many(calls), &(&1["isError"] == false))
+
+    for {box, n} <- [
+          {"eab-box-case-x", 1},
+          {"eab-box-case-y", 2},
+          {"eab-box-case-x", 3},
+          {"eab-box-case-y", 4}
+        ] do
+      command = "c#{n}"
+      assert_receive {:tool, ^box, "bash", %{"command" => ^command}}
+    end
+
+    assert tool_call("agent-Z", "bash", %{"command" => "z"})["isError"]
+    refute_received {:tool, _, _, %{"command" => "z"}}
+
+    # One solver finishing leaves the other bound to its workspace.
+    hook(stop_event("agent-B"), ClaudeCode.kit_files(@url), %{
+      "transcript" => jsonl(as_agent(transcript("Prompt Y\n"), "agent-B"))
+    })
+
+    assert {:ok, y} = Task.await(task_y)
+    assert y["claude_code"]["agent_id"] == "agent-B"
+    assert Broker.status().active == [%{case: "case-x", agent_id: "agent-A"}]
+    assert tool_call("agent-B", "bash", %{"command" => "late"})["isError"]
+    refute tool_call("agent-A", "bash", %{"command" => "still"})["isError"]
+    assert_receive {:tool, "eab-box-case-x", "bash", %{"command" => "still"}}
+
+    # A transcript from another solver fails the attempt instead of being graded as it.
+    hook(stop_event("agent-A"), ClaudeCode.kit_files(@url), %{
+      "transcript" => jsonl(as_agent(transcript("Prompt X\n"), "agent-B"))
+    })
+
+    assert {:error, message} = Task.await(task_x)
+    assert message =~ "Solver identity mismatch"
+  end
+
+  test "busy solver slots send the session to wait; free slots wait for a workspace" do
+    kit = %{"files" => ClaudeCode.kit_files(@url)}
+    run = %{id: "run-x", parallel: 1}
+    event = fn id -> agent_call("eab-opus-5-5-xhigh", id) end
+
+    assert Broker.claim(event.("toolu_0"), kit, run, 0) == :waiting
+    assert Broker.claim(event.("toolu_0"), kit, nil, 0) == :waiting
+
+    task_x = start_attempt("Prompt X\n", [], "case-x")
+    await_waiting("case-x")
+    assert {:ok, %{case: "case-x"}} = Broker.claim(event.("toolu_1"), kit, run, 0)
+
+    # A launching solver already fills the only slot.
+    assert Broker.claim(event.("toolu_2"), kit, run, 0) == :busy
+    launched("toolu_1", "agent-A")
+    assert Broker.claim(event.("toolu_2"), kit, run, 0) == :busy
+
+    # With room for two, the call waits until the next workspace registers.
+    waiter =
+      Task.async(fn -> Broker.claim(event.("toolu_3"), kit, %{run | parallel: 2}, 5_000) end)
+
+    Process.sleep(50)
+    task_y = start_attempt("Prompt Y\n", [], "case-y")
+    assert {:ok, %{case: "case-y"}} = Task.await(waiter)
+    launched("toolu_3", "agent-B")
+    assert Broker.claim(event.("toolu_4"), kit, %{run | parallel: 2}, 0) == :busy
+
+    # A solver that stopped frees its slot at once, before its transcript arrives: a fast
+    # failure must not leave the session refused with no notification left to wait for.
+    assert hook(stop_event("agent-B"), ClaudeCode.kit_files(@url), %{"stopping" => true}) ==
+             %{}
+
+    assert Broker.claim(event.("toolu_5"), kit, %{run | parallel: 2}, 0) == :waiting
+    assert Broker.status().active |> Enum.map(& &1.case) == ["case-x", "case-y"]
+
+    for {agent, task, prompt} <- [
+          {"agent-A", task_x, "Prompt X\n"},
+          {"agent-B", task_y, "Prompt Y\n"}
+        ] do
+      hook(stop_event(agent), ClaudeCode.kit_files(@url), %{
+        "transcript" => jsonl(as_agent(transcript(prompt), agent))
+      })
+
+      assert {:ok, _} = Task.await(task)
+    end
+
+    log = File.read!(Store.path("runs/run-x/claude-code-hooks.jsonl"))
+    assert log =~ ~s("decision":"busy")
+    assert log =~ ~s("broker":"stopped")
+  end
+
+  test "a solver that ended without a stop event is recovered on the next Agent call" do
+    task = start_attempt("Prompt X\n")
+    await_waiting("case-x")
+    hook(agent_call("eab-opus-5-5-xhigh", "toolu_1"))
+    launched("toolu_1", "agent-A")
+    kit = %{"files" => ClaudeCode.kit_files(@url)}
+    run = %{id: "run-x", parallel: 1}
+    assert Broker.claim(agent_call("eab-opus-5-5-xhigh", "toolu_2"), kit, run, 0) == :busy
+
+    # An API error ended the solver: Claude Code marks it finished but sends no
+    # SubagentStop. The session's next Agent call reports it.
+    finished = [
+      %{
+        "agent_id" => "agent-A",
+        "agent_type" => "eab-opus-5-5-xhigh",
+        "agent_transcript_path" => "/home/user/.claude/s/subagents/agent-agent-A.jsonl"
+      },
+      %{"agent_id" => "agent-unknown", "agent_type" => "eab-opus-5-5-xhigh"}
+    ]
+
+    assert hook(agent_call("eab-opus-5-5-xhigh", "toolu_3"), ClaudeCode.kit_files(@url), %{
+             "recover" => finished
+           }) == %{"eab_upload" => [hd(finished)]}
+
+    assert Broker.claim(agent_call("eab-opus-5-5-xhigh", "toolu_4"), kit, run, 0) == :waiting
+
+    # Reported again, it is not recovered twice.
+    assert hook(agent_call("eab-opus-5-5-xhigh", "toolu_5"), ClaudeCode.kit_files(@url), %{
+             "recover" => finished
+           }) == %{"eab_upload" => []}
+
+    # The hook uploads its transcript like a stop. It holds no model response at all, and
+    # the attempt fails naming the API error rather than an unreadable model.
+    error =
+      entry("assistant", %{
+        "isApiErrorMessage" => true,
+        "error" => "invalid_request",
+        "message" => %{
+          "id" => "s",
+          "model" => "<synthetic>",
+          "content" => [
+            %{"type" => "text", "text" => "API Error: safeguards flagged this session"}
+          ]
+        }
+      })
+
+    recovered = %{
+      "hook_event_name" => "SubagentStop",
+      "agent_id" => "agent-A",
+      "agent_type" => "eab-opus-5-5-xhigh",
+      "recovered" => true
+    }
+
+    only_error = [hd(transcript("Prompt X\n")), error]
+
+    hook(recovered, ClaudeCode.kit_files(@url), %{
+      "transcript" => jsonl(as_agent(only_error, "agent-A"))
+    })
+
+    assert {:error, message} = Task.await(task)
+    assert message =~ "safeguards"
+    assert Broker.status().active == []
+    log = File.read!(Store.path("runs/run-x/claude-code-hooks.jsonl"))
+    assert log =~ "stop not reported; recovered from the session"
+  end
+
+  test "a launch Claude Code never reports is offered to the next Agent call" do
+    Application.put_env(:eab, :claude_code_launch_timeout_ms, 100)
+    Application.put_env(:eab, :claude_code_bind_wait_ms, 200)
+    task = start_attempt("Prompt X\n")
+    await_waiting("case-x")
+
+    assert hook(agent_call("eab-opus-5-5-xhigh", "toolu_1"))["hookSpecificOutput"][
+             "permissionDecision"
+           ] == "allow"
+
+    # An unbound solver's tool calls wait briefly, then fail without touching the workspace.
+    assert tool_call("agent-ghost", "bash", %{"command" => "ghost"})["isError"]
+    refute_received {:tool, _, _, %{"command" => "ghost"}}
+
+    await_waiting("case-x")
+    assert_receive {:progress, "case-x", "Waiting for the Claude Code solver (/solve-run)"}, 1000
+
+    # A failed launch report requeues at once.
+    assert hook(agent_call("eab-opus-5-5-xhigh", "toolu_2"))["hookSpecificOutput"][
+             "permissionDecision"
+           ] == "allow"
+
+    hook(%{
+      "hook_event_name" => "PostToolUse",
+      "tool_name" => "Agent",
+      "tool_use_id" => "toolu_2",
+      "tool_response" => %{"status" => "error"}
+    })
+
+    assert Broker.status().waiting == ["case-x"]
+
+    # The next launch binds normally; a late report for an abandoned call changes nothing.
+    hook(agent_call("eab-opus-5-5-xhigh", "toolu_3"))
+    launched("toolu_3", "agent-A")
+    assert launched("toolu_1", "agent-ghost") == %{}
+    assert Broker.status().active == [%{case: "case-x", agent_id: "agent-A"}]
+
+    hook(stop_event("agent-A"), ClaudeCode.kit_files(@url), %{
+      "transcript" => jsonl(as_agent(transcript("Prompt X\n"), "agent-A"))
+    })
+
+    assert {:ok, _} = Task.await(task)
+    log = File.read!(Store.path("runs/run-x/claude-code-hooks.jsonl"))
+    assert log =~ "launch timed out" and log =~ "launch not reported"
   end
 
   test "a usage-limit stop is an evaluation error and pauses further attempts" do
@@ -806,6 +1078,7 @@ defmodule Eab.ClaudeCodeTest do
     task = start_attempt(prompt)
     await_waiting("case-x")
     hook(agent_call("eab-opus-5-5-xhigh"))
+    launched("toolu_1", "agent-1")
 
     limit =
       entry("assistant", %{
@@ -818,12 +1091,7 @@ defmodule Eab.ClaudeCodeTest do
         }
       })
 
-    stop = %{
-      "hook_event_name" => "SubagentStop",
-      "agent_id" => "agent-1",
-      "agent_type" => "eab-opus-5-5-xhigh"
-    }
-
+    stop = Map.delete(stop_event("agent-1"), "last_assistant_message")
     hook(stop, ClaudeCode.kit_files(@url), %{"transcript" => jsonl(transcript(prompt, limit))})
     assert {:error, message} = Task.await(task)
     assert message =~ "usage limit"
@@ -832,21 +1100,54 @@ defmodule Eab.ClaudeCodeTest do
     # The next case waits; the solver is told to stop until the user releases the pause.
     task = start_attempt(prompt)
     await_waiting("case-x")
-    denied = hook(agent_call("eab-opus-5-5-xhigh"))["hookSpecificOutput"]
+    denied = hook(agent_call("eab-opus-5-5-xhigh", "toolu_2"))["hookSpecificOutput"]
 
     assert denied["permissionDecision"] == "deny" and
              denied["permissionDecisionReason"] =~ "Stop now"
 
     Broker.release_pause()
 
-    assert hook(agent_call("eab-opus-5-5-xhigh"))["hookSpecificOutput"]["permissionDecision"] ==
-             "allow"
+    assert hook(agent_call("eab-opus-5-5-xhigh", "toolu_3"))["hookSpecificOutput"][
+             "permissionDecision"
+           ] == "allow"
+
+    launched("toolu_3", "agent-1")
 
     # A different Claude Code version within one run is an evaluation error.
     other = Enum.map(transcript(prompt), &Map.put(&1, "version", "2.2.0"))
     hook(stop, ClaudeCode.kit_files(@url), %{"transcript" => jsonl(other)})
     assert {:error, changed} = Task.await(task)
     assert changed =~ "Claude Code changed from 2.1.308 to 2.2.0"
+  end
+
+  test "a usage limit on the solver's first request still pauses further attempts" do
+    task = start_attempt("Prompt X\n")
+    await_waiting("case-x")
+    hook(agent_call("eab-opus-5-5-xhigh"))
+    launched("toolu_1", "agent-1")
+
+    limit =
+      entry("assistant", %{
+        "isApiErrorMessage" => true,
+        "error" => "rate_limit",
+        "message" => %{
+          "id" => "s",
+          "model" => "<synthetic>",
+          "content" => [%{"type" => "text", "text" => "You've hit your limit"}]
+        }
+      })
+
+    hook(
+      Map.delete(stop_event("agent-1"), "last_assistant_message"),
+      ClaudeCode.kit_files(@url),
+      %{
+        "transcript" => jsonl([hd(transcript("Prompt X\n")), limit])
+      }
+    )
+
+    assert {:error, message} = Task.await(task)
+    assert message =~ "hit your limit"
+    assert Broker.status().pause =~ "usage limit"
   end
 
   test "an escape-test attempt returns the automatic verdict with its record" do
@@ -857,14 +1158,12 @@ defmodule Eab.ClaudeCodeTest do
     assert hook(agent_call("eab-opus-5-5-xhigh"))["hookSpecificOutput"]["updatedInput"]["prompt"] ==
              prompt
 
-    stop = %{
-      "hook_event_name" => "SubagentStop",
-      "agent_id" => "agent-1",
-      "agent_type" => "eab-opus-5-5-xhigh",
-      "last_assistant_message" => "Done."
-    }
+    launched("toolu_1", "agent-1")
 
-    hook(stop, ClaudeCode.kit_files(@url), %{"transcript" => jsonl(transcript(prompt))})
+    hook(stop_event("agent-1"), ClaudeCode.kit_files(@url), %{
+      "transcript" => jsonl(transcript(prompt))
+    })
+
     assert {:ok, result} = Task.await(task)
     assert result["escape_test"]["passed"]
     assert result["escape_test"]["tools_used"] == %{"x" => 1}
@@ -875,16 +1174,14 @@ defmodule Eab.ClaudeCodeTest do
     task = start_attempt(prompt)
     await_waiting("case-x")
     hook(agent_call("eab-opus-5-5-xhigh"))
-
-    stop = %{
-      "hook_event_name" => "SubagentStop",
-      "agent_id" => "agent-1",
-      "agent_type" => "eab-opus-5-5-xhigh",
-      "last_assistant_message" => "Final report."
-    }
+    launched("toolu_1", "agent-1")
 
     fallback = desktop(prompt, safety: true, model: "claude-opus-4-8")
-    hook(stop, ClaudeCode.kit_files(@url), %{"transcript" => jsonl(fallback)})
+
+    hook(stop_event("agent-1", "Final report."), ClaudeCode.kit_files(@url), %{
+      "transcript" => jsonl(fallback)
+    })
+
     assert {:error, message} = Task.await(task)
     assert message =~ "safety fallback switched the solver"
     progress = Store.read("runs/run-x/case-x/agent-progress.json")
@@ -902,5 +1199,6 @@ defmodule Eab.ClaudeCodeTest do
     assert denied["permissionDecision"] == "deny"
     assert denied["permissionDecisionReason"] =~ "No Claude Code run is active"
     assert hook(%{"hook_event_name" => "SubagentStop", "agent_type" => "x"}) == %{}
+    assert hook(%{"hook_event_name" => "PostToolUse", "tool_use_id" => "nothing"}) == %{}
   end
 end

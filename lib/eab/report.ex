@@ -52,6 +52,7 @@ defmodule Eab.Report do
     - Model weights: #{Eab.ModelIdentity.size_label(model)}
     - Backend: #{model["backend"] || "Unknown"}
     - Harness: #{Eab.Harness.label(run)}#{if run["validation"], do: "\n- Purpose: case validation run; never published or scored", else: ""}
+    - Parallel attempts: #{parallel(run)}
     - Thinking: #{escape(Eab.Thinking.label(run["settings"]))}
     - Thinking source: #{get_in(run, ["settings", "reasoning_effort_source"]) || if(model["backend"] in ["openai_subscription", "anthropic"], do: "provider request", else: "not recorded")}
     - Release: #{run["release_id"] || "Historical protocol only"}
@@ -74,7 +75,7 @@ defmodule Eab.Report do
     #{Jason.encode!(run["settings"] || %{}, pretty: true)}
     ```
 
-    Case time covers Pi startup, model calls and tools through completion, excluding fixture preparation and independent grading. Claude Code attempts store no timing. Missing timings are not reconstructed from logs.
+    Case time covers Pi startup, model calls and tools through completion, excluding fixture preparation and independent grading. Claude Code attempts and runs with more than one parallel attempt store no timing. Missing timings are not reconstructed from logs.
 
     | Case | Result | Model calls | Case time | Explanation |
     | --- | --- | ---: | ---: | --- |
@@ -103,6 +104,14 @@ defmodule Eab.Report do
     do: "Unscored escape test in the workspace of " <> id
 
   defp scope(_), do: "Full inventory"
+
+  # Runs before ADR 0014 recorded no value and ran one attempt at a time.
+  defp parallel(run) do
+    case run["parallel_attempts"] || 1 do
+      1 -> "1"
+      n -> "#{n} (no elapsed times recorded)"
+    end
+  end
 
   defp memory(%{"memory" => memory}) when is_map(memory) do
     "Sampled model-service memory peaks: #{escape(Eab.MemoryMonitor.label(memory))}. " <>

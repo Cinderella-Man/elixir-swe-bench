@@ -35,4 +35,35 @@ defmodule Eab.ReportTest do
     assert report =~ "| failed | Failed | 0 | 2.5 s |"
     assert report =~ "| legacy | Failed | 0 | Not measured |"
   end
+
+  test "a run's parallel attempts are reported, and parallel runs record no times" do
+    id = "report-parallel-#{System.unique_integer([:positive])}"
+    on_exit(fn -> File.rm_rf!(Store.path("runs/#{id}")) end)
+
+    run = %{
+      "id" => id,
+      "status" => "completed",
+      "parallel_attempts" => 3,
+      "model" => %{"model" => "fixture", "backend" => "strata"},
+      "settings" => %{},
+      "cases" => ~w(a),
+      "attempts" => %{
+        "a" => %{
+          "status" => "completed",
+          "grade" => %{"passed" => true},
+          "measurement" => Eab.Measurement.finish(Eab.Measurement.start(false))
+        }
+      }
+    }
+
+    Report.write(run)
+    report = File.read!(Store.path("runs/#{id}/report.md"))
+    assert report =~ "- Parallel attempts: 3 (no elapsed times recorded)"
+
+    assert report =~
+             "| a | Passed | 0 | Not measured: the run worked on several attempts at once |"
+
+    Report.write(Map.delete(run, "parallel_attempts"))
+    assert File.read!(Store.path("runs/#{id}/report.md")) =~ "- Parallel attempts: 1\n"
+  end
 end

@@ -37,12 +37,12 @@ Cold baseline preparation follows ascending PR number within each repository/run
 
 | Branch | Decision |
 | --- | --- |
-| Agent concurrency | Exactly one active Pi attempt |
+| Agent concurrency | The run's parallel attempts, 1 by default ([ADR 0014](adr/0014-run-a-runs-attempts-in-parallel.md)) |
 | Model location | Assume a remote model for resource planning; local endpoints remain supported |
 | Readiness | Prepared image plus valid qualification, with only the next workspace kept live |
 | First case | Prepare it exclusively until its attempt starts |
 | Ordering | Inventory order; wait for the next case when necessary |
-| Capacity | Four upcoming cases, two preparation jobs, one waiting workspace, one grader and one queued submission; preparation bounds are configurable |
+| Capacity | At least four upcoming cases and two preparation jobs; one waiting workspace and one grader per parallel attempt; preparation bounds are configurable |
 | Failure | Retry safe transient connection failures within a request up to five times; record terminal case errors and continue unrelated cases; no automatic case retry or final score for an incomplete/error run |
 | Cancellation | Stop all workers and drain subprocesses before removing installation-owned containers |
 | Restart | Preserve evidence, mark unfinished work interrupted and clean up; explicitly resume under unchanged release/model/settings |
@@ -70,7 +70,7 @@ The intended use is evaluating 10–30 models against the same PR cases on one D
 | Model sequence | Complete the frozen active inventory for one model, then run the same inventory for the next model; every case's baseline persists across those runs |
 | Starting-state contract | Application repairs start after the original broken revision's installation and migrations; future installation/migration cases explicitly request fresh setup |
 | Database seeding across PRs | Prepare an oldest compatible pristine database base, clone it for later cases, apply only their missing migrations, then retain each case's completed baseline for all model runs |
-| Existing scheduling | Keep one active Pi, the bounded preparation window, one waiting workspace and independent grading |
+| Existing scheduling | Keep the run's parallel attempts, the bounded preparation window, waiting workspaces and independent grading |
 | Measurement | Source inspection and correctness evidence only on this machine; no timing promises or performance qualification |
 
 ### Established facts

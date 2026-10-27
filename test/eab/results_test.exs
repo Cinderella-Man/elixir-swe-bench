@@ -114,6 +114,28 @@ defmodule Eab.ResultsTest do
     refute Jason.encode!(Results.export!(source)) =~ "attempt_ms"
   end
 
+  test "each published run states its parallel attempts; older records without it still validate" do
+    assert entry(Results.export!(run()))["deployment"]["parallel_attempts"] == 1
+    record = Results.export!(Map.put(run(), "parallel_attempts", 4))
+    assert entry(record)["deployment"]["parallel_attempts"] == 4
+
+    older =
+      update_in(record, ["runs"], fn [run] ->
+        [update_in(run["deployment"], &Map.delete(&1, "parallel_attempts"))]
+      end)
+
+    assert Results.validate!(older)
+
+    for bad <- [0, 9, "4"] do
+      invalid =
+        update_in(record, ["runs"], fn [run] ->
+          [put_in(run, ["deployment", "parallel_attempts"], bad)]
+        end)
+
+      assert_raise ArgumentError, fn -> Results.validate!(invalid) end
+    end
+  end
+
   test "thinking presets survive public export without backfilling old runs" do
     assert Results.export!(run())["settings"]["reasoning_effort"] == nil
 

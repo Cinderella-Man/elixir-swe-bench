@@ -1,7 +1,9 @@
-# Elixir Agent Benchmark solver hook. Forwards Claude Code's PreToolUse(Agent) and
-# SubagentStop events to the benchmark controller and prints its reply as hook output.
-# It also reports the installed kit's file hashes, so the controller can refuse a
-# drifted kit, and uploads the finished solver's transcript. Standard library only.
+# Elixir Agent Benchmark solver hook. Forwards Claude Code's PreToolUse(Agent),
+# PostToolUse(Agent) and SubagentStop events to the benchmark controller and prints its
+# reply as hook output. It also reports the installed kit's file hashes, so the
+# controller can refuse a drifted kit, and uploads the finished solver's transcript.
+# Workspace tool calls get the calling subagent's agent_id added locally, so the
+# controller routes each one to that solver's workspace. Standard library only.
 import hashlib
 import json
 import os
@@ -14,6 +16,8 @@ import urllib.error
 import urllib.request
 
 CONTROLLER = "__EAB_CONTROLLER_URL__"
+WORKSPACE_TOOLS = "mcp__eab_workspace__"
+AGENT_FIELD = "eab_agent_id"
 INSTRUCTIONS = ("CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", ".claude/CLAUDE.md")
 # Claude Code writes the solver's last records after SubagentStop hooks start, sometimes
 # even after .meta.json says finished. The uploader waits until the transcript ends its
@@ -134,37 +138,113 @@ def upload(body):
         handle.write("Transcript upload failed for %s: %s\n" % (path, failure[:500]))
 
 
+def decision(kind, reason=None, updated=None):
+    output = {"hookEventName": "PreToolUse", "permissionDecision": kind}
+    if reason:
+        output["permissionDecisionReason"] = reason
+    if updated is not None:
+        output["updatedInput"] = updated
+    return json.dumps({"hookSpecificOutput": output})
+
+
+def workspace_tool(event):
+    """Name the calling solver on a workspace tool call; refuse calls from outside one."""
+    agent = event.get("agent_id")
+    if not isinstance(agent, str) or not agent:
+        print(decision("deny", "Workspace tools work only inside a solver started by /solve-run."))
+        return
+    updated = dict(event.get("tool_input") or {})
+    updated[AGENT_FIELD] = agent
+    print(decision("allow", updated=updated))
+
+
+def report(body):
+    """PostToolUse(Agent): tell the controller which subagent the launch started."""
+    try:
+        post(body, 60)
+    except (urllib.error.URLError, OSError) as error:
+        log = pathlib.Path(tempfile.gettempdir()) / "eab-solver-hook.log"
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write("Launch report failed for %s: %s\n" % (
+                body["event"].get("tool_use_id"), detail(error)[:500]))
+
+
+def spawn_upload(body):
+    """Detached: the uploader outlives this hook and sends the settled transcript."""
+    child = subprocess.Popen(
+        [sys.executable, "-I", os.path.abspath(__file__), "--upload"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    child.stdin.write(json.dumps(body).encode("utf-8"))
+    child.stdin.close()
+
+
+def finished_solvers(event):
+    """Solvers of this session that Claude Code marks finished. A solver ended by an API
+    error gets no SubagentStop, so every Agent call reports these and the controller
+    recovers any it still counts as working."""
+    transcript = event.get("transcript_path")
+    if not transcript:
+        return []
+    folder = pathlib.Path(transcript).with_suffix("") / "subagents"
+    found = []
+    for meta in sorted(folder.glob("agent-*.meta.json")):
+        try:
+            record = json.loads(meta.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if record.get("finished") is True:
+            agent = meta.name[len("agent-"):-len(".meta.json")]
+            found.append({"agent_id": agent, "agent_type": record.get("agentType"),
+                          "agent_transcript_path": str(meta.with_name("agent-%s.jsonl" % agent))})
+    return found
+
+
 def main():
     if sys.argv[1:] == ["--upload"]:
         upload(json.load(sys.stdin))
         return
     event = json.load(sys.stdin)
     name = event.get("hook_event_name")
+    if name == "PreToolUse" and str(event.get("tool_name", "")).startswith(WORKSPACE_TOOLS):
+        workspace_tool(event)
+        return
     root = pathlib.Path(os.environ.get("CLAUDE_PROJECT_DIR") or pathlib.Path(__file__).resolve().parents[2])
     body = {"event": event, "kit": kit(root)}
     if name == "SubagentStop":
+        # Tell the controller at once that this solver stopped, so its slot is free for
+        # the next launch even while the transcript is still settling.
+        try:
+            post(dict(body, stopping=True), 10)
+        except (urllib.error.URLError, OSError):
+            pass
         if event.get("agent_transcript_path"):
             # Return at once; a detached uploader sends the transcript when it is complete.
-            child = subprocess.Popen(
-                [sys.executable, "-I", os.path.abspath(__file__), "--upload"],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            child.stdin.write(json.dumps(body).encode("utf-8"))
-            child.stdin.close()
+            spawn_upload(body)
         # Never exit 2 here: that would keep the solver running.
         return
+    if name == "PostToolUse":
+        report(body)
+        return
+    finished = finished_solvers(event)
+    if finished:
+        # Quick and separate from the claim below, which may wait minutes for a workspace:
+        # solvers the controller recovers get their transcripts uploaded like a stop.
+        try:
+            reply = json.loads(post(dict(body, recover=finished), 30))
+            for solver in reply.get("eab_upload", []):
+                spawn_upload({"event": dict(solver, hook_event_name="SubagentStop", recovered=True),
+                              "kit": body["kit"]})
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
     try:
         sys.stdout.write(post(body, 590))
     except (urllib.error.URLError, OSError) as error:
         # Fail closed: without the controller no attempt may start.
         reason = "The benchmark controller did not accept this call: " + detail(error)[:500] + \
             " Tell the user and stop."
-        print(json.dumps({"hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        }}))
+        print(decision("deny", reason))
 
 
 if __name__ == "__main__":

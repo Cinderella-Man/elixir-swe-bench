@@ -37,6 +37,8 @@ _Avoid_: repeats, trial set, epochs
 
 **Attempt**: One agent's investigation, edits, tool calls and submission for a case. A run records one scored attempt per case and retains interrupted work separately.
 
+**Parallel attempts**: The most attempts one run works on at the same time. It is a run setting, 1 by default; runs of one run series may use different values. Elapsed attempt time is recorded only when it is 1.
+
 **Workspace**: A fresh offline Docker environment containing a case's starting project source and prepared dependencies. It excludes reference solutions, grader-only checks, upstream Git history and controller credentials.
 
 **Prepared case**: A case whose starting environment is available and whose fixture qualification is valid for that environment.
@@ -47,7 +49,7 @@ _Avoid_: repeats, trial set, epochs
 
 **Database seed**: Pristine initialized database state whose compatible migration history can be reused when preparing another case. It contains no changes made by an attempt or grading check.
 
-**Waiting workspace**: A pristine workspace held ready for the next ordered attempt, before the agent's investigation begins.
+**Waiting workspace**: A pristine workspace held ready for a coming attempt, before the agent's investigation begins. Attempts start in case order and may finish in any order.
 
 **Submission**: The saved patch produced by an attempt and handed to the grader.
 

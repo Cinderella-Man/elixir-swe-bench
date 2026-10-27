@@ -109,7 +109,7 @@ defmodule Eab.Pi do
     caps["supports_thinking"] == true or caps["supports_preserve_reasoning"] == true
   end
 
-  def run(box, endpoint, key, settings, prefix, prompt, instructions, emit) do
+  def run(box, endpoint, key, settings, prefix, prompt, instructions, emit, opts \\ []) do
     Eab.Activity.note(
       "Starting Pi #{identity()["version"]} in #{box.name}, working directory /workspace"
     )
@@ -121,7 +121,7 @@ defmodule Eab.Pi do
     Sandbox.copy_file(box, file, "/opt/eab-attempt/pi.json")
 
     state = %{
-      state(endpoint, key, settings, prefix, emit)
+      state(endpoint, key, settings, prefix, emit, Keyword.get(opts, :measure, true))
       | snapshot: fn -> Store.write_text("#{prefix}/model.patch", Sandbox.patch(box), key) end
     }
 
@@ -146,7 +146,7 @@ defmodule Eab.Pi do
     finish(result)
   end
 
-  def state(endpoint, key, settings, prefix, emit) do
+  def state(endpoint, key, settings, prefix, emit, measure? \\ true) do
     %{
       endpoint: endpoint,
       key: key,
@@ -155,7 +155,7 @@ defmodule Eab.Pi do
       emit: emit,
       calls: 0,
       generated_tokens: 0,
-      measurement: Eab.Measurement.start(),
+      measurement: Eab.Measurement.start(measure?),
       stop_reason: nil,
       error: nil,
       settled: false,

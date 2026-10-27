@@ -1,5 +1,8 @@
 defmodule Eab.Pipeline do
-  @moduledoc "Ordered Pi attempts with bounded preparation, workspace prewarming and grading."
+  @moduledoc """
+  Attempts in case order, up to `parallel` at once (ADR 0014), with bounded preparation,
+  workspace prewarming and grading. With one parallel attempt only one agent works at a time.
+  """
   use GenServer
   alias Eab.Command
 
@@ -38,6 +41,7 @@ defmodule Eab.Pipeline do
     monitor = Process.monitor(owner)
     lookahead = Keyword.get(opts, :lookahead, 4)
     workers = Keyword.get(opts, :preparation_workers, 2)
+    parallel = Keyword.get(opts, :parallel, 1)
     ancestry = Keyword.get(opts, :preparation_plan, %{})
 
     unless Enum.all?(ancestry, fn {id, earlier} ->
@@ -53,6 +57,9 @@ defmodule Eab.Pipeline do
              workers in 1..4,
            do: raise(ArgumentError, "Invalid preparation limits")
 
+    unless is_integer(parallel) and parallel in 1..8,
+      do: raise(ArgumentError, "Invalid parallel attempts")
+
     {:ok,
      %{
        owner: monitor,
@@ -62,14 +69,15 @@ defmodule Eab.Pipeline do
        callbacks: callbacks,
        lookahead: lookahead,
        workers: workers,
+       parallel: parallel,
        ancestry: ancestry,
        baselines: MapSet.new(),
        first_started: false,
        prepared: %{},
        tasks: %{},
-       warm: nil,
-       active: nil,
-       grading: nil,
+       warm: [],
+       active: [],
+       grading: [],
        submissions: [],
        results: %{},
        from: nil
@@ -81,10 +89,13 @@ defmodule Eab.Pipeline do
 
   @impl true
   def handle_info({:workspace_ready, pid}, state) do
-    case state.warm do
-      %{pid: ^pid} = warm -> advance(%{state | warm: %{warm | ready: true}})
-      _ -> {:noreply, state}
-    end
+    if Enum.any?(state.warm, &(&1.pid == pid)),
+      do:
+        advance(%{
+          state
+          | warm: Enum.map(state.warm, &if(&1.pid == pid, do: %{&1 | ready: true}, else: &1))
+        }),
+      else: {:noreply, state}
   end
 
   def handle_info({ref, result}, state) when is_reference(ref) do
@@ -155,7 +166,14 @@ defmodule Eab.Pipeline do
     preparing =
       for {_, %{kind: kind, id: id}} <- state.tasks, kind in [:baseline, :prepare], do: id
 
-    window = Enum.take(state.pending, if(state.first_started, do: state.lookahead, else: 1))
+    window =
+      Enum.take(
+        state.pending,
+        if(state.first_started,
+          do: max(state.lookahead, state.parallel),
+          else: state.parallel
+        )
+      )
 
     window
     |> Enum.reject(&(&1 in preparing or Map.has_key?(state.prepared, &1)))
@@ -179,49 +197,77 @@ defmodule Eab.Pipeline do
     end)
   end
 
-  defp start_workspace(%{warm: nil, pending: [id | _]} = state) do
-    if Map.has_key?(state.prepared, id) do
-      parent = self()
-      control = Map.fetch!(state.prepared, id)
-      workspace = state.callbacks.workspace
-      attempt = state.callbacks.attempt
+  # Waiting workspaces cover the next pending cases in order, up to `parallel` of them.
+  # A prepared later case never warms ahead of an unprepared earlier one.
+  defp start_workspace(state) do
+    warm = MapSet.new(state.warm, & &1.id)
 
-      state =
-        launch(state, :attempt, id, fn ->
-          workspace.(id, fn box ->
-            send(parent, {:workspace_ready, self()})
+    state.pending
+    |> Enum.take(state.parallel)
+    |> Enum.reduce_while(state, fn id, state ->
+      cond do
+        MapSet.member?(warm, id) -> {:cont, state}
+        Map.has_key?(state.prepared, id) -> {:cont, warm_workspace(state, id)}
+        true -> {:halt, state}
+      end
+    end)
+  end
 
-            receive do
-              :attempt -> attempt.(id, box, control)
-            end
-          end)
+  defp warm_workspace(state, id) do
+    parent = self()
+    control = Map.fetch!(state.prepared, id)
+    workspace = state.callbacks.workspace
+    attempt = state.callbacks.attempt
+
+    state =
+      launch(state, :attempt, id, fn ->
+        workspace.(id, fn box ->
+          send(parent, {:workspace_ready, self()})
+
+          receive do
+            :attempt -> attempt.(id, box, control)
+          end
         end)
+      end)
 
-      {_, %{task: task}} =
-        Enum.find(state.tasks, fn {_, job} -> job.kind == :attempt and job.id == id end)
+    {_, %{task: task}} =
+      Enum.find(state.tasks, fn {_, job} -> job.kind == :attempt and job.id == id end)
 
-      %{state | warm: %{id: id, pid: task.pid, ready: false}}
+    %{state | warm: state.warm ++ [%{id: id, pid: task.pid, ready: false}]}
+  end
+
+  # Attempts start in case order while fewer than `parallel` run. A submission waiting
+  # for a free grader holds the next workspace back instead of accumulating work.
+  defp start_attempt(
+         %{submissions: [], pending: [id | rest], warm: [%{id: id, ready: true} = warm | warming]} =
+           state
+       ) do
+    if length(state.active) < state.parallel do
+      send(warm.pid, :attempt)
+
+      start_attempt(%{
+        state
+        | active: state.active ++ [warm],
+          warm: warming,
+          pending: rest,
+          first_started: true
+      })
     else
       state
     end
   end
 
-  defp start_workspace(state), do: state
-
-  # At most one submission may queue behind the grader. Once that slot is
-  # occupied, keep the next workspace waiting instead of accumulating work.
-  defp start_attempt(%{active: nil, submissions: [], warm: %{ready: true} = warm} = state) do
-    send(warm.pid, :attempt)
-    %{state | active: warm, warm: nil, pending: tl(state.pending), first_started: true}
-  end
-
   defp start_attempt(state), do: state
 
-  defp start_grade(%{grading: nil, submissions: [{id, submission} | rest]} = state) do
-    control = Map.fetch!(state.prepared, id)
-    grade = state.callbacks.grade
-    state = launch(state, :grade, id, fn -> grade.(id, submission, control) end)
-    %{state | grading: id, submissions: rest}
+  defp start_grade(%{submissions: [{id, submission} | rest]} = state) do
+    if length(state.grading) < state.parallel do
+      control = Map.fetch!(state.prepared, id)
+      grade = state.callbacks.grade
+      state = launch(state, :grade, id, fn -> grade.(id, submission, control) end)
+      start_grade(%{state | grading: state.grading ++ [id], submissions: rest})
+    else
+      state
+    end
   end
 
   defp start_grade(state), do: state
@@ -251,11 +297,16 @@ defmodule Eab.Pipeline do
   defp completed(state, :prepare, id, {:ok, control}),
     do: put_in(state.prepared[id], control)
 
-  defp completed(state, :attempt, id, {:ok, submission}),
-    do: %{state | active: nil, submissions: state.submissions ++ [{id, submission}]}
+  defp completed(state, :attempt, id, {:ok, submission}) do
+    %{
+      state
+      | active: Enum.reject(state.active, &(&1.id == id)),
+        submissions: state.submissions ++ [{id, submission}]
+    }
+  end
 
   defp completed(state, :grade, id, {:ok, result}),
-    do: record(%{state | grading: nil}, id, result)
+    do: record(%{state | grading: List.delete(state.grading, id)}, id, result)
 
   defp completed(state, kind, id, {:error, message}) do
     state =
@@ -264,13 +315,13 @@ defmodule Eab.Pipeline do
           state
 
         :grade ->
-          %{state | grading: nil}
+          %{state | grading: List.delete(state.grading, id)}
 
         :attempt ->
           %{
             state
-            | active: if(state.active && state.active.id == id, do: nil, else: state.active),
-              warm: if(state.warm && state.warm.id == id, do: nil, else: state.warm)
+            | active: Enum.reject(state.active, &(&1.id == id)),
+              warm: Enum.reject(state.warm, &(&1.id == id))
           }
       end
 

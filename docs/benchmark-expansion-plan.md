@@ -10,7 +10,7 @@ Implementation status from 2026-10-14: release/recovery/retention/evidence contr
 
 ## Scope and decisions
 
-Preserve the agreed behavior: Run automatically prepares missing state; Pi, grading and regression probes use independent clones; ordinary repairs start from an installed application; installation/migration cases declare fresh setup; one Pi runs at a time against a remote model; preparation and grading stay bounded; baselines persist until explicitly removed. Services start during runs, with the next workspace prepared ahead.
+Preserve the agreed behavior: Run automatically prepares missing state; Pi, grading and regression probes use independent clones; ordinary repairs start from an installed application; installation/migration cases declare fresh setup; attempts run one at a time unless a run sets parallel attempts (ADR 0014); preparation and grading stay bounded; baselines persist until explicitly removed. Services start during runs, with the next workspace prepared ahead.
 
 Confirmed expansion choices:
 
@@ -76,7 +76,7 @@ Keep a content-addressed artifact catalog with ownership, component references, 
 
 ## Storage and resource policy
 
-The number of retained artifacts can grow with the corpus; live workspaces grow only with configured worker limits. Keep one Pi, one waiting workspace, one grader and the existing bounded preparation workers. A larger inventory does not automatically increase those limits. Account for service containers started by qualification workers as well as preparation itself.
+The number of retained artifacts can grow with the corpus; live workspaces grow only with configured worker limits. Keep the run's parallel attempts, one waiting workspace and one grader per attempt, and the existing bounded preparation workers. A larger inventory does not automatically increase those limits. Account for service containers started by qualification workers as well as preparation itself.
 
 Show logical case coverage and actual shared/unique storage separately. Do not sum image virtual sizes as if every shared layer were unique. Include build cache, source archives, scratch preparation and run evidence in capacity reporting. A 500-case corpus evaluated by 10–30 models creates 5,000–15,000 attempts, even though it need not create 5,000–15,000 pristine baselines.
 

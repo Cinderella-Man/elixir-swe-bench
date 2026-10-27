@@ -8,6 +8,11 @@ Where Claude Code has no equivalent, the harness declares the difference instead
 
 Opus 5.5 at extra-high effort (`claude-opus-5-5`, `xhigh`) through this harness is the only validator for new cases, and curation sessions run on Opus 5.5. Two fresh passes remain the default. Haiku 5.5 is a benchmark subject only: a weaker model's failure does not show that a case is unsolvable. Existing Astra validations keep their evidence. Before the first scored run, an escape test and one unscored Opus attempt on an already validated case check the harness.
 
+## Amendments
+
+- [ADR 0014](0014-run-a-runs-attempts-in-parallel.md) lets one solver session serve several attempts at once; the controller tells them apart by Claude Code's per-subagent `agent_id`.
+- The dashboard no longer offers Pi through the per-token Claude API, because subscription runs through this harness are the supported way to benchmark Claude. `Eab.Anthropic` and its tests remain, unused.
+
 ## Considered options
 
 - **Pi with the Claude API**: same agent as every other row, but billed per token, which the user rules out.

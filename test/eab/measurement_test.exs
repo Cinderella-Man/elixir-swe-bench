@@ -21,6 +21,24 @@ defmodule Eab.MeasurementTest do
            ] == result
   end
 
+  test "a run with several parallel attempts records no elapsed time" do
+    counter = :counters.new(1, [])
+    Application.put_env(:eab, :measurement_clock, fn -> :counters.get(counter, 1) end)
+    model = %{"backend" => "llama_cpp", "context" => 32768}
+    prefix = "runs/parallel-time-#{System.unique_integer([:positive])}/case"
+    on_exit(fn -> File.rm_rf!(Eab.Store.path(Path.dirname(prefix))) end)
+
+    state =
+      Eab.Pi.state(model, "", Eab.Model.settings(model), prefix, fn _ -> :ok end, false)
+
+    state = %{state | calls: 1, assistant: true, settled: true, exit_code: 0}
+    :counters.put(counter, 1, 9000)
+    result = Eab.Pi.finish(%{"state" => state, "returncode" => 0})
+    refute Map.has_key?(result["measurement"], "attempt_ms")
+    assert Measurement.label(result["measurement"]) =~ "several attempts at once"
+    refute Eab.Store.read("#{prefix}/agent-progress.json")["measurement"]["attempt_ms"]
+  end
+
   test "completion freezes time before grading and preserves it on a grading error" do
     alias Eab.{Agent, Model, Pi, Store}
     prefix = "runs/finished-time-#{System.unique_integer([:positive])}/case"

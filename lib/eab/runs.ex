@@ -21,6 +21,7 @@ defmodule Eab.Runs do
   @doc """
   Starts a full run. `validation: true` marks an unpublishable case-validation run
   (ADR 0012); `series: id` contributes to a published run series and must match its setup.
+  `parallel_attempts: n` (1 to 8, default 1) runs up to n cases at once (ADR 0014).
   """
   def start(endpoint, key, settings, opts \\ []),
     do: GenServer.call(__MODULE__, {:start, endpoint, key, settings, opts}, 30_000)
@@ -93,7 +94,11 @@ defmodule Eab.Runs do
   def handle_call({:start, endpoint, key, settings, opts}, _from, state) do
     release = Release.freeze()
     settings = Model.settings(endpoint, settings)
-    run = new_run(release, endpoint, settings)
+
+    run =
+      release
+      |> new_run(endpoint, settings)
+      |> Map.put("parallel_attempts", parallel_attempts!(opts[:parallel_attempts] || 1))
 
     run =
       cond do
@@ -170,6 +175,7 @@ defmodule Eab.Runs do
       |> Map.put("cases", cases)
       |> Map.put("selection", selection)
       |> Map.put("validation", source["validation"] == true)
+      |> Map.put("parallel_attempts", source["parallel_attempts"] || 1)
       |> Map.put("message", "Starting selected cases in a fresh partial run")
       |> Map.put(
         "experiment_id",
@@ -388,6 +394,9 @@ defmodule Eab.Runs do
       "experiment_id" => Release.experiment(release["id"], endpoint, settings, selection)
     })
   end
+
+  defp parallel_attempts!(n) when is_integer(n) and n in 1..8, do: n
+  defp parallel_attempts!(_), do: raise("Parallel attempts must be a whole number from 1 to 8")
 
   defp new_run(release, endpoint, settings) do
     id = DateTime.utc_now() |> Calendar.strftime("%Y%m%d-%H%M%S-")

@@ -31,7 +31,15 @@ defmodule Eab.ClaudeCode.MCP do
   defp response(id, "tools/list", _), do: result(id, %{"tools" => ClaudeCode.tools()})
 
   defp response(id, "tools/call", %{"name" => name} = params) when is_binary(name) do
-    case Broker.call_tool(name, params["arguments"] || %{}) do
+    # The kit's PreToolUse hook adds the calling subagent's id to every workspace tool
+    # call; it routes the call and never reaches the tool.
+    {agent_id, arguments} =
+      case params["arguments"] do
+        %{} = arguments -> Map.pop(arguments, ClaudeCode.agent_field())
+        other -> {nil, other || %{}}
+      end
+
+    case Broker.call_tool(agent_id, name, arguments) do
       {:ok, outcome} ->
         result(id, outcome)
 

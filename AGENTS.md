@@ -8,7 +8,7 @@ When adding a benchmark case, resuming an unfinished candidate, changing an exis
 
 This machine is used concurrently for other work. Functional benchmarks, model accuracy/task-success evaluations, fixture qualification, builds and correctness/concurrency tests are allowed here when speed is not the subject. Run those locally when needed; do not ask for another host merely because the project calls them benchmarks.
 
-Never run speed-based benchmarks, throughput/latency measurements, or performance comparisons on this machine. Do not run combined evidence scripts that include such measurements. Disable automatic elapsed-time measurement before local solver validation as described in the curation workflow.
+This machine runs the benchmark controller. It may record elapsed attempt time for runs whose model is served on another machine, with parallel attempts at 1: the model server and network dominate those times. Never time a model served on this machine, and never run speed-based benchmarks, throughput/latency measurements or performance comparisons of this machine itself. Do not run combined evidence scripts that include such measurements. Disable automatic elapsed-time measurement before local solver validation as described in the curation workflow.
 
 Use bounded resource concurrency for local functional work. Watchdog timeouts may detect hangs; do not interpret their elapsed times or routine test/build durations as performance evidence. Historical timings from this machine are unsuitable indicators for performance decisions. Speed/performance qualification requires a separate suitable environment and explicit authorization to use it.
 

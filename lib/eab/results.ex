@@ -155,7 +155,8 @@ defmodule Eab.Results do
             List.last(run["code_versions"] || [get_in(run, ["protocol", "implementation"])]),
           "deployment" => %{
             "server_build" => profile["build_info"],
-            "total_slots" => profile["total_slots"]
+            "total_slots" => profile["total_slots"],
+            "parallel_attempts" => run["parallel_attempts"] || 1
           },
           "cases" =>
             Enum.map(selected_ids, fn id ->

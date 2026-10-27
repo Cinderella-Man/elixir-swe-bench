@@ -55,6 +55,15 @@ defmodule Eab.ClaudeCode.Transcript do
     })
   end
 
+  @doc "The subagent id the transcript's records carry; it fails closed if they disagree."
+  def observed_agent_id(entries) do
+    case entries |> Enum.map(& &1["agentId"]) |> Enum.reject(&is_nil/1) |> Enum.uniq() do
+      [] -> nil
+      [id] -> id
+      ids -> raise "Solver transcript mixes subagent ids #{Enum.join(ids, ", ")}"
+    end
+  end
+
   @doc """
   Validates the transcript against the frozen prompt, model and effort and summarizes it.
   `final` is SubagentStop's `last_assistant_message`; the transcript must contain it, as
@@ -81,6 +90,11 @@ defmodule Eab.ClaudeCode.Transcript do
             "Solver transcript does not begin with the frozen harness prompt"
         end,
         cond do
+          # A solver ended by an API error before any response has no model to read;
+          # its outcome below names the error (or the usage limit) instead.
+          models == [] and api_error?(List.last(assistants) || %{}) ->
+            nil
+
           models == [] ->
             "The solver's resolved model cannot be read from its transcript"
 

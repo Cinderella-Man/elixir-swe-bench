@@ -109,7 +109,18 @@ defmodule Eab.Results.Schema do
         do: require!(run["seed"] in r["seeds"], "Each run needs one of the series seeds"),
         else: require!(is_nil(run["seed"]), "This series records no seed")
 
-      fields!(run["deployment"], ~w(server_build total_slots), "Unexpected deployment fields")
+      # Runs published before ADR 0014 ran one attempt at a time and record no value.
+      fields!(
+        Map.delete(run["deployment"] || %{}, "parallel_attempts"),
+        ~w(server_build total_slots),
+        "Unexpected deployment fields"
+      )
+
+      require!(
+        is_nil(run["deployment"]["parallel_attempts"]) or
+          run["deployment"]["parallel_attempts"] in 1..8,
+        "Invalid parallel attempts"
+      )
 
       require!(
         is_nil(run["deployment"]["server_build"]) or is_binary(run["deployment"]["server_build"]),

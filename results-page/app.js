@@ -100,12 +100,13 @@
     outcomes.append(node("h3", "settings-heading", "Runs"));
     const runs = node("table", "case-table");
     const runHead = node("thead"), runRow = node("tr");
-    for (const title of ["Run", "Seed", "Passed", "Output tokens", "Model calls"]) runRow.append(node("th", "", title));
+    for (const title of ["Run", "Seed", "Parallel attempts", "Passed", "Output tokens", "Model calls"]) runRow.append(node("th", "", title));
     runHead.append(runRow); runs.append(runHead);
     const runBody = node("tbody");
     for (const run of r.runs) {
       const row = node("tr"), tokens = sum(run, "generated_tokens"), calls = sum(run, "model_calls");
       row.append(node("td", "case-id", `${run.created_at.slice(0, 10)} · ${run.run_id}`), node("td", "numeric", run.seed ?? "—"),
+        node("td", "numeric", run.deployment?.parallel_attempts ?? 1),
         node("td", "numeric", `${run.cases.filter(c => c.passed).length}/${run.cases.length}`),
         node("td", "numeric", tokens == null ? "—" : fmt(tokens)), node("td", "numeric", calls == null ? "—" : fmt(calls)));
       runBody.append(row);

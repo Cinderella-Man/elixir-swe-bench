@@ -116,6 +116,7 @@ defmodule Eab.Runner do
     pipeline_opts =
       Application.get_env(:eab, :pipeline, [])
       |> Keyword.put(:preparation_plan, Preparation.plan(pending))
+      |> Keyword.put(:parallel, run["parallel_attempts"] || 1)
 
     results = Pipeline.run(pending, callbacks, pipeline_opts)
 

@@ -48,12 +48,12 @@ defmodule Eab.Agent do
 
     {record, patch} =
       try do
+        run = Store.read("runs/#{run_id}/run.json") || %{}
+
         result =
           if claude_code do
             # An escape test swaps the task for the frozen probe; nothing else changes.
-            escape =
-              get_in(Store.read("runs/#{run_id}/run.json") || %{}, ["selection", "kind"]) ==
-                "escape_test"
+            escape = get_in(run, ["selection", "kind"]) == "escape_test"
 
             ClaudeCode.Attempt.run(
               box,
@@ -68,7 +68,11 @@ defmodule Eab.Agent do
               escape_test: escape
             )
           else
-            Pi.run(box, endpoint, key, settings, prefix, prompt, instructions, emit)
+            # Concurrent attempts share the host and any local model server, so their
+            # elapsed times are not comparable and are not recorded (ADR 0014).
+            Pi.run(box, endpoint, key, settings, prefix, prompt, instructions, emit,
+              measure: (run["parallel_attempts"] || 1) == 1
+            )
           end
 
         {Map.merge(base, result), Sandbox.patch(box)}
