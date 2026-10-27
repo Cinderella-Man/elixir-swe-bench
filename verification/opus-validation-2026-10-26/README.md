@@ -11,6 +11,7 @@ Unpublished validation runs under [ADR 0012](../../docs/adr/0012-rebuild-release
 | `20261026-224602-11868a92` | all 20 cases | Completed: **18 of 20 passed** as graded. accent-pr-183 failed only on a grader defect and passes when re-graded; ash-pr-3031 failed. Per-case grade summaries and the sealed patches are in [`run-20261026-224602-11868a92/`](run-20261026-224602-11868a92/). |
 | `20261027-095752-a0aaa695` | all 20 cases, 2 parallel attempts | The first run under the parallel-attempts kit ([ADR 0014](../../docs/adr/0014-run-a-runs-attempts-in-parallel.md)). Completed: **18 of 20 passed**. livebook-pr-2800 and ash-pr-3031 failed. Per-case grade summaries, the sealed patches, the patches that show both failing cases are solvable, and the hook decision log are in [`run-20261027-095752-a0aaa695/`](run-20261027-095752-a0aaa695/). No elapsed times were recorded. |
 | `20261027-143532-8d2e4ed2` | all 20 cases, 2 parallel attempts | Completed: **19 of 20 passed**. ash-pr-3031 failed. Per-case grade summaries, the sealed patches, the patches that show ash-pr-3031 is solvable, and the hook decision log are in [`run-20261027-143532-8d2e4ed2/`](run-20261027-143532-8d2e4ed2/). No elapsed times were recorded. |
+| `20261027-183407-2bbea0a5` | all 20 cases, 2 parallel attempts | The first run under the session-level workspace server and the final case versions. Completed: **18 of 20 passed**. ash-pr-3031 and livebook-pr-2800 failed. Per-case grade summaries, the sealed patches, the patches that show both failing cases are solvable, and the hook decision log are in [`run-20261027-183407-2bbea0a5/`](run-20261027-183407-2bbea0a5/). No elapsed times were recorded. |
 
 Raw transcripts stay in the controller's data volume: they carry the solver's environment block and account details.
 
@@ -55,10 +56,19 @@ This was the final review before the release freezes. Each pass was read against
 - **Harness: the controller staged the solver's edits.** Its patch snapshot after each tool call ran `git add -A` in the solver's own index, so the solver's `git diff` showed nothing and `git checkout` restored nothing. In plausible-pr-6449 the solver "tested the starting source" with its fix still applied before noticing. The snapshot now stages into a copy of the index.
 - **Environment: PostgreSQL ran out of memory in vutuv-pr-1759's full suite.** Every vutuv attempt since run 07bb9eac saw about 75 spurious failures in its own full-suite run when the kernel killed a PostgreSQL backend at the 512 MB limit. No graded command was affected. The database container now gets 1 GB, under which the full suite runs without a kill.
 
+## What the reviews of run 2bbea0a5 found
+
+Reviewed under the final-batch rule: each pass was checked for genuineness and for any fault of the case, and its logs were read.
+
+- **All 18 passes are genuine, and no case is at fault.** No solution weakened or deleted an existing test, special-cased hidden data or edited outside the allowed prefixes. No review found a new check gap.
+- **livebook-pr-2800 failed on a stated requirement.** This time Opus left the starting source's `:erlang.list_to_binary/1` call in place, which raises on the non-ASCII text the ticket names (3 of 67 hidden checks fail). With that one call replaced by `IO.chardata_to_string/1`, as the reference does, Opus's patch passes all 67 ([patch](run-20261027-183407-2bbea0a5/livebook-pr-2800/soundness/)).
+- **ash-pr-3031 failed on the same two requirements as in runs 11868a92 and 8d2e4ed2** (13 of 15 hidden checks pass). Opus's patch passes all 15 with both repaired ([patches](run-20261027-183407-2bbea0a5/ash-pr-3031/soundness/)).
+- **The harness fixes held.** No tool call lost its answer, including two long calls that were running while the other solver finished. The solvers' own `git diff` and `git checkout` worked on their edits, and vutuv-pr-1759's full suite ran without a database drop.
+
 ## Validation ledger
 
 A case stays in the release after two reviewed passes under the same case version and harness kit (ADR 0012). A changed case starts its two attempts again. The kit changed after run 8d2e4ed2 ([ADR 0014 amendment](../../docs/adr/0014-run-a-runs-attempts-in-parallel.md)), so all 20 cases collect their two passes under the new kit; runs a0aaa695 and 8d2e4ed2 no longer count. Eight cases also changed in the final case-fix batch.
 
-- **Two fresh attempts needed under the current kit:** all 20 cases.
-- **Kept by the user's decision whatever their results:** ash-pr-3031 (Opus has missed stated requirements in all four attempts) and livebook-pr-2800 (missed in run a0aaa695, passed in run 8d2e4ed2). Both stay sound cases Opus can be measured against.
+- **One reviewed pass under the current kit and case versions (run 2bbea0a5), one more needed:** absinthe-pr-1176, accent-pr-183, beacon-pr-687, cachex-pr-341, guardian-pr-748, livebeats-pr-37, livebook-pr-2219, livebook-pr-2527, livebook-pr-2663, livebook-pr-2822, livebook-pr-3076, operately-pr-1069, operately-pr-1205, pinchflat-pr-610, plausible-pr-5939, plausible-pr-5956, plausible-pr-6449 and vutuv-pr-1759.
+- **Kept by the user's decision whatever their results:** ash-pr-3031 (Opus has missed stated requirements in all five attempts) and livebook-pr-2800 (missed in runs a0aaa695 and 2bbea0a5, passed in run 8d2e4ed2). Both stay sound cases Opus can be measured against.
 - **Final batch:** on 2026-10-27 the user made the fixes after run 8d2e4ed2 the final strengthening batch. In the next two runs only a failure the case is at fault for changes a case; new minor gaps a review finds are recorded instead of reopening validation.
