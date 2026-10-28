@@ -7,7 +7,7 @@ Scored runs of Sonnet 5.5 at max effort through the [Claude Code harness](../../
 | `20261028-065746-940e9ba4` | **18 of 20 passed.** ash-pr-3031 and guardian-pr-748 failed. Evidence in [`run-20261028-065746-940e9ba4/`](run-20261028-065746-940e9ba4/). |
 | `20261028-133546-8d515727` | **18 of 20 passed.** The same two failed. Evidence in [`run-20261028-133546-8d515727/`](run-20261028-133546-8d515727/). |
 
-Each run folder holds a grade summary and the sealed patch per case, plus the hook decision log. Each failure's folder also holds the patch that shows what separated it from a pass. Raw transcripts and activity logs stay in the controller's data volume: they carry the solver's environment block and account details.
+Each run folder holds a grade summary and the sealed patch per case, plus the hook decision log. Each failure's folder also holds the patch that shows what separated it from a pass. Each case's `logs/` folder holds the attempt's full logs: the controller's `activity.log`, the solver's `claude-transcript.jsonl` and the grader's `grade.json`. The user's email address and Claude organization ID are replaced with `[redacted email]` and `[redacted organization]`; nothing else is changed.
 
 ## How the runs were checked
 

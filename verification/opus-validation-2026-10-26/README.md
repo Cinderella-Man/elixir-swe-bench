@@ -14,7 +14,7 @@ Unpublished validation runs under [ADR 0012](../../docs/adr/0012-rebuild-release
 | `20261027-183407-2bbea0a5` | all 20 cases, 2 parallel attempts | The first run under the session-level workspace server and the final case versions. Completed: **18 of 20 passed**. ash-pr-3031 and livebook-pr-2800 failed. Per-case grade summaries, the sealed patches, the patches that show both failing cases are solvable, and the hook decision log are in [`run-20261027-183407-2bbea0a5/`](run-20261027-183407-2bbea0a5/). No elapsed times were recorded. |
 | `20261027-204103-33348dcc` | all 20 cases, 2 parallel attempts | Completed: **17 of 20 passed**. ash-pr-3031, livebook-pr-2800 and vutuv-pr-1759 failed. Per-case grade summaries, the sealed patches, the patches that show all three failing cases are solvable, and the hook decision log are in [`run-20261027-204103-33348dcc/`](run-20261027-204103-33348dcc/). No elapsed times were recorded. |
 
-Raw transcripts stay in the controller's data volume: they carry the solver's environment block and account details.
+For the three runs of Opus 5.5's published series (`2bbea0a5`, `33348dcc` and `e5c64f64`), each case's `logs/` folder holds the attempt's full logs: the controller's `activity.log`, the solver's `claude-transcript.jsonl` and the grader's `grade.json`. The user's email address and Claude organization ID are replaced with `[redacted email]` and `[redacted organization]`; nothing else is changed. The earlier runs' raw logs stay in the controller's data volume.
 
 ## What the reviews of run 07bb9eac found
 
@@ -35,7 +35,6 @@ The same method as for the first run: every passing patch was reviewed against i
 - **15 cases had checks a plausible wrong solution still passes, texts that claim more than the reference delivers, or a reference that fails a stated input.** All were corrected; six needed curator corrections to the reference. See [the second case-fix batch](../case-fixes-2026-10-27/README.md).
 - **Harness:** the activity logs no longer repeat the patch after every tool call, and no run left orphaned processes or hit the process limit.
 
-Raw transcripts and activity logs stay in the controller's data volume.
 
 ## What the reviews of run a0aaa695 found
 
