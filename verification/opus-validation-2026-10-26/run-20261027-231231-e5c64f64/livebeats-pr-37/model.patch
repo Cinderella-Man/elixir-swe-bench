@@ -1,0 +1,254 @@
+diff --git a/assets/js/app.js b/assets/js/app.js
+index 476cdc1..ed75dd4 100644
+--- a/assets/js/app.js
++++ b/assets/js/app.js
+@@ -10,6 +10,61 @@ let execJS = (selector, attr) => {
+   document.querySelectorAll(selector).forEach(el => liveSocket.execJS(el, el.getAttribute(attr)))
+ }
+ 
++// Names the playing song in the browser tab. LiveView may set the page's own
++// title at any time (live navigation, patches), so the latest one is tracked to
++// be put back once listening stops, while the song stays shown in the meantime.
++class TabTitle {
++  constructor(){
++    this.pageTitle = document.title
++    this.songTitle = null
++    this.requested = null
++    this.written = null
++    this.observer = new MutationObserver(() => this.render())
++    this.observer.observe(document.head, {childList: true, subtree: true, characterData: true})
++  }
++
++  showSong({title, artist}){
++    let titleEl = document.querySelector("title")
++    let {prefix, suffix} = titleEl ? titleEl.dataset : {}
++    let name = artist ? `${title} (${artist})` : title
++    this.songTitle = `${prefix || ""}${name}${suffix || ""}`
++    this.render()
++  }
++
++  restore(){
++    this.songTitle = null
++    this.render()
++  }
++
++  disconnect(){
++    this.restore()
++    this.observer.disconnect()
++  }
++
++  render(){
++    // a title we did not write ourselves is the page's new title
++    if(document.title !== this.written){ this.pageTitle = document.title }
++    let title = this.songTitle === null ? this.pageTitle : this.songTitle
++    // document.title reads back whitespace-collapsed, so compare against what
++    // was requested and what was read back rather than the two against each other
++    let stale = title !== this.requested || document.title !== this.written
++    if(stale && document.title !== title){ document.title = title }
++    this.requested = title
++    this.written = document.title
++  }
++}
++
++// The Media Session API is optional; playback must never depend on it.
++let updateMediaSession = (fn) => {
++  let mediaSession = ("mediaSession" in navigator) ? navigator.mediaSession : null
++  if(!mediaSession){ return }
++  try {
++    fn(mediaSession)
++  } catch(error){
++    console.error("unable to update media session", error)
++  }
++}
++
+ let Hooks = {}
+ 
+ Hooks.Flash = {
+@@ -100,6 +155,7 @@ Hooks.AudioPlayer = {
+     this.currentTime = this.el.querySelector("#player-time")
+     this.duration = this.el.querySelector("#player-duration")
+     this.progress = this.el.querySelector("#player-progress")
++    this.tabTitle = new TabTitle()
+     let enableAudio = () => {
+       if(this.player.src){
+         document.removeEventListener("click", enableAudio)
+@@ -116,7 +172,7 @@ Hooks.AudioPlayer = {
+         this.play()
+       }
+     })
+-    this.handleEvent("play", ({url, token, elapsed}) => {
++    this.handleEvent("play", ({url, token, elapsed, title, artist}) => {
+       this.playbackBeganAt = nowSeconds() - elapsed
+       let currentSrc = this.player.src.split("?")[0]
+       if(currentSrc === url && this.player.paused){
+@@ -125,9 +181,40 @@ Hooks.AudioPlayer = {
+         this.player.src = `${url}?token=${token}`
+         this.play({sync: true})
+       }
++      this.showNowPlaying({title, artist})
++    })
++    this.handleEvent("pause", () => {
++      this.pause()
++      updateMediaSession(session => session.playbackState = "paused")
++    })
++    this.handleEvent("stop", () => {
++      this.stop()
++      this.clearNowPlaying()
++    })
++  },
++
++  destroyed(){
++    this.clearNowPlaying()
++    this.tabTitle.disconnect()
++  },
++
++  showNowPlaying({title, artist}){
++    if(!title){ return }
++    this.tabTitle.showSong({title, artist})
++    updateMediaSession(session => {
++      if(typeof window.MediaMetadata === "function"){
++        session.metadata = new window.MediaMetadata({title, artist: artist || ""})
++      }
++      session.playbackState = "playing"
++    })
++  },
++
++  clearNowPlaying(){
++    this.tabTitle.restore()
++    updateMediaSession(session => {
++      session.metadata = null
++      session.playbackState = "none"
+     })
+-    this.handleEvent("pause", () => this.pause())
+-    this.handleEvent("stop", () => this.stop())
+   },
+ 
+   clearNextTimer(){
+diff --git a/lib/live_beats_web/live/player_live.ex b/lib/live_beats_web/live/player_live.ex
+index 26bc162..5f15c8a 100644
+--- a/lib/live_beats_web/live/player_live.ex
++++ b/lib/live_beats_web/live/player_live.ex
+@@ -314,7 +314,9 @@ defmodule LiveBeatsWeb.PlayerLive do
+       elapsed: elapsed,
+       duration: song.duration,
+       token: token,
+-      url: song.mp3_url
++      url: song.mp3_url,
++      title: song.title,
++      artist: song.artist
+     })
+   end
+ 
+diff --git a/test/benchmark/preservation.mjs b/test/benchmark/preservation.mjs
+index 36debfc..07a9551 100644
+--- a/test/benchmark/preservation.mjs
++++ b/test/benchmark/preservation.mjs
+@@ -39,3 +39,108 @@ test('profiles require a session and other listeners cannot control the owner so
+     assert.deepEqual(errors, []);
+   } finally {await context.close();}
+ });
++
++const playerButton = (page, name) => page.locator('#audio-player').getByRole('button', {name, exact:true});
++
++async function waitForAudio(page, song) {
++  await page.waitForFunction(filename => {
++    const audio = document.querySelector('#audio-player audio');
++    return audio && audio.src.includes(filename) && !audio.paused && audio.readyState >= 2;
++  }, song.filename);
++}
++
++// The tab title and (when the API exists) the Media Session metadata name the playing song.
++async function waitForNowPlaying(page, song, {mediaSession = true} = {}) {
++  await page.waitForFunction(({title, artist, mediaSession}) => {
++    if (!document.title.includes(title) || !document.title.includes(artist)) return false;
++    if (!mediaSession) return true;
++    const metadata = navigator.mediaSession.metadata;
++    return !!metadata && metadata.title === title && metadata.artist === artist;
++  }, {title: song.title, artist: song.artist, mediaSession});
++}
++
++test('now playing song is shown in the tab and media session for list picks and Next/Previous', async () => {
++  const {page, context, profile, errors} = await fixture.page();
++  try {
++    const [first, second] = profile.songs;
++    const ordinaryTitle = await page.title();
++    assert.equal(ordinaryTitle, 'Listing Songs · Phoenix Framework');
++    assert.equal(await page.evaluate(() => navigator.mediaSession.metadata), null);
++
++    await playSong(page, first);
++    await waitForNowPlaying(page, first);
++    assert.ok(!(await page.title()).includes(second.title));
++
++    await playerButton(page, 'Next').click();
++    await waitForAudio(page, second);
++    await waitForNowPlaying(page, second);
++    assert.ok(!(await page.title()).includes(first.title));
++
++    await playerButton(page, 'Previous').click();
++    await waitForAudio(page, first);
++    await waitForNowPlaying(page, first);
++
++    // Picking another row from the song list updates the tab as well.
++    await playSong(page, second);
++    await waitForNowPlaying(page, second);
++
++    // Pausing and resuming keep naming the current song.
++    await playerButton(page, 'Pause').click();
++    await page.waitForFunction(() => document.querySelector('#audio-player audio').paused);
++    await waitForNowPlaying(page, second);
++    await playerButton(page, 'Play').click();
++    await waitForAudio(page, second);
++    await waitForNowPlaying(page, second);
++
++    await stopListening(page);
++    await page.waitForFunction(title => document.title === title, ordinaryTitle);
++    assert.equal(await page.evaluate(() => navigator.mediaSession.metadata), null);
++    assert.deepEqual(errors, []);
++  } finally {await context.close();}
++});
++
++test('page title updates while listening keep the song in the tab and stopping restores the page title', async () => {
++  const {page, context, profile, errors} = await fixture.page();
++  try {
++    const [first] = profile.songs;
++    const ordinaryTitle = await page.title();
++    await playSong(page, first);
++    await waitForNowPlaying(page, first);
++
++    // Opening and closing the upload modal makes the profile view send new page titles.
++    await page.getByRole('link', {name:'Upload Songs', exact:true}).click();
++    await page.locator('#layout-container').waitFor({state:'visible'});
++    await waitForNowPlaying(page, first);
++    await page.goBack();
++    await page.locator('#layout-container').waitFor({state:'detached'});
++    await waitForNowPlaying(page, first);
++
++    await stopListening(page);
++    await page.waitForFunction(title => document.title === title, ordinaryTitle);
++    assert.deepEqual(errors, []);
++  } finally {await context.close();}
++});
++
++test('playback and the tab title work without the Media Session API', async () => {
++  const {page, context, profile, errors} = await fixture.page({mediaSession:false});
++  try {
++    const [first, second] = profile.songs;
++    assert.equal(await page.evaluate(() => 'mediaSession' in navigator), false);
++    const ordinaryTitle = await page.title();
++
++    await playSong(page, first);
++    await waitForNowPlaying(page, first, {mediaSession:false});
++    await playerButton(page, 'Pause').click();
++    await page.waitForFunction(() => document.querySelector('#audio-player audio').paused);
++    await playerButton(page, 'Play').click();
++    await waitForAudio(page, first);
++
++    await playerButton(page, 'Next').click();
++    await waitForAudio(page, second);
++    await waitForNowPlaying(page, second, {mediaSession:false});
++
++    await stopListening(page);
++    await page.waitForFunction(title => document.title === title, ordinaryTitle);
++    assert.deepEqual(errors, []);
++  } finally {await context.close();}
++});

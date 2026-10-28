@@ -87,3 +87,15 @@ Validation is complete. A case stays in the release after two reviewed passes un
   - vutuv-pr-1759: passed in run 2bbea0a5, missed in run 33348dcc, which by the decision made before its results could not remove a case.
 - **Final batch:** the fixes after run 8d2e4ed2 were the last strengthening batch; neither later run changed a case.
 - **Runs 2bbea0a5 and 33348dcc count toward Opus 5.5's published series.** Neither run's outcome changed the release, so both are listed in [`priv/admitted_validation_runs.json`](../../priv/admitted_validation_runs.json) under the ADR 0012 amendment. One fresh scored run completes the series. Every earlier validation run stays unpublished.
+
+## Opus 5.5's published series
+
+Opus 5.5's run series on this release ([ADR 0011](../../docs/adr/0011-publish-three-run-series.md)) is published on the results page: **88.3% ± 3.3** (18, 17 and 18 of 20).
+
+- Runs `20261027-183407-2bbea0a5` and `20261027-204103-33348dcc` are the two validation runs admitted under the [ADR 0012 amendment](../../docs/adr/0012-rebuild-release-and-validate-with-unpublished-opus-runs.md).
+- Run `20261027-231231-e5c64f64` is the third, an ordinary scored run on the same release, kit and settings. Its grade summaries, sealed patches and hook log are in [`run-20261027-231231-e5c64f64/`](run-20261027-231231-e5c64f64/).
+  - It passed 18 of 20. ash-pr-3031 and livebook-pr-2800 failed the same hidden checks as in run 33348dcc.
+  - Every attempt resolved to `claude-opus-5-5` at `xhigh`, with no safety stops and no errored attempts.
+  - No tool call lost its answer and no database connection dropped.
+- An [escape test](../harness-checks-2026-10-26/README.md) on the same kit passed before this run.
+
