@@ -2,7 +2,7 @@
 
 A static, shareable page for Elixir SWE Bench results, produced by this repository's benchmark runner. One dot represents a run series ([ADR 0011](../docs/adr/0011-publish-three-run-series.md)): up to three runs of one model through one harness on the current admitted cases. The dot sits at the mean score; a band shows ±1.96 standard errors of rerun noise once two runs exist. Hollow dots are provisional series that still miss runs. No server, database, npm packages or external assets are needed to serve it.
 
-The page contains a title, maximum model-size slider and one shared chart, with labels immediately left of their dots. Case outcomes and recorded settings open below the chart. There is no comparison selector or model search.
+The page contains a title, maximum model-size slider and one shared chart, with each model's name just above its dot and its score beside it. Case outcomes and recorded settings open below the chart. There is no comparison selector or model search.
 
 The benchmark run history and published results were cleared on 2026-10-20 because their thinking presets were not reliably recorded, and again on 2026-10-26 because the cases are being rebuilt ([ADR 0012](../docs/adr/0012-rebuild-release-and-validate-with-unpublished-opus-runs.md)). Every series starts on the rebuilt release. With no published records, the page shows “No benchmark results yet” and hides the slider and chart guidance.
 

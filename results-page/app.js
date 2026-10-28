@@ -165,7 +165,7 @@
     }
     for (const [i, r] of shown.entries()) {
       const position = r.score_percent / 100;
-      const point = node("button", "plot-point" + (selected === r.series_id ? " selected" : "") + (position < .2 ? " near-start" : "") + (r.complete ? "" : " provisional"));
+      const point = node("button", "plot-point" + (selected === r.series_id ? " selected" : "") + (r.complete ? "" : " provisional"));
       point.id = `point-${r.series_id}`;
       point.style.left = `${position * 100}%`;
       point.style.setProperty("--score-position", position);
@@ -199,6 +199,18 @@
     figure.append(area, node("div", "axis-caption", "Cases passed (mean of runs)"));
     return figure;
   }
+  // A name is centred above its dot unless that would cross the chart's edge; then it lines up with the dot.
+  function fitLabels() {
+    const area = document.querySelector(".plot-area");
+    if (!area) return;
+    const bounds = area.getBoundingClientRect();
+    for (const point of area.querySelectorAll(".plot-point")) {
+      point.classList.remove("near-start", "near-end");
+      const box = point.querySelector(".point-label").getBoundingClientRect();
+      if (box.right > bounds.right) point.classList.add("near-end");
+      else if (box.left < bounds.left) point.classList.add("near-start");
+    }
+  }
   function render() {
     const cap = Number($("size-limit").value), all = cap === allValue;
     const shown = records.filter(r => all || r.model.size_bytes !== null && r.model.size_bytes / 1e9 <= cap)
@@ -206,7 +218,7 @@
     $("size-value").textContent = all ? "All" : `${cap} GB`;
     $("size-limit").setAttribute("aria-valuetext", all ? "All models" : `Up to ${cap} GB of model weights`);
     $("chart").replaceChildren();
-    if (shown.length) $("chart").append(plot(shown));
+    if (shown.length) { $("chart").append(plot(shown)); fitLabels(); }
     else $("chart").append(node("p", "empty", "No models within this size limit."));
     const active = shown.find(r => r.series_id === selected);
     if (active) $("chart").append(details(active)); else selected = null;
@@ -214,5 +226,6 @@
     $("result-status").textContent = `${shown.length} / ${records.length} run series` + (!all && unknownSizes ? " · API / unknown sizes hidden" : "");
   }
   $("size-limit").addEventListener("input", render);
+  window.addEventListener("resize", fitLabels);
   render();
 })();
