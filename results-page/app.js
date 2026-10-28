@@ -21,7 +21,6 @@
     $("chart").append(node("p", "empty", "No benchmark results yet."));
     return;
   }
-  $("snapshot-note").hidden = !records.some(r => r.resources?.kind === "loaded_snapshot");
   const number = new Intl.NumberFormat("en-US");
   const fmt = value => number.format(value);
   const gb = bytes => bytes == null ? "Not recorded" : `${(bytes / 1e9).toFixed(1)} GB`;
@@ -33,6 +32,10 @@
   const thinking = r => ({unknown: "Not reported", on: "On (no level)", off: "Off",
     default: "Server/provider default", unsupported: "Not supported"})[r.settings.reasoning_effort] ||
     r.settings.reasoning_effort || "Not recorded";
+  // The chart names the model and its thinking level only; the rest is in the details.
+  const effort = r => ({minimal: "Minimal", low: "Low", medium: "Medium", high: "High", xhigh: "Extra", max: "Max",
+    on: "Thinking", off: "No thinking"})[r.settings.reasoning_effort];
+  const chartName = r => [r.model.name, r.model.quantization, effort(r)].filter(Boolean).join(" ");
   const vram = r => r.resources ? (r.resources.peak_vram_bytes ?? r.resources.gpus.reduce((sum, gpu) => sum + gpu.used_bytes, 0)) : null;
   const context = r => r.settings.window_tokens ? `${fmt(r.settings.window_tokens)} context` : "API";
   const sum = (run, key) => run.cases.every(c => Number.isInteger(c[key])) ? run.cases.reduce((n, c) => n + c[key], 0) : null;
@@ -171,15 +174,9 @@
       point.setAttribute("aria-expanded", String(selected === r.series_id));
       if (selected === r.series_id) point.setAttribute("aria-controls", "run-detail");
       const label = node("span", "point-label");
-      label.append(node("span", "model-name", r.model.name), node("span", "point-meta", [r.model.quantization, harness(r), `Thinking: ${thinking(r)}`,
-        hosted(r) ? "API" : `${gb(r.model.size_bytes)} weights`, r.settings.window_tokens ? `${r.settings.window_tokens / 1024}K ctx` : null].filter(Boolean).join(" · ")),
-        node("span", "point-meta", runsText(r)));
-      if (r.resources) label.append(node("span", "point-memory", r.resources.kind === "run_samples" ?
-        `${gb(vram(r))} VRAM · ${gb(r.resources.peak_ram_bytes)} RAM · ${r.resources.coverage === "complete" ? "run peaks" : "partial samples"}` :
-        `${gb(vram(r))} VRAM · ${gb(r.resources.service_ram_lifetime_peak_bytes ?? r.resources.ram_lifetime_peak_bytes)} RAM peak¹`));
-      else if (!hosted(r)) label.append(node("span", "point-memory", "RAM / VRAM not recorded"));
-      if (records.filter(other => other.model.name === r.model.name && other.model.quantization === r.model.quantization).length > 1) {
-        label.append(node("span", "point-meta", `Series ${r.series_id.slice(0, 8)}`));
+      label.append(node("span", "model-name", chartName(r)));
+      if (records.filter(other => chartName(other) === chartName(r)).length > 1) {
+        label.append(node("span", "point-meta", `${harness(r)} · Series ${r.series_id.slice(0, 8)}`));
       }
       const dot = node("span", "result-dot");
       const score = node("span", "point-score", scoreText(r));
