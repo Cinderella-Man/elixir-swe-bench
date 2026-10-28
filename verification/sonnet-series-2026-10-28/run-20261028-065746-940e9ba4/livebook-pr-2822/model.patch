@@ -1,0 +1,572 @@
+diff --git a/lib/livebook/runtime/evaluator.ex b/lib/livebook/runtime/evaluator.ex
+index 2343b84..6bf0b1c 100644
+--- a/lib/livebook/runtime/evaluator.ex
++++ b/lib/livebook/runtime/evaluator.ex
+@@ -41,7 +41,12 @@ defmodule Livebook.Runtime.Evaluator do
+   Each evaluation produces a  new context, which may be optionally
+   used by a later evaluation.
+   """
+-  @type context :: %{binding: Code.binding(), env: Macro.Env.t(), id: binary()}
++  @type context :: %{
++          binding: Code.binding(),
++          env: Macro.Env.t(),
++          pdict: %{term() => term()},
++          id: binary()
++        }
+ 
+   @typedoc """
+   A term used to identify evaluation.
+@@ -131,6 +136,11 @@ defmodule Livebook.Runtime.Evaluator do
+   used as the entry point for evaluation.
+ 
+   Any exceptions are captured and transformed into an error result.
++  A failed evaluation has no effect on the context. Evaluations that
++  have it among their parents see the same context as if it was not
++  there, including imports and the process dictionary. This means
++  that the changes the failed evaluation made to the process
++  dictionary are rolled back and the modules it defined are deleted.
+ 
+   The evaluation result is formatted into an output and sent to the
+   configured client (see `start_link/1`) together with metadata.
+@@ -348,6 +358,29 @@ defmodule Livebook.Runtime.Evaluator do
+     %{id: random_long_id(), binding: [], env: env, pdict: %{}}
+   end
+ 
++  # Builds the context resulting from an evaluation that failed.
++  #
++  # The failed evaluation has no effect on the context, so it does not
++  # contribute any binding, aliases, requires or modules. Imports and
++  # the process dictionary are different, because they are not merged
++  # incrementally. Instead, the most recent context in the sequence
++  # carries all of them (see `merge_context/2` and `merge_env/2`), so
++  # a blank context would make any evaluation that follows the failed
++  # one lose everything imported or put in the process dictionary by
++  # the evaluations before. For that reason we carry over imports and
++  # the process dictionary from the context the evaluation started with.
++  defp failed_context(prev_context) do
++    context = initial_context()
++
++    env = %{
++      context.env
++      | functions: prev_context.env.functions,
++        macros: prev_context.env.macros
++    }
++
++    %{context | env: env, pdict: prev_context.pdict}
++  end
++
+   defp handle_cast({:evaluate_code, language, code, ref, parent_refs, opts}, state) do
+     do_evaluate_code(language, code, ref, parent_refs, opts, state)
+   end
+@@ -464,12 +497,16 @@ defmodule Livebook.Runtime.Evaluator do
+             delete_module(module)
+           end
+ 
++          # The evaluation could have changed the process dictionary
++          # before failing, so we roll that back, as if the evaluation
++          # never happened
++          set_pdict(context, state.ignored_pdict_keys)
++
+           result = {:error, kind, error, stacktrace}
+           identifiers_used = :unknown
+           identifiers_defined = %{}
+           identifier_definitions = []
+-          # Empty context
+-          new_context = initial_context()
++          new_context = failed_context(context)
+           {new_context, result, identifiers_used, identifiers_defined, identifier_definitions}
+       end
+ 
+diff --git a/test/livebook/runtime/evaluator_test.exs b/test/livebook/runtime/evaluator_test.exs
+index 6d2fe89..3111cea 100644
+--- a/test/livebook/runtime/evaluator_test.exs
++++ b/test/livebook/runtime/evaluator_test.exs
+@@ -549,6 +549,424 @@ defmodule Livebook.Runtime.EvaluatorTest do
+     end
+   end
+ 
++  describe "evaluate_code/6 with a failing evaluation" do
++    test "keeps imports from the previous evaluations", %{evaluator: evaluator} do
++      assert terminal_text(_) = evaluate(evaluator, "import ExUnit.Assertions", :code_1, [])
++
++      assert error(message) = evaluate(evaluator, "assert false", :code_2, [:code_1])
++      assert clean_message(message) =~ "** (ExUnit.AssertionError)"
++
++      assert "true" == evaluate_text(evaluator, "assert true", :code_3, [:code_2, :code_1])
++
++      # The imports are there even if the failed evaluation is the
++      # only parent
++      assert "true" == evaluate_text(evaluator, "assert true", :code_4, [:code_2])
++    end
++
++    test "keeps process dictionary from the previous evaluations", %{evaluator: evaluator} do
++      assert terminal_text(_) = evaluate(evaluator, "Process.put(:x, 1)", :code_1, [])
++
++      assert error(_) = evaluate(evaluator, ~S|raise "failed"|, :code_2, [:code_1])
++
++      assert "1" == evaluate_text(evaluator, "Process.get(:x)", :code_3, [:code_2, :code_1])
++
++      # The process dictionary is there even if the failed evaluation
++      # is the only parent
++      assert "1" == evaluate_text(evaluator, "Process.get(:x)", :code_4, [:code_2])
++    end
++
++    test "rolls back changes to the process dictionary", %{evaluator: evaluator} do
++      code1 = """
++      Process.put(:overwritten, 1)
++      Process.put(:deleted, 1)
++      Process.put(:untouched, 1)
++      """
++
++      failing_code = """
++      Process.put(:overwritten, 2)
++      Process.delete(:deleted)
++      Process.put(:added, 2)
++      raise "failed"
++      """
++
++      code2 = """
++      {Process.get(:overwritten), Process.get(:deleted), Process.get(:untouched),
++       Process.get(:added)}
++      """
++
++      assert terminal_text(_) = evaluate(evaluator, code1, :code_1, [])
++      assert error(_) = evaluate(evaluator, failing_code, :code_2, [:code_1])
++
++      # The changes are undone as soon as the evaluation fails
++      {:dictionary, dictionary} = Process.info(evaluator.pid, :dictionary)
++      assert dictionary[:overwritten] == 1
++      assert dictionary[:deleted] == 1
++      assert dictionary[:untouched] == 1
++      refute List.keymember?(dictionary, :added, 0)
++
++      assert "{1, 1, 1, nil}" == evaluate_text(evaluator, code2, :code_3, [:code_2, :code_1])
++      assert "{1, 1, 1, nil}" == evaluate_text(evaluator, code2, :code_4, [:code_2])
++
++      # Failures in a row
++      assert error(_) = evaluate(evaluator, failing_code, :code_5, [:code_2, :code_1])
++      assert error(_) = evaluate(evaluator, failing_code, :code_6, [:code_5, :code_2, :code_1])
++
++      assert "{1, 1, 1, nil}" ==
++               evaluate_text(evaluator, code2, :code_7, [:code_6, :code_5, :code_2, :code_1])
++
++      context = Evaluator.get_evaluation_context(evaluator, [:code_7, :code_6, :code_5])
++      assert context.pdict == %{overwritten: 1, deleted: 1, untouched: 1}
++    end
++
++    test "does not roll back the random number generator state", %{evaluator: evaluator} do
++      # The numbers generated by the failing evaluations (the first and
++      # the third) are consumed, the evaluations in between get the
++      # second and the fourth
++      state = :rand.seed_s(:default, 0)
++      {_first, state} = :rand.uniform_s(state)
++      {second, state} = :rand.uniform_s(state)
++      {_third, state} = :rand.uniform_s(state)
++      {fourth, _state} = :rand.uniform_s(state)
++
++      assert terminal_text(_) = evaluate(evaluator, ":rand.seed(:default, 0)", :code_1, [])
++
++      failing_code = """
++      :rand.uniform()
++      raise "failed"
++      """
++
++      assert error(_) = evaluate(evaluator, failing_code, :code_2, [:code_1])
++
++      assert inspect(second) ==
++               evaluate_text(evaluator, ":rand.uniform()", :code_3, [:code_2, :code_1])
++
++      assert error(_) = evaluate(evaluator, failing_code, :code_4, [:code_3, :code_2, :code_1])
++
++      assert inspect(fourth) ==
++               evaluate_text(evaluator, ":rand.uniform()", :code_5, [:code_4, :code_3])
++
++      # The state is not a part of any context
++      assert Evaluator.get_evaluation_context(evaluator, [:code_5, :code_4]).pdict == %{}
++    end
++
++    test "does not roll back process dictionary entries the evaluator started with",
++         %{evaluator: evaluator} do
++      {:dictionary, dictionary} = Process.info(evaluator.pid, :dictionary)
++      assert List.keymember?(dictionary, :"$ancestors", 0)
++
++      failing_code = """
++      Process.put(:"$ancestors", [:changed])
++      Process.put(:added, 1)
++      raise "failed"
++      """
++
++      assert error(_) = evaluate(evaluator, failing_code, :code_1, [])
++
++      {:dictionary, dictionary} = Process.info(evaluator.pid, :dictionary)
++      assert dictionary[:"$ancestors"] == [:changed]
++      refute List.keymember?(dictionary, :added, 0)
++
++      # The entries are not a part of any context
++      assert Evaluator.get_evaluation_context(evaluator, [:code_1]).pdict == %{}
++    end
++
++    test "the following evaluation sees exactly the context from before the failed one",
++         %{evaluator: evaluator} do
++      code1 = """
++      b = 1
++      x = 1
++
++      alias Enum, as: E
++
++      require Integer
++
++      import String, only: [upcase: 1, downcase: 1]
++
++      Process.put(:x, 1)
++      Process.put(:y, 1)
++
++      defmodule Livebook.Runtime.EvaluatorTest.FailedFollowing.One do
++      end
++      """
++
++      code2 = """
++      a = 2
++      x = 2
++
++      alias Map, as: M
++
++      require Logger
++
++      import Integer, only: [is_odd: 1]
++
++      Process.put(:y, 2)
++      Process.put(:z, 2)
++
++      defmodule Livebook.Runtime.EvaluatorTest.FailedFollowing.Two do
++      end
++      """
++
++      failing_code = """
++      c = 3
++      x = 3
++
++      alias MapSet, as: M
++      alias Range, as: R
++
++      require Code
++
++      import Enum, only: [map: 2]
++      import String, except: [upcase: 1]
++      import Integer
++
++      Process.put(:y, 3)
++      Process.delete(:z)
++      Process.put(:w, 3)
++
++      defmodule Livebook.Runtime.EvaluatorTest.FailedFollowing.Three do
++      end
++
++      raise "failed"
++      """
++
++      assert terminal_text(_) = evaluate(evaluator, code1, :code_1, [])
++      assert terminal_text(_) = evaluate(evaluator, code2, :code_2, [:code_1])
++
++      assert error(message) = evaluate(evaluator, failing_code, :code_3, [:code_2, :code_1])
++      assert clean_message(message) =~ "** (RuntimeError) failed"
++
++      # Make sure there is something to compare
++
++      expected_context = Evaluator.get_evaluation_context(evaluator, [:code_2, :code_1])
++
++      assert Enum.sort(expected_context.binding) == [a: 2, b: 1, x: 2]
++      assert Enum.sort(expected_context.env.aliases) == [{E, Enum}, {M, Map}]
++      assert Integer in expected_context.env.requires
++      assert Logger in expected_context.env.requires
++      assert Code not in expected_context.env.requires
++      assert expected_context.env.functions[String] == [downcase: 1, upcase: 1]
++      assert expected_context.env.macros[Integer] == [is_odd: 1]
++      refute Keyword.has_key?(expected_context.env.functions, Enum)
++
++      assert Enum.sort(Map.keys(expected_context.env.versioned_vars)) ==
++               [{:a, nil}, {:b, nil}, {:x, nil}]
++
++      assert expected_context.env.context_modules == [
++               Livebook.Runtime.EvaluatorTest.FailedFollowing.Two,
++               Livebook.Runtime.EvaluatorTest.FailedFollowing.One
++             ]
++
++      assert expected_context.pdict == %{x: 1, y: 2, z: 2}
++
++      # The failed evaluation changes nothing
++
++      context = Evaluator.get_evaluation_context(evaluator, [:code_3, :code_2, :code_1])
++      assert_same_context(context, expected_context)
++
++      refute Code.ensure_loaded?(Livebook.Runtime.EvaluatorTest.FailedFollowing.Three)
++
++      # Same for the evaluations that follow
++
++      assert terminal_text(_) = evaluate(evaluator, "d = 4", :code_4, [:code_3, :code_2, :code_1])
++
++      expected_context = Evaluator.get_evaluation_context(evaluator, [:code_4, :code_2, :code_1])
++      context = Evaluator.get_evaluation_context(evaluator, [:code_4, :code_3, :code_2, :code_1])
++      assert_same_context(context, expected_context)
++      assert Enum.sort(context.binding) == [a: 2, b: 1, d: 4, x: 2]
++    end
++
++    test "the context of the failed evaluation has only imports and process dictionary from before",
++         %{evaluator: evaluator} do
++      code1 = """
++      x = 1
++
++      alias Enum, as: E
++
++      require Integer
++
++      import String, only: [upcase: 1]
++
++      Process.put(:a, 1)
++
++      defmodule Livebook.Runtime.EvaluatorTest.FailedContext.Earlier do
++      end
++      """
++
++      failing_code = """
++      y = 2
++
++      alias Map, as: M
++
++      require Logger
++
++      import Integer, only: [is_odd: 1]
++
++      Process.put(:a, 2)
++      Process.put(:b, 2)
++
++      defmodule Livebook.Runtime.EvaluatorTest.FailedContext.Failed do
++      end
++
++      raise "failed"
++      """
++
++      assert terminal_text(_) = evaluate(evaluator, code1, :code_1, [])
++      assert error(_) = evaluate(evaluator, failing_code, :code_2, [:code_1])
++
++      initial_context = Evaluator.get_evaluation_context(evaluator, [])
++      earlier_context = Evaluator.get_evaluation_context(evaluator, [:code_1])
++      context = Evaluator.get_evaluation_context(evaluator, [:code_2])
++
++      assert context.binding == []
++      assert context.env.aliases == []
++      assert context.env.versioned_vars == %{}
++      assert context.env.context_modules == []
++
++      assert context.env.requires == initial_context.env.requires
++      assert Integer not in context.env.requires
++      assert Logger not in context.env.requires
++
++      assert context.env.functions == earlier_context.env.functions
++      assert context.env.macros == earlier_context.env.macros
++      assert context.env.functions[String] == [upcase: 1]
++      refute Keyword.has_key?(context.env.macros, Integer)
++
++      assert context.pdict == earlier_context.pdict
++      assert context.pdict == %{a: 1}
++
++      # The earlier imports and process dictionary are there even if
++      # the failed evaluation is the only parent
++
++      assert ~S|{"HI", 1, nil}| ==
++               evaluate_text(
++                 evaluator,
++                 ~S|{upcase("hi"), Process.get(:a), Process.get(:b)}|,
++                 :code_3,
++                 [:code_2]
++               )
++
++      # Everything else is not
++
++      assert error(_) = evaluate(evaluator, "x", :code_4, [:code_2])
++      assert error(_) = evaluate(evaluator, "E.map([], & &1)", :code_5, [:code_2])
++    end
++
++    test "in the first evaluation the context is the initial one", %{evaluator: evaluator} do
++      failing_code = """
++      import Integer
++      Process.put(:x, 1)
++      raise "failed"
++      """
++
++      assert error(_) = evaluate(evaluator, failing_code, :code_1, [])
++
++      initial_context = Evaluator.get_evaluation_context(evaluator, [])
++      context = Evaluator.get_evaluation_context(evaluator, [:code_1])
++
++      assert_same_context(context, initial_context)
++      assert context.pdict == %{}
++
++      assert "nil" == evaluate_text(evaluator, "Process.get(:x)", :code_2, [:code_1])
++    end
++
++    test "keeps imports and process dictionary when the code is in erlang",
++         %{evaluator: evaluator} do
++      code = """
++      import Integer
++      Process.put(:x, 1)
++      """
++
++      assert terminal_text(_) = evaluate(evaluator, code, :code_1, [])
++
++      assert error(_) = evaluate(evaluator, "erlang:error(failed).", :code_2, [:code_1], :erlang)
++
++      assert "{true, 1}" ==
++               evaluate_text(
++                 evaluator,
++                 "{is_even(2), Process.get(:x)}",
++                 :code_3,
++                 [:code_2, :code_1]
++               )
++    end
++
++    test "keeps imports in the intellisense context", %{evaluator: evaluator} do
++      assert terminal_text(_) = evaluate(evaluator, "import ExUnit.Assertions", :code_1, [])
++
++      assert error(_) = evaluate(evaluator, "assert false", :code_2, [:code_1])
++
++      intellisense_context = Evaluator.intellisense_context(evaluator, [:code_2, :code_1])
++      assert List.keymember?(intellisense_context.env.functions, ExUnit.Assertions, 0)
++      assert List.keymember?(intellisense_context.env.macros, ExUnit.Assertions, 0)
++
++      intellisense_context = Evaluator.intellisense_context(evaluator, [:code_2])
++      assert List.keymember?(intellisense_context.env.functions, ExUnit.Assertions, 0)
++      assert List.keymember?(intellisense_context.env.macros, ExUnit.Assertions, 0)
++    end
++
++    @tag :with_ebin_path
++    test "does not leave loaded the modules that finished defining",
++         %{evaluator: evaluator, ebin_path: ebin_path} do
++      code1 = """
++      defmodule Livebook.Runtime.EvaluatorTest.FailedModules.Earlier do
++      end
++      """
++
++      failing_code = """
++      defmodule Livebook.Runtime.EvaluatorTest.FailedModules.Outer do
++        defmodule Inner do
++        end
++      end
++
++      defmodule Livebook.Runtime.EvaluatorTest.FailedModules.Struct do
++        defstruct [:name]
++      end
++
++      defmodule Livebook.Runtime.EvaluatorTest.FailedModules.Incomplete do
++        raise "failed while defining"
++      end
++      """
++
++      code2 = """
++      defmodule Livebook.Runtime.EvaluatorTest.FailedModules.Outer do
++        defmodule Inner do
++        end
++      end
++
++      defmodule Livebook.Runtime.EvaluatorTest.FailedModules.Struct do
++        defstruct [:name]
++      end
++      """
++
++      assert terminal_text(_) = evaluate(evaluator, code1, :code_1, [])
++      assert error(_) = evaluate(evaluator, failing_code, :code_2, [:code_1])
++
++      for module <- [
++            Livebook.Runtime.EvaluatorTest.FailedModules.Outer,
++            Livebook.Runtime.EvaluatorTest.FailedModules.Outer.Inner,
++            Livebook.Runtime.EvaluatorTest.FailedModules.Struct,
++            Livebook.Runtime.EvaluatorTest.FailedModules.Incomplete
++          ] do
++        assert :code.is_loaded(module) == false
++        refute Code.ensure_loaded?(module)
++      end
++
++      assert File.ls!(ebin_path) == [
++               "Elixir.Livebook.Runtime.EvaluatorTest.FailedModules.Earlier.beam"
++             ]
++
++      assert Code.ensure_loaded?(Livebook.Runtime.EvaluatorTest.FailedModules.Earlier)
++
++      context = Evaluator.get_evaluation_context(evaluator, [:code_2, :code_1])
++
++      assert context.env.context_modules == [
++               Livebook.Runtime.EvaluatorTest.FailedModules.Earlier
++             ]
++
++      # The modules can be defined again
++      assert terminal_text(_) = evaluate(evaluator, code2, :code_3, [:code_2, :code_1])
++    end
++  end
++
+   describe "doctests" do
+     @describetag :with_ebin_path
+ 
+@@ -1260,6 +1678,23 @@ defmodule Livebook.Runtime.EvaluatorTest do
+       assert_receive {:runtime_evaluation_response, :code_2, terminal_text(ansi_number(1)),
+                       metadata()}
+     end
++
++    test "copies imports and process dictionary through a failed evaluation",
++         %{evaluator: evaluator, parent_evaluator: parent_evaluator} do
++      code = """
++      import Integer
++      Process.put(:x, 1)
++      y = 2
++      """
++
++      assert terminal_text(_) = evaluate(parent_evaluator, code, :code_1, [])
++      assert error(_) = evaluate(parent_evaluator, ~S|raise "failed"|, :code_2, [:code_1])
++
++      Evaluator.initialize_from(evaluator, parent_evaluator, [:code_2, :code_1])
++
++      assert "{true, 1, 2}" ==
++               evaluate_text(evaluator, "{is_even(2), Process.get(:x), y}", :code_3, [])
++    end
+   end
+ 
+   describe "binding order" do
+@@ -1439,6 +1874,39 @@ defmodule Livebook.Runtime.EvaluatorTest do
+ 
+   # Helpers
+ 
++  # Evaluates the given code, awaits the evaluation to finish and
++  # returns the output
++  defp evaluate(evaluator, code, ref, parent_refs, language \\ :elixir) do
++    Evaluator.evaluate_code(evaluator, language, code, ref, parent_refs)
++    assert_receive {:runtime_evaluation_response, ^ref, output, metadata()}, 2_000
++    output
++  end
++
++  # Same as evaluate/5, but expects the evaluation to succeed and
++  # returns the printed result, without any formatting
++  defp evaluate_text(evaluator, code, ref, parent_refs) do
++    assert terminal_text(text) = evaluate(evaluator, code, ref, parent_refs)
++    clean_message(text)
++  end
++
++  # Asserts that an evaluation starting from either of the contexts
++  # would see exactly the same bindings, variables, aliases, requires,
++  # modules, imports and process dictionary
++  defp assert_same_context(context, expected_context) do
++    assert context.binding == expected_context.binding
++    assert context.env.aliases == expected_context.env.aliases
++    assert context.env.requires == expected_context.env.requires
++    assert context.env.context_modules == expected_context.env.context_modules
++    assert context.env.functions == expected_context.env.functions
++    assert context.env.macros == expected_context.env.macros
++    assert context.pdict == expected_context.pdict
++
++    # Versions are reassigned whenever contexts are merged, so we
++    # only compare the variables
++    assert Enum.sort(Map.keys(context.env.versioned_vars)) ==
++             Enum.sort(Map.keys(expected_context.env.versioned_vars))
++  end
++
+   # Returns a code that spawns a widget process, registers
+   # a pointer for it and adds monitoring, then returns widget
+   # pid from the evaluation

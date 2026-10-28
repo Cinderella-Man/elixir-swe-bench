@@ -1,0 +1,1685 @@
+diff --git a/lib/accent/versions/version_resolver.ex b/lib/accent/versions/version_resolver.ex
+new file mode 100644
+index 0000000..563c9e8
+--- /dev/null
++++ b/lib/accent/versions/version_resolver.ex
+@@ -0,0 +1,120 @@
++defmodule Accent.VersionResolver do
++  @moduledoc """
++  Resolve the version of a project that is referenced by a request.
++
++  A request references a version with a string that is either the tag of one
++  of the versions of the project (`master`, `1.2.0`) or a semantic version
++  requirement (`~> 1.1`, `>= 1.0.0 and < 2.0.0`).
++
++    * A version with a tag that is exactly the string is always preferred.
++    * Otherwise, when the string is a valid requirement, the highest version of
++      the project that satisfies it is selected, whatever the order in which the
++      versions were created. The tags are read as semantic versions, with an
++      optional leading `v` (`v1.2.0`), and the tags that are not semantic
++      versions (`latest`, `1.2`) are ignored.
++  """
++
++  # `Version` is the Elixir module that handles semantic versions,
++  # the schema of the versions of a project is `Accent.Version`.
++  alias Accent.Repo
++  alias Accent.Scopes.Version, as: VersionScope
++
++  @doc """
++  Returns the version of the project referenced by the string,
++  or `nil` when the project has no such version.
++  """
++  @spec resolve(String.t(), any()) :: Accent.Version.t() | nil
++  def resolve(project_id, param) when is_binary(project_id) do
++    exact(project_id, param) || compatible(project_id, param)
++  end
++
++  @doc """
++  Returns the highest version among the versions that satisfy the requirement,
++  or `nil` when there are none or when the requirement is not valid.
++
++  The tags are read as semantic versions, with an optional leading `v`, and the tags that are not versions are ignored.
++  When many tags are the same version (like `1.2.0` and `v1.2.0`), the first tag in alphabetical order is selected.
++
++  ## Examples
++
++    iex> versions = Enum.map(~w(1.0.0 v1.10.0 1.9.0 2.0.0 latest), &%Accent.Version{tag: &1})
++    iex> Accent.VersionResolver.highest_compatible(versions, "~> 1.1").tag
++    "v1.10.0"
++    iex> Accent.VersionResolver.highest_compatible(versions, ">= 1.0.0 and < 1.5.0").tag
++    "1.0.0"
++    iex> Accent.VersionResolver.highest_compatible(versions, "~> 3.0")
++    nil
++    iex> Accent.VersionResolver.highest_compatible(versions, "latest")
++    nil
++    iex> Accent.VersionResolver.highest_compatible([%Accent.Version{tag: "v1.2.0"}, %Accent.Version{tag: "1.2.0"}], "~> 1.1").tag
++    "1.2.0"
++  """
++  @spec highest_compatible([Accent.Version.t()], String.t() | Version.Requirement.t()) :: Accent.Version.t() | nil
++  def highest_compatible(versions, requirement) when is_binary(requirement) do
++    case parse_requirement(requirement) do
++      {:ok, requirement} -> highest_compatible(versions, requirement)
++      :error -> nil
++    end
++  end
++
++  def highest_compatible(versions, requirement = %Version.Requirement{}) do
++    versions
++    |> Enum.flat_map(&parse_tag/1)
++    |> Enum.filter(fn {semantic_version, _version} -> Version.match?(semantic_version, requirement) end)
++    |> Enum.reduce(nil, &highest/2)
++    |> case do
++      nil -> nil
++      {_semantic_version, version} -> version
++    end
++  end
++
++  # Same lookup as before the support of requirements, so a request for a tag has the same outcome.
++  defp exact(project_id, tag) do
++    Accent.Version
++    |> VersionScope.from_project(project_id)
++    |> VersionScope.from_tag(tag)
++    |> Repo.one()
++  end
++
++  defp compatible(project_id, requirement) when is_binary(requirement) do
++    case parse_requirement(requirement) do
++      {:ok, requirement} ->
++        Accent.Version
++        |> VersionScope.from_project(project_id)
++        |> Repo.all()
++        |> highest_compatible(requirement)
++
++      :error ->
++        nil
++    end
++  end
++
++  defp compatible(_project_id, _param), do: nil
++
++  defp parse_requirement(requirement) do
++    if String.valid?(requirement) do
++      Version.parse_requirement(requirement)
++    else
++      :error
++    end
++  end
++
++  defp parse_tag(version = %{tag: tag}) when is_binary(tag) do
++    case tag |> String.replace_prefix("v", "") |> Version.parse() do
++      {:ok, semantic_version} -> [{semantic_version, version}]
++      :error -> []
++    end
++  end
++
++  defp parse_tag(_version), do: []
++
++  defp highest(candidate, nil), do: candidate
++
++  defp highest(candidate = {semantic_version, version}, current = {current_semantic_version, current_version}) do
++    case Version.compare(semantic_version, current_semantic_version) do
++      :gt -> candidate
++      :lt -> current
++      :eq -> if version.tag < current_version.tag, do: candidate, else: current
++    end
++  end
++end
+diff --git a/lib/web/controllers/export_controller.ex b/lib/web/controllers/export_controller.ex
+index 8ba2271..684941d 100644
+--- a/lib/web/controllers/export_controller.ex
++++ b/lib/web/controllers/export_controller.ex
+@@ -6,14 +6,14 @@ defmodule Accent.ExportController do
+   alias Accent.Scopes.Document, as: DocumentScope
+   alias Accent.Scopes.Revision, as: RevisionScope
+   alias Accent.Scopes.Translation, as: Scope
+-  alias Accent.Scopes.Version, as: VersionScope
+ 
+   alias Accent.{
+     Document,
+     Project,
+     Repo,
+     Translation,
+-    Version
++    Version,
++    VersionResolver
+   }
+ 
+   plug(Plug.Assign, %{canary_action: :export_revision})
+@@ -46,7 +46,8 @@ defmodule Accent.ExportController do
+   ### Optional params
+     - `order_by`
+     - `inline_render`
+-    - `version`
++    - `version`: The tag of a version or a semantic version requirement (like `~> 1.1`).
++      The version with this exact tag is preferred, otherwise the highest compatible version of the project is used.
+ 
+   ### Response
+ 
+@@ -137,10 +138,8 @@ defmodule Accent.ExportController do
+   end
+ 
+   defp fetch_version(conn = %{params: %{"version" => version_param}, assigns: %{project: project}}, _) do
+-    Version
+-    |> VersionScope.from_project(project.id)
+-    |> VersionScope.from_tag(version_param)
+-    |> Repo.one()
++    project.id
++    |> VersionResolver.resolve(version_param)
+     |> case do
+       version = %Version{} ->
+         assign(conn, :version, version)
+diff --git a/lib/web/controllers/export_jipt_controller.ex b/lib/web/controllers/export_jipt_controller.ex
+index 175585b..2cee992 100644
+--- a/lib/web/controllers/export_jipt_controller.ex
++++ b/lib/web/controllers/export_jipt_controller.ex
+@@ -6,14 +6,14 @@ defmodule Accent.ExportJIPTController do
+   alias Accent.Scopes.Document, as: DocumentScope
+   alias Accent.Scopes.Revision, as: RevisionScope
+   alias Accent.Scopes.Translation, as: Scope
+-  alias Accent.Scopes.Version, as: VersionScope
+ 
+   alias Accent.{
+     Document,
+     Project,
+     Repo,
+     Translation,
+-    Version
++    Version,
++    VersionResolver
+   }
+ 
+   plug(Plug.Assign, %{canary_action: :export_revision})
+@@ -39,6 +39,11 @@ defmodule Accent.ExportJIPTController do
+     - `document_format`
+     - `document_path`
+ 
++  ### Optional params
++    - `inline_render`
++    - `version`: The tag of a version or a semantic version requirement (like `~> 1.1`).
++      The version with this exact tag is preferred, otherwise the highest compatible version of the project is used.
++
+   ### Response
+ 
+     #### Success
+@@ -103,10 +108,8 @@ defmodule Accent.ExportJIPTController do
+   end
+ 
+   defp fetch_version(conn = %{params: %{"version" => version_param}, assigns: %{project: project}}, _) do
+-    Version
+-    |> VersionScope.from_project(project.id)
+-    |> VersionScope.from_tag(version_param)
+-    |> Repo.one()
++    project.id
++    |> VersionResolver.resolve(version_param)
+     |> case do
+       version = %Version{} ->
+         assign(conn, :version, version)
+diff --git a/lib/web/controllers/merge_controller.ex b/lib/web/controllers/merge_controller.ex
+index 6d5664d..f84a731 100644
+--- a/lib/web/controllers/merge_controller.ex
++++ b/lib/web/controllers/merge_controller.ex
+@@ -31,6 +31,8 @@ defmodule Accent.MergeController do
+ 
+   ### Optional params
+     - `merge_type` (smart, force or passive), default: smart.
++    - `version`: The tag of a version or a semantic version requirement (like `~> 1.1`).
++      The version with this exact tag is preferred, otherwise the highest compatible version of the project is used.
+ 
+   ### Response
+ 
+@@ -39,7 +41,7 @@ defmodule Accent.MergeController do
+ 
+     #### Error
+     `404` - Unknown revision
+-    `422` - Invalid file
++    `422` - Invalid file or unknown version
+   """
+   def create(conn, _params) do
+     conn.assigns[:movement_context]
+diff --git a/lib/web/controllers/peek_controller.ex b/lib/web/controllers/peek_controller.ex
+index 9d95515..2aae743 100644
+--- a/lib/web/controllers/peek_controller.ex
++++ b/lib/web/controllers/peek_controller.ex
+@@ -32,6 +32,8 @@ defmodule Accent.PeekController do
+ 
+   ### Optional params
+     - `merge_type`
++    - `version`: The tag of a version or a semantic version requirement (like `~> 1.1`).
++      The version with this exact tag is preferred, otherwise the highest compatible version of the project is used.
+ 
+   ### Response
+ 
+@@ -40,6 +42,7 @@ defmodule Accent.PeekController do
+ 
+     #### Error
+     `404` - Unknown project
++    `422` - Unknown version
+   """
+   def sync(conn, _params) do
+     operations =
+@@ -75,6 +78,8 @@ defmodule Accent.PeekController do
+   ### Optional params
+     - `merge_type`
+     - `sync_type`
++    - `version`: The tag of a version or a semantic version requirement (like `~> 1.1`).
++      The version with this exact tag is preferred, otherwise the highest compatible version of the project is used.
+ 
+   ### Response
+ 
+@@ -83,7 +88,7 @@ defmodule Accent.PeekController do
+ 
+     #### Error
+     `404` - Unknown revision
+-    `422` - Invalid file
++    `422` - Invalid file or unknown version
+   """
+   def merge(conn, _params) do
+     operations =
+diff --git a/lib/web/controllers/sync_controller.ex b/lib/web/controllers/sync_controller.ex
+index 9a5d5a4..7efccbf 100644
+--- a/lib/web/controllers/sync_controller.ex
++++ b/lib/web/controllers/sync_controller.ex
+@@ -30,6 +30,8 @@ defmodule Accent.SyncController do
+ 
+   ### Optional params
+     - `sync_type` (smart or passive), default: smart.
++    - `version`: The tag of a version or a semantic version requirement (like `~> 1.1`).
++      The version with this exact tag is preferred, otherwise the highest compatible version of the project is used.
+ 
+   ### Response
+ 
+@@ -38,6 +40,7 @@ defmodule Accent.SyncController do
+ 
+     #### Error
+     `404` - Unknown project
++    `422` - Unknown version
+   """
+   def create(conn, _) do
+     conn.assigns[:movement_context]
+diff --git a/lib/web/plugs/movement_context_parser.ex b/lib/web/plugs/movement_context_parser.ex
+index e5006ae..baad337 100644
+--- a/lib/web/plugs/movement_context_parser.ex
++++ b/lib/web/plugs/movement_context_parser.ex
+@@ -1,9 +1,8 @@
+ defmodule Accent.Plugs.MovementContextParser do
+   use Plug.Builder
+ 
+-  alias Accent.{Document, Repo, Version}
++  alias Accent.{Document, Repo, VersionResolver}
+   alias Accent.Scopes.Document, as: DocumentScope
+-  alias Accent.Scopes.Version, as: VersionScope
+   alias Movement.Context
+ 
+   plug(:validate_params)
+@@ -39,10 +38,8 @@ defmodule Accent.Plugs.MovementContextParser do
+   end
+ 
+   def assign_version(conn = %{assigns: %{project: project}, params: %{"version" => version}}, _) do
+-    Version
+-    |> VersionScope.from_tag(version)
+-    |> VersionScope.from_project(project.id)
+-    |> Repo.one()
++    project.id
++    |> VersionResolver.resolve(version)
+     |> case do
+       nil ->
+         conn
+diff --git a/test/plugs/movement_context_parser_test.exs b/test/plugs/movement_context_parser_test.exs
+index f22aaf8..e5e213a 100644
+--- a/test/plugs/movement_context_parser_test.exs
++++ b/test/plugs/movement_context_parser_test.exs
+@@ -8,7 +8,8 @@ defmodule AccentTest.Plugs.MovementContextParser do
+     Plugs.MovementContextParser,
+     ProjectCreator,
+     Repo,
+-    User
++    User,
++    Version
+   }
+ 
+   def file(filename \\ "simple.json") do
+@@ -212,4 +213,94 @@ defmodule AccentTest.Plugs.MovementContextParser do
+     assert conn.status == 422
+     assert conn.resp_body == "file cannot be parsed"
+   end
++
++  test "assign no version without version param", %{project: project, user: user} do
++    Repo.insert!(%Version{project_id: project.id, user_id: user.id, name: "Master", tag: "master"})
++
++    conn =
++      :get
++      |> conn("/foo", %{document_path: "test.json", document_format: "json", file: file(), language: "fr"})
++      |> assign(:project, project)
++      |> MovementContextParser.call([])
++
++    assert conn.state == :unset
++    assert conn.assigns[:version] == nil
++    assert conn.assigns[:movement_context].assigns[:version] == nil
++  end
++
++  test "assign version from its tag", %{project: project, user: user} do
++    version = Repo.insert!(%Version{project_id: project.id, user_id: user.id, name: "Master", tag: "master"})
++    Repo.insert!(%Version{project_id: project.id, user_id: user.id, name: "Release", tag: "1.0.0"})
++
++    conn =
++      :get
++      |> conn("/foo", %{version: "master", document_path: "test.json", document_format: "json", file: file(), language: "fr"})
++      |> assign(:project, project)
++      |> MovementContextParser.call([])
++
++    assert conn.state == :unset
++    assert conn.assigns[:version].id == version.id
++    assert conn.assigns[:movement_context].assigns[:version].id == version.id
++  end
++
++  test "assign version from a requirement", %{project: project, user: user} do
++    # The versions are created in an order that is neither the semantic order nor the alphabetical order of their tags
++    versions = for tag <- ~w(1.2.0 2.0.0 v1.10.0 1.0.0 latest 1.9.0), do: Repo.insert!(%Version{project_id: project.id, user_id: user.id, name: tag, tag: tag})
++    version = Enum.find(versions, &(&1.tag == "v1.10.0"))
++
++    conn =
++      :get
++      |> conn("/foo", %{version: "~> 1.1", document_path: "test.json", document_format: "json", file: file(), language: "fr"})
++      |> assign(:project, project)
++      |> MovementContextParser.call([])
++
++    assert conn.state == :unset
++    assert conn.assigns[:version].id == version.id
++    assert conn.assigns[:movement_context].assigns[:version].id == version.id
++  end
++
++  test "assign version from its tag when it is also a requirement", %{project: project, user: user} do
++    Repo.insert!(%Version{project_id: project.id, user_id: user.id, name: "Release", tag: "1.2.0"})
++    version = Repo.insert!(%Version{project_id: project.id, user_id: user.id, name: "Literal", tag: "~> 1.1"})
++
++    conn =
++      :get
++      |> conn("/foo", %{version: "~> 1.1", document_path: "test.json", document_format: "json", file: file(), language: "fr"})
++      |> assign(:project, project)
++      |> MovementContextParser.call([])
++
++    assert conn.state == :unset
++    assert conn.assigns[:version].id == version.id
++  end
++
++  test "assign version from a requirement ignores the versions of the other projects", %{project: project, user: user, language: language} do
++    version = Repo.insert!(%Version{project_id: project.id, user_id: user.id, name: "Release", tag: "1.1.0"})
++    {:ok, other_project} = ProjectCreator.create(params: %{main_color: "#f00", name: "Other project", language_id: language.id}, user: user)
++    Repo.insert!(%Version{project_id: other_project.id, user_id: user.id, name: "Release", tag: "1.9.0"})
++
++    conn =
++      :get
++      |> conn("/foo", %{version: "~> 1.1", document_path: "test.json", document_format: "json", file: file(), language: "fr"})
++      |> assign(:project, project)
++      |> MovementContextParser.call([])
++
++    assert conn.state == :unset
++    assert conn.assigns[:version].id == version.id
++  end
++
++  test "unknown version", %{project: project, user: user} do
++    Repo.insert!(%Version{project_id: project.id, user_id: user.id, name: "Release", tag: "1.0.0"})
++
++    for version <- ["foo", "~> 1.1", "> 1.0.0", "~> 1.x", ""] do
++      conn =
++        :get
++        |> conn("/foo", %{version: version, document_path: "test.json", document_format: "json", file: file(), language: "fr"})
++        |> assign(:project, project)
++        |> MovementContextParser.call([])
++
++      assert conn.state == :sent, "version #{version}"
++      assert conn.status == 422, "version #{version}"
++      assert conn.resp_body == "unknown version", "version #{version}"
++    end
++  end
+ end
+diff --git a/test/services/version_resolver_test.exs b/test/services/version_resolver_test.exs
+new file mode 100644
+index 0000000..f03876b
+--- /dev/null
++++ b/test/services/version_resolver_test.exs
+@@ -0,0 +1,249 @@
++defmodule AccentTest.VersionResolver do
++  use Accent.RepoCase
++
++  doctest Accent.VersionResolver
++
++  alias Accent.{Project, Repo, User, Version, VersionResolver}
++
++  setup do
++    user = Repo.insert!(%User{email: "test@test.com"})
++    project = Repo.insert!(%Project{main_color: "#f00", name: "My project"})
++
++    {:ok, [user: user, project: project]}
++  end
++
++  defp insert_versions(project, user, tags) do
++    Enum.map(tags, &Repo.insert!(%Version{project_id: project.id, user_id: user.id, name: "Version #{&1}", tag: &1}))
++  end
++
++  defp resolve(project, param) do
++    case VersionResolver.resolve(project.id, param) do
++      nil -> nil
++      version -> version.tag
++    end
++  end
++
++  describe "resolve/2 with a tag" do
++    test "selects the version with the tag", %{user: user, project: project} do
++      insert_versions(project, user, ~w(master 1.0.0 v1.1.0))
++
++      assert %Version{tag: "master"} = VersionResolver.resolve(project.id, "master")
++      assert %Version{tag: "1.0.0"} = VersionResolver.resolve(project.id, "1.0.0")
++      assert %Version{tag: "v1.1.0"} = VersionResolver.resolve(project.id, "v1.1.0")
++    end
++
++    test "returns nil for an unknown tag", %{user: user, project: project} do
++      insert_versions(project, user, ~w(master 1.0.0))
++
++      assert resolve(project, "develop") == nil
++      assert resolve(project, "Master") == nil
++      assert resolve(project, "v1.0.0") == nil
++      assert resolve(project, "") == nil
++    end
++
++    test "ignores the versions of the other projects", %{user: user, project: project} do
++      other_project = Repo.insert!(%Project{main_color: "#f00", name: "Other project"})
++      insert_versions(other_project, user, ~w(master 1.0.0))
++
++      assert resolve(project, "master") == nil
++      assert resolve(project, "1.0.0") == nil
++      assert resolve(project, "~> 1.0") == nil
++    end
++
++    test "requires a project id", %{user: user, project: project} do
++      insert_versions(project, user, ~w(master))
++
++      assert_raise FunctionClauseError, fn -> VersionResolver.resolve(nil, "master") end
++    end
++  end
++
++  describe "resolve/2 with a requirement" do
++    test "selects the highest compatible version", %{user: user, project: project} do
++      insert_versions(project, user, ~w(1.0.0 1.1.0 1.1.5 1.2.0 2.0.0 2.1.0))
++
++      assert resolve(project, "~> 1.1") == "1.2.0"
++      assert resolve(project, "~> 1.1.0") == "1.1.5"
++      assert resolve(project, "~> 2.0") == "2.1.0"
++      assert resolve(project, ">= 1.0.0") == "2.1.0"
++      assert resolve(project, "> 1.0.0 and < 1.2.0") == "1.1.5"
++      assert resolve(project, "< 1.1.0") == "1.0.0"
++      assert resolve(project, "<= 1.1.0") == "1.1.0"
++      assert resolve(project, "== 1.1.0") == "1.1.0"
++      assert resolve(project, "!= 2.1.0") == "2.0.0"
++      assert resolve(project, "< 1.1.0 or >= 2.1.0") == "2.1.0"
++    end
++
++    test "compares the versions as semantic versions", %{user: user, project: project} do
++      insert_versions(project, user, ~w(1.9.0 1.10.0 1.2.0 1.100.0 1.99.0))
++
++      assert resolve(project, "~> 1.1") == "1.100.0"
++      assert resolve(project, "~> 1.1 and < 1.100.0") == "1.99.0"
++      assert resolve(project, "< 1.10.0") == "1.9.0"
++    end
++
++    test "selects the same version whatever the creation order of the versions", %{user: user} do
++      tags = ~w(1.0.0 v1.1.0 1.1.5 1.2.0 v1.10.0 1.9.0 2.0.0 latest)
++
++      orders = [
++        tags,
++        Enum.reverse(tags),
++        Enum.sort(tags),
++        Enum.sort(tags, &(&1 >= &2)),
++        ~w(1.9.0 latest 1.0.0 2.0.0 v1.10.0 v1.1.0 1.2.0 1.1.5),
++        ~w(v1.10.0 2.0.0 1.9.0 1.0.0 1.2.0 latest 1.1.5 v1.1.0)
++      ]
++
++      for order <- orders do
++        project = Repo.insert!(%Project{main_color: "#f00", name: "Project"})
++        insert_versions(project, user, order)
++
++        assert resolve(project, "~> 1.1") == "v1.10.0", "created in the order #{Enum.join(order, ",")}"
++        assert resolve(project, "~> 1.1.0") == "1.1.5", "created in the order #{Enum.join(order, ",")}"
++        assert resolve(project, "< 1.1.0") == "1.0.0", "created in the order #{Enum.join(order, ",")}"
++      end
++    end
++
++    test "accepts the tags with a leading v", %{user: user, project: project} do
++      insert_versions(project, user, ~w(v1.0.0 v1.1.0 v1.3.0 v2.0.0))
++
++      assert resolve(project, "~> 1.1") == "v1.3.0"
++      assert resolve(project, "~> 1.0.0") == "v1.0.0"
++      assert resolve(project, "1.1.0") == "v1.1.0"
++      assert resolve(project, "== 2.0.0") == "v2.0.0"
++    end
++
++    test "accepts a mix of tags with and without a leading v", %{user: user, project: project} do
++      insert_versions(project, user, ~w(1.0.0 v1.1.0 1.2.0 v1.3.0 1.4.0))
++
++      assert resolve(project, "~> 1.1") == "1.4.0"
++      assert resolve(project, "< 1.4.0") == "v1.3.0"
++      assert resolve(project, "~> 1.1.0") == "v1.1.0"
++    end
++
++    test "ignores the tags that are not versions", %{user: user, project: project} do
++      insert_versions(project, user, ~w(master latest 1 1.2 v1.3 1.2.3.4 1.x release-1.5.0 V1.6.0 vv1.7.0 v v. 9999 1.0.0 v1.1.0))
++
++      assert resolve(project, ">= 0.0.0") == "v1.1.0"
++      assert resolve(project, "~> 1.0") == "v1.1.0"
++      assert resolve(project, "> 1.1.0") == nil
++    end
++
++    test "returns nil when no version is compatible", %{user: user, project: project} do
++      insert_versions(project, user, ~w(1.0.0 1.1.0 2.0.0 latest))
++
++      assert resolve(project, "~> 3.0") == nil
++      assert resolve(project, "> 2.0.0") == nil
++      assert resolve(project, "~> 1.1.1") == nil
++      assert resolve(project, ">= 1.1.0 and < 1.1.0") == nil
++      assert resolve(project, "== 1.0.1") == nil
++    end
++
++    test "returns nil when the project has no versions", %{project: project} do
++      assert resolve(project, "~> 1.1") == nil
++      assert resolve(project, "master") == nil
++    end
++
++    test "returns nil when the requirement is not valid", %{user: user, project: project} do
++      insert_versions(project, user, ~w(1.0.0 1.1.0 2.0.0 latest))
++
++      for requirement <- ["", " ", "~>", "~> 1", "~> 1.x", "~> v1.1", "v1.1.0", "1.1", "latest.0", "and", ">= 1.0.0 and", "=> 1.0.0"] do
++        assert resolve(project, requirement) == nil, "requirement #{inspect(requirement)}"
++      end
++    end
++
++    test "ignores the versions of the other projects", %{user: user, project: project} do
++      other_project = Repo.insert!(%Project{main_color: "#f00", name: "Other project"})
++      insert_versions(other_project, user, ~w(1.1.0 1.9.0 v1.10.0 2.0.0))
++      insert_versions(project, user, ~w(1.0.0 1.2.0 2.0.0))
++
++      assert resolve(project, "~> 1.1") == "1.2.0"
++      assert resolve(other_project, "~> 1.1") == "v1.10.0"
++      assert resolve(project, "~> 1.5") == nil
++    end
++
++    test "returns the version", %{user: user, project: project} do
++      [_, expected_version] = insert_versions(project, user, ~w(1.0.0 v1.1.0))
++
++      assert VersionResolver.resolve(project.id, "~> 1.0").id == expected_version.id
++    end
++
++    test "selects a pre-release version only when it is the highest compatible version", %{user: user, project: project} do
++      insert_versions(project, user, ~w(1.1.0 1.2.0-rc.1))
++      assert resolve(project, "~> 1.1") == "1.2.0-rc.1"
++
++      insert_versions(project, user, ~w(1.2.0))
++      assert resolve(project, "~> 1.1") == "1.2.0"
++    end
++
++    test "selects a version with a build metadata", %{user: user, project: project} do
++      insert_versions(project, user, ~w(1.1.0+build.1 1.2.0+build.1))
++
++      assert resolve(project, "~> 1.1") == "1.2.0+build.1"
++      assert resolve(project, "== 1.1.0") == "1.1.0+build.1"
++    end
++
++    test "selects the first tag in alphabetical order when many tags are the same version", %{user: user} do
++      for order <- [~w(1.2.0 v1.2.0 1.2.0+build), ~w(v1.2.0 1.2.0+build 1.2.0), ~w(1.2.0+build 1.2.0 v1.2.0)] do
++        project = Repo.insert!(%Project{main_color: "#f00", name: "Project"})
++        insert_versions(project, user, order)
++
++        assert resolve(project, "~> 1.1") == "1.2.0", "created in the order #{Enum.join(order, ",")}"
++      end
++    end
++  end
++
++  describe "resolve/2 with a tag that is also a requirement" do
++    test "prefers the tag", %{user: user, project: project} do
++      insert_versions(project, user, ["1.2.0", "2.0.0", "~> 1.1", "~>1.1", ">= 1.0.0"])
++
++      assert resolve(project, "~> 1.1") == "~> 1.1"
++      assert resolve(project, "~>1.1") == "~>1.1"
++      assert resolve(project, ">= 1.0.0") == ">= 1.0.0"
++      assert resolve(project, "~> 1.0") == "1.2.0"
++    end
++
++    test "prefers the tag even when a higher version is compatible", %{user: user, project: project} do
++      insert_versions(project, user, ["1.0.0", "> 0.0.0", "2.0.0"])
++
++      assert resolve(project, "> 0.0.0") == "> 0.0.0"
++      assert resolve(project, "> 0.0.1") == "2.0.0"
++    end
++
++    test "prefers the tag that is the exact version over the same version with a leading v", %{user: user, project: project} do
++      insert_versions(project, user, ~w(v1.2.0 1.2.0 v1.3.0))
++
++      assert resolve(project, "1.2.0") == "1.2.0"
++      assert resolve(project, "v1.2.0") == "v1.2.0"
++      assert resolve(project, "== 1.2.0") == "1.2.0"
++      assert resolve(project, "1.3.0") == "v1.3.0"
++      assert resolve(project, "v1.3.0") == "v1.3.0"
++    end
++  end
++
++  describe "highest_compatible/2" do
++    test "accepts a parsed requirement" do
++      versions = Enum.map(~w(1.0.0 v1.2.0 2.0.0), &%Version{tag: &1})
++      {:ok, requirement} = Elixir.Version.parse_requirement("~> 1.0")
++
++      assert %Version{tag: "v1.2.0"} = VersionResolver.highest_compatible(versions, requirement)
++    end
++
++    test "returns nil for no versions" do
++      assert VersionResolver.highest_compatible([], "~> 1.1") == nil
++    end
++
++    test "returns nil for a requirement that is not valid" do
++      versions = Enum.map(~w(1.0.0 v1.2.0 2.0.0), &%Version{tag: &1})
++
++      assert VersionResolver.highest_compatible(versions, "master") == nil
++      assert VersionResolver.highest_compatible(versions, <<255>>) == nil
++      assert VersionResolver.highest_compatible(versions, "~> 1.1" <> <<255>>) == nil
++    end
++
++    test "ignores the versions without a tag" do
++      versions = [%Version{tag: nil}, %Version{tag: "1.0.0"}]
++
++      assert %Version{tag: "1.0.0"} = VersionResolver.highest_compatible(versions, ">= 0.0.0")
++    end
++  end
++end
+diff --git a/test/web/controllers/export_controller_test.exs b/test/web/controllers/export_controller_test.exs
+index 3fba158..c5bff09 100644
+--- a/test/web/controllers/export_controller_test.exs
++++ b/test/web/controllers/export_controller_test.exs
+@@ -185,4 +185,151 @@ defmodule AccentTest.ExportController do
+              "ok": "bar"
+            """
+   end
++
++  test "export version with a requirement selects the highest compatible version", %{conn: conn, user: user, project: project, revision: revision, language: language} do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++
++    # The versions are created in an order that is neither the semantic order nor the alphabetical order of their tags
++    for {tag, key} <- [{"1.2.0", "one_two"}, {"2.0.0", "two"}, {"v1.10.0", "one_ten"}, {"1.0.0", "one"}, {"latest", "latest"}, {"1.9.0", "one_nine"}] do
++      insert_translation(revision, document, key, insert_version(project, user, tag))
++    end
++
++    insert_translation(revision, document, "without_version", nil)
++
++    params = %{version: "~> 1.1", project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++    response = get(conn, export_path(conn, [], params))
++
++    assert response.status == 200
++
++    assert response.resp_body == """
++           {
++             "one_ten": "text of one_ten"
++           }
++           """
++  end
++
++  test "export version with various requirements", %{conn: conn, user: user, project: project, revision: revision, language: language} do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++
++    for {tag, key} <- [{"1.1.5", "one_one_five"}, {"2.0.0", "two"}, {"1.0.0", "one"}, {"v1.2.0", "one_two"}, {"1.1.0", "one_one"}] do
++      insert_translation(revision, document, key, insert_version(project, user, tag))
++    end
++
++    requirements = [
++      {"~> 1.1", "one_two"},
++      {"~> 1.1.0", "one_one_five"},
++      {">= 1.0.0 and < 1.2.0", "one_one_five"},
++      {"< 1.1.0", "one"},
++      {">= 1.0.0", "two"},
++      {"== 1.1.0", "one_one"},
++      {"!= 2.0.0", "one_two"}
++    ]
++
++    for {requirement, key} <- requirements do
++      params = %{version: requirement, project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++      response = get(conn, export_path(conn, [], params))
++
++      assert response.status == 200, "requirement #{requirement}"
++      assert response.resp_body == "{\n  \"#{key}\": \"text of #{key}\"\n}\n", "requirement #{requirement}"
++    end
++  end
++
++  test "export version with an exact version accepts a tag with a leading v", %{conn: conn, user: user, project: project, revision: revision, language: language} do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++    insert_translation(revision, document, "prefixed", insert_version(project, user, "v1.2.0"))
++    insert_translation(revision, document, "other", insert_version(project, user, "v1.3.0"))
++
++    params = %{version: "1.2.0", project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++    response = get(conn, export_path(conn, [], params))
++
++    assert response.resp_body == """
++           {
++             "prefixed": "text of prefixed"
++           }
++           """
++  end
++
++  test "export version prefers a tag that is the exact version", %{conn: conn, user: user, project: project, revision: revision, language: language} do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++    insert_translation(revision, document, "prefixed", insert_version(project, user, "v1.2.0"))
++    insert_translation(revision, document, "plain", insert_version(project, user, "1.2.0"))
++
++    for {version, key} <- [{"1.2.0", "plain"}, {"v1.2.0", "prefixed"}] do
++      params = %{version: version, project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++      response = get(conn, export_path(conn, [], params))
++
++      assert response.resp_body == "{\n  \"#{key}\": \"text of #{key}\"\n}\n", "version #{version}"
++    end
++  end
++
++  test "export version prefers a tag that is the exact requirement", %{conn: conn, user: user, project: project, revision: revision, language: language} do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++    insert_translation(revision, document, "compatible", insert_version(project, user, "1.2.0"))
++    insert_translation(revision, document, "literal", insert_version(project, user, "~> 1.1"))
++
++    params = %{version: "~> 1.1", project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++    response = get(conn, export_path(conn, [], params))
++
++    assert response.resp_body == """
++           {
++             "literal": "text of literal"
++           }
++           """
++  end
++
++  test "export version with a requirement ignores the versions of the other projects", %{conn: conn, user: user, project: project, revision: revision, language: language} do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++    insert_translation(revision, document, "ok", insert_version(project, user, "1.1.0"))
++
++    other_project = %Project{main_color: "#f00", name: "Other project"} |> Repo.insert!()
++    other_revision = %Revision{language_id: language.id, project_id: other_project.id, master: true} |> Repo.insert!()
++    other_document = %Document{project_id: other_project.id, path: "test2", format: "json"} |> Repo.insert!()
++    insert_translation(other_revision, other_document, "other", insert_version(other_project, user, "1.9.0"))
++
++    params = %{version: "~> 1.1", project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++    response = get(conn, export_path(conn, [], params))
++
++    assert response.resp_body == """
++           {
++             "ok": "text of ok"
++           }
++           """
++  end
++
++  test "export version with a requirement that no version of the project satisfies", %{conn: conn, user: user, project: project, revision: revision, language: language} do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++
++    for {tag, key} <- [{"1.0.0", "one"}, {"2.0.0", "two"}, {"latest", "latest"}, {"1.5", "one_five"}, {"v1", "v_one"}] do
++      insert_translation(revision, document, key, insert_version(project, user, tag))
++    end
++
++    other_project = %Project{main_color: "#f00", name: "Other project"} |> Repo.insert!()
++    insert_version(other_project, user, "1.5.0")
++
++    for requirement <- ["~> 1.1", "> 2.0.0", "== 1.5.0", "~> 1.x", ">= 1.0.0 and < 1.0.0", "~> 1", "~>", ""] do
++      params = %{version: requirement, project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++      response = get(conn, export_path(conn, [], params))
++
++      assert response.status == 404, "requirement #{requirement}"
++    end
++  end
++
++  test "export version with a requirement in a project without versions", %{conn: conn, project: project, language: language} do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++
++    params = %{version: "~> 1.1", project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++    response = get(conn, export_path(conn, [], params))
++
++    assert response.status == 404
++  end
++
++  defp insert_version(project, user, tag) do
++    %Version{project_id: project.id, user_id: user.id, name: "Version #{tag}", tag: tag} |> Repo.insert!()
++  end
++
++  defp insert_translation(revision, document, key, version) do
++    text = "text of #{key}"
++
++    %Translation{revision_id: revision.id, key: key, corrected_text: text, proposed_text: text, document_id: document.id, version_id: version && version.id} |> Repo.insert!()
++  end
+ end
+diff --git a/test/web/controllers/export_jipt_controller_test.exs b/test/web/controllers/export_jipt_controller_test.exs
+index 5783d0e..d9b2f95 100644
+--- a/test/web/controllers/export_jipt_controller_test.exs
++++ b/test/web/controllers/export_jipt_controller_test.exs
+@@ -8,7 +8,8 @@ defmodule AccentTest.ExportJIPTController do
+     Repo,
+     Revision,
+     Translation,
+-    User
++    User,
++    Version
+   }
+ 
+   @user %User{email: "test@test.com"}
+@@ -110,4 +111,127 @@ defmodule AccentTest.ExportJIPTController do
+              "test": "{^test@test2}"
+            """
+   end
++
++  test "export version", %{conn: conn, user: user, project: project, revision: revision, language: language} do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++    insert_translation(revision, document, "ok", nil)
++    insert_translation(revision, document, "test", insert_version(project, user, "master"))
++
++    params = %{version: "master", project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++    response = get(conn, export_jipt_path(conn, [], params))
++
++    assert response.status == 200
++
++    assert response.resp_body == """
++           {
++             "test": "{^test@test2}"
++           }
++           """
++  end
++
++  test "export without version", %{conn: conn, user: user, project: project, revision: revision, language: language} do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++    insert_translation(revision, document, "ok", nil)
++    insert_translation(revision, document, "test", insert_version(project, user, "master"))
++
++    params = %{project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++    response = get(conn, export_jipt_path(conn, [], params))
++
++    assert response.resp_body == """
++           {
++             "ok": "{^ok@test2}"
++           }
++           """
++  end
++
++  test "export with unknown version", %{conn: conn, user: user, project: project, revision: revision, language: language} do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++    insert_translation(revision, document, "test", insert_version(project, user, "master"))
++
++    params = %{version: "foo", project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++    response = get(conn, export_jipt_path(conn, [], params))
++
++    assert response.status == 404
++  end
++
++  test "export version with a requirement selects the highest compatible version", %{conn: conn, user: user, project: project, revision: revision, language: language} do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++
++    # The versions are created in an order that is neither the semantic order nor the alphabetical order of their tags
++    for {tag, key} <- [{"1.2.0", "one_two"}, {"2.0.0", "two"}, {"v1.10.0", "one_ten"}, {"1.0.0", "one"}, {"latest", "latest"}, {"1.9.0", "one_nine"}] do
++      insert_translation(revision, document, key, insert_version(project, user, tag))
++    end
++
++    insert_translation(revision, document, "without_version", nil)
++
++    params = %{version: "~> 1.1", project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++    response = get(conn, export_jipt_path(conn, [], params))
++
++    assert response.status == 200
++
++    assert response.resp_body == """
++           {
++             "one_ten": "{^one_ten@test2}"
++           }
++           """
++  end
++
++  test "export version prefers a tag that is the exact requirement", %{conn: conn, user: user, project: project, revision: revision, language: language} do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++    insert_translation(revision, document, "compatible", insert_version(project, user, "1.2.0"))
++    insert_translation(revision, document, "literal", insert_version(project, user, "~> 1.1"))
++
++    params = %{version: "~> 1.1", project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++    response = get(conn, export_jipt_path(conn, [], params))
++
++    assert response.resp_body == """
++           {
++             "literal": "{^literal@test2}"
++           }
++           """
++  end
++
++  test "export version with a requirement ignores the versions of the other projects", %{conn: conn, user: user, project: project, revision: revision, language: language} do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++    insert_translation(revision, document, "ok", insert_version(project, user, "1.1.0"))
++
++    other_project = %Project{main_color: "#f00", name: "Other project"} |> Repo.insert!()
++    other_revision = %Revision{language_id: language.id, project_id: other_project.id, master: true} |> Repo.insert!()
++    other_document = %Document{project_id: other_project.id, path: "test2", format: "json"} |> Repo.insert!()
++    insert_translation(other_revision, other_document, "other", insert_version(other_project, user, "1.9.0"))
++
++    params = %{version: "~> 1.1", project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++    response = get(conn, export_jipt_path(conn, [], params))
++
++    assert response.resp_body == """
++           {
++             "ok": "{^ok@test2}"
++           }
++           """
++  end
++
++  test "export version with a requirement that no version of the project satisfies", %{conn: conn, user: user, project: project, revision: revision, language: language} do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++
++    for {tag, key} <- [{"1.0.0", "one"}, {"2.0.0", "two"}, {"latest", "latest"}] do
++      insert_translation(revision, document, key, insert_version(project, user, tag))
++    end
++
++    for requirement <- ["~> 1.1", "> 2.0.0", "~> 1.x", ""] do
++      params = %{version: requirement, project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++      response = get(conn, export_jipt_path(conn, [], params))
++
++      assert response.status == 404, "requirement #{requirement}"
++    end
++  end
++
++  defp insert_version(project, user, tag) do
++    %Version{project_id: project.id, user_id: user.id, name: "Version #{tag}", tag: tag} |> Repo.insert!()
++  end
++
++  defp insert_translation(revision, document, key, version) do
++    text = "text of #{key}"
++
++    %Translation{revision_id: revision.id, key: key, corrected_text: text, proposed_text: text, document_id: document.id, version_id: version && version.id} |> Repo.insert!()
++  end
+ end
+diff --git a/test/web/controllers/merge_controller_test.exs b/test/web/controllers/merge_controller_test.exs
+index 37962ec..f5b9305 100644
+--- a/test/web/controllers/merge_controller_test.exs
++++ b/test/web/controllers/merge_controller_test.exs
+@@ -15,7 +15,8 @@ defmodule AccentTest.MergeController do
+     Repo,
+     Revision,
+     Translation,
+-    User
++    User,
++    Version
+   }
+ 
+   @user %User{email: "test@test.com"}
+@@ -128,4 +129,201 @@ defmodule AccentTest.MergeController do
+     assert merge_operation.user_id == user.id
+     assert merge_operation.revision_id == revision.id
+   end
++
++  test "merge with a version", %{user: user, access_token: access_token, conn: conn, project: project, revision: revision, language: language} do
++    insert_version(project, user, "master")
++    version = insert_version(project, user, "1.0.0")
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++    translation = insert_translation(revision, document, "initial", version)
++    unversioned_translation = insert_translation(revision, document, "initial", nil)
++
++    body = %{file: file(), version: "1.0.0", project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++
++    Accent.Hook.BroadcasterMock
++    |> expect(:notify, fn %{event: "merge"} -> :ok end)
++
++    response =
++      conn
++      |> put_req_header("authorization", "Bearer #{access_token.token}")
++      |> post(merge_path(conn, []), body)
++
++    assert response.status == 200
++
++    merge_operation = from(o in Operation, where: [action: ^"merge"]) |> Repo.one()
++    merge_on_proposed_operation = from(o in Operation, where: [action: ^"merge_on_proposed"]) |> Repo.one()
++
++    assert merge_operation.version_id == version.id
++    assert merge_on_proposed_operation.translation_id == translation.id
++    assert Repo.get!(Translation, translation.id).corrected_text == "F"
++    assert_unchanged([unversioned_translation])
++  end
++
++  test "merge with a version requirement", %{user: user, access_token: access_token, conn: conn, project: project, revision: revision, language: language} do
++    # The versions are created in an order that is neither the semantic order nor the alphabetical order of their tags
++    versions = for tag <- ~w(1.2.0 2.0.0 v1.10.0 1.0.0 latest 1.9.0), do: insert_version(project, user, tag)
++    selected_version = Enum.find(versions, &(&1.tag == "v1.10.0"))
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++
++    selected_translation = insert_translation(revision, document, "initial", selected_version)
++
++    # The translations outside of the selected version are not changed
++    other_translations =
++      for version <- [nil | versions -- [selected_version]] do
++        insert_translation(revision, document, "initial", version)
++      end
++
++    body = %{file: file(), version: "~> 1.1", project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++
++    Accent.Hook.BroadcasterMock
++    |> expect(:notify, fn %{event: "merge"} -> :ok end)
++
++    response =
++      conn
++      |> put_req_header("authorization", "Bearer #{access_token.token}")
++      |> post(merge_path(conn, []), body)
++
++    assert response.status == 200
++
++    merge_operation = from(o in Operation, where: [action: ^"merge"]) |> Repo.one()
++    merge_on_proposed_operation = from(o in Operation, where: [action: ^"merge_on_proposed"]) |> Repo.one()
++
++    assert merge_operation.version_id == selected_version.id
++    assert merge_operation.revision_id == revision.id
++    assert merge_on_proposed_operation.batch_operation_id == merge_operation.id
++    assert merge_on_proposed_operation.translation_id == selected_translation.id
++    assert Repo.get!(Translation, selected_translation.id).corrected_text == "F"
++    assert_unchanged(other_translations)
++  end
++
++  test "merge with a version requirement prefers a tag that is the exact requirement", %{
++    user: user,
++    access_token: access_token,
++    conn: conn,
++    project: project,
++    revision: revision,
++    language: language
++  } do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++    compatible_translation = insert_translation(revision, document, "initial", insert_version(project, user, "1.2.0"))
++    translation = insert_translation(revision, document, "initial", insert_version(project, user, "~> 1.1"))
++
++    body = %{file: file(), version: "~> 1.1", project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++
++    Accent.Hook.BroadcasterMock
++    |> expect(:notify, fn %{event: "merge"} -> :ok end)
++
++    response =
++      conn
++      |> put_req_header("authorization", "Bearer #{access_token.token}")
++      |> post(merge_path(conn, []), body)
++
++    assert response.status == 200
++
++    merge_on_proposed_operation = from(o in Operation, where: [action: ^"merge_on_proposed"]) |> Repo.one()
++
++    assert merge_on_proposed_operation.translation_id == translation.id
++    assert_unchanged([compatible_translation])
++  end
++
++  test "merge with a version requirement ignores the versions of the other projects", %{
++    user: user,
++    access_token: access_token,
++    conn: conn,
++    project: project,
++    revision: revision,
++    language: language
++  } do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++    translation = insert_translation(revision, document, "initial", insert_version(project, user, "1.1.0"))
++
++    other_project = %Project{main_color: "#f00", name: "Other project"} |> Repo.insert!()
++    other_revision = %Revision{language_id: language.id, project_id: other_project.id, master: true} |> Repo.insert!()
++    other_document = %Document{project_id: other_project.id, path: "test2", format: "json"} |> Repo.insert!()
++    other_translation = insert_translation(other_revision, other_document, "initial", insert_version(other_project, user, "1.9.0"))
++
++    body = %{file: file(), version: "~> 1.1", project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++
++    Accent.Hook.BroadcasterMock
++    |> expect(:notify, fn %{event: "merge"} -> :ok end)
++
++    response =
++      conn
++      |> put_req_header("authorization", "Bearer #{access_token.token}")
++      |> post(merge_path(conn, []), body)
++
++    assert response.status == 200
++
++    merge_on_proposed_operation = from(o in Operation, where: [action: ^"merge_on_proposed"]) |> Repo.one()
++
++    assert merge_on_proposed_operation.translation_id == translation.id
++    assert_unchanged([other_translation])
++  end
++
++  test "merge with an unknown version", %{access_token: access_token, conn: conn, project: project, revision: revision, language: language} do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++    translation = insert_translation(revision, document, "initial", nil)
++
++    body = %{file: file(), version: "foo", project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++
++    response =
++      conn
++      |> put_req_header("authorization", "Bearer #{access_token.token}")
++      |> post(merge_path(conn, []), body)
++
++    assert response.status == 422
++    assert response.resp_body == "unknown version"
++    assert Repo.all(Operation) == []
++    assert_unchanged([translation])
++  end
++
++  test "merge with a version requirement that no version of the project satisfies", %{
++    user: user,
++    access_token: access_token,
++    conn: conn,
++    project: project,
++    revision: revision,
++    language: language
++  } do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++
++    translations =
++      for tag <- ~w(1.0.0 2.0.0 latest) do
++        insert_translation(revision, document, "initial", insert_version(project, user, tag))
++      end
++
++    other_project = %Project{main_color: "#f00", name: "Other project"} |> Repo.insert!()
++    insert_version(other_project, user, "1.5.0")
++
++    for requirement <- ["~> 1.1", "> 2.0.0", "~> 1.x"] do
++      body = %{file: file(), version: requirement, project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++
++      response =
++        conn
++        |> put_req_header("authorization", "Bearer #{access_token.token}")
++        |> post(merge_path(conn, []), body)
++
++      assert response.status == 422, "requirement #{requirement}"
++      assert response.resp_body == "unknown version", "requirement #{requirement}"
++    end
++
++    assert Repo.all(Operation) == []
++    assert_unchanged(translations)
++  end
++
++  @translation_fields ~w(key proposed_text corrected_text conflicted_text conflicted removed locked version_id document_id revision_id)a
++
++  defp insert_version(project, user, tag) do
++    %Version{project_id: project.id, user_id: user.id, name: "Version #{tag}", tag: tag} |> Repo.insert!()
++  end
++
++  defp insert_translation(revision, document, text, version) do
++    %Translation{revision_id: revision.id, key: "test", conflicted: true, corrected_text: text, proposed_text: text, document_id: document.id, version_id: version && version.id}
++    |> Repo.insert!()
++  end
++
++  defp assert_unchanged(translations) do
++    for translation <- translations do
++      assert Map.take(Repo.get!(Translation, translation.id), @translation_fields) == Map.take(translation, @translation_fields)
++    end
++  end
+ end
+diff --git a/test/web/controllers/peek_controller_test.exs b/test/web/controllers/peek_controller_test.exs
+index f3150e9..0cfbc73 100644
+--- a/test/web/controllers/peek_controller_test.exs
++++ b/test/web/controllers/peek_controller_test.exs
+@@ -13,7 +13,8 @@ defmodule AccentTest.PeekController do
+     Repo,
+     Revision,
+     Translation,
+-    User
++    User,
++    Version
+   }
+ 
+   @user %User{email: "test@test.com"}
+@@ -172,4 +173,243 @@ defmodule AccentTest.PeekController do
+              }
+            ]
+   end
++
++  test "merge with a version requirement", %{access_token: access_token, conn: conn, user: user, project: project, revision: revision, language: language} do
++    # The versions are created in an order that is neither the semantic order nor the alphabetical order of their tags
++    versions = for tag <- ~w(1.2.0 2.0.0 v1.10.0 1.0.0 latest 1.9.0), do: insert_version(project, user, tag)
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++
++    for version <- [nil | versions] do
++      insert_translation(revision, document, "test", "text of #{(version && version.tag) || "unversioned"}", version)
++    end
++
++    body = %{file: file(), version: "~> 1.1", project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++
++    Accent.Hook.BroadcasterMock
++    |> expect(:notify, fn %{event: "peek_merge"} -> :ok end)
++
++    response =
++      conn
++      |> put_req_header("authorization", "Bearer #{access_token.token}")
++      |> post(peek_add_translations_path(conn, :merge), body)
++      |> json_response(200)
++
++    assert get_in(response, ["data", "stats", revision.id]) == %{"merge_on_proposed" => 1}
++
++    assert get_in(response, ["data", "operations", revision.id]) == [
++             %{
++               "action" => "merge_on_proposed",
++               "key" => "test",
++               "previous-text" => "text of v1.10.0",
++               "text" => "F"
++             }
++           ]
++  end
++
++  test "merge with a version", %{access_token: access_token, conn: conn, user: user, project: project, revision: revision, language: language} do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++
++    for tag <- ~w(1.0.0 master v1.2.0) do
++      insert_translation(revision, document, "test", "text of #{tag}", insert_version(project, user, tag))
++    end
++
++    body = %{file: file(), version: "master", project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++
++    Accent.Hook.BroadcasterMock
++    |> expect(:notify, fn %{event: "peek_merge"} -> :ok end)
++
++    response =
++      conn
++      |> put_req_header("authorization", "Bearer #{access_token.token}")
++      |> post(peek_add_translations_path(conn, :merge), body)
++      |> json_response(200)
++
++    assert get_in(response, ["data", "operations", revision.id]) == [
++             %{
++               "action" => "merge_on_proposed",
++               "key" => "test",
++               "previous-text" => "text of master",
++               "text" => "F"
++             }
++           ]
++  end
++
++  test "merge with a version requirement prefers a tag that is the exact requirement", %{
++    access_token: access_token,
++    conn: conn,
++    user: user,
++    project: project,
++    revision: revision,
++    language: language
++  } do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++
++    for tag <- ["1.2.0", "~> 1.1"] do
++      insert_translation(revision, document, "test", "text of #{tag}", insert_version(project, user, tag))
++    end
++
++    body = %{file: file(), version: "~> 1.1", project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++
++    Accent.Hook.BroadcasterMock
++    |> expect(:notify, fn %{event: "peek_merge"} -> :ok end)
++
++    response =
++      conn
++      |> put_req_header("authorization", "Bearer #{access_token.token}")
++      |> post(peek_add_translations_path(conn, :merge), body)
++      |> json_response(200)
++
++    assert get_in(response, ["data", "operations", revision.id]) == [
++             %{
++               "action" => "merge_on_proposed",
++               "key" => "test",
++               "previous-text" => "text of ~> 1.1",
++               "text" => "F"
++             }
++           ]
++  end
++
++  test "merge with an unknown version", %{access_token: access_token, conn: conn, user: user, project: project, revision: revision, language: language} do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++    insert_translation(revision, document, "test", "initial", insert_version(project, user, "1.0.0"))
++
++    for version <- ["foo", "~> 1.1", "> 1.0.0"] do
++      body = %{file: file(), version: version, project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++
++      response =
++        conn
++        |> put_req_header("authorization", "Bearer #{access_token.token}")
++        |> post(peek_add_translations_path(conn, :merge), body)
++
++      assert response.status == 422, "version #{version}"
++      assert response.resp_body == "unknown version", "version #{version}"
++    end
++  end
++
++  test "sync with a version requirement", %{access_token: access_token, conn: conn, user: user, project: project, revision: revision, language: language} do
++    # The versions are created in an order that is neither the semantic order nor the alphabetical order of their tags
++    versions = for tag <- ~w(1.2.0 2.0.0 v1.10.0 1.0.0 latest 1.9.0), do: insert_version(project, user, tag)
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++
++    for version <- [nil | versions] do
++      insert_translation(revision, document, "test", "text of #{(version && version.tag) || "unversioned"}", version)
++      insert_translation(revision, document, "other", "text of other in #{(version && version.tag) || "unversioned"}", version)
++    end
++
++    body = %{file: file(), version: "~> 1.1", project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++
++    Accent.Hook.BroadcasterMock
++    |> expect(:notify, fn %{event: "peek_sync"} -> :ok end)
++
++    response =
++      conn
++      |> put_req_header("authorization", "Bearer #{access_token.token}")
++      |> post(peek_sync_path(conn, :sync), body)
++      |> json_response(200)
++
++    assert get_in(response, ["data", "stats", revision.id]) == %{"conflict_on_proposed" => 1, "new" => 2, "remove" => 1}
++
++    assert get_in(response, ["data", "operations", revision.id]) == [
++             %{
++               "action" => "conflict_on_proposed",
++               "key" => "test",
++               "previous-text" => "text of v1.10.0",
++               "text" => "F"
++             },
++             %{
++               "action" => "new",
++               "key" => "test2",
++               "previous-text" => "",
++               "text" => "D"
++             },
++             %{
++               "action" => "new",
++               "key" => "test3",
++               "previous-text" => "",
++               "text" => "New history please"
++             },
++             %{
++               "action" => "remove",
++               "key" => "other",
++               "previous-text" => "text of other in v1.10.0",
++               "text" => nil
++             }
++           ]
++  end
++
++  test "sync with a version", %{access_token: access_token, conn: conn, user: user, project: project, revision: revision, language: language} do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++
++    for tag <- ~w(1.0.0 master v1.2.0) do
++      insert_translation(revision, document, "test", "text of #{tag}", insert_version(project, user, tag))
++    end
++
++    body = %{file: file(), version: "master", project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++
++    Accent.Hook.BroadcasterMock
++    |> expect(:notify, fn %{event: "peek_sync"} -> :ok end)
++
++    response =
++      conn
++      |> put_req_header("authorization", "Bearer #{access_token.token}")
++      |> post(peek_sync_path(conn, :sync), body)
++      |> json_response(200)
++
++    assert get_in(response, ["data", "stats", revision.id]) == %{"conflict_on_proposed" => 1, "new" => 2}
++    assert get_in(response, ["data", "operations", revision.id, Access.at(0), "previous-text"]) == "text of master"
++  end
++
++  test "sync with a version requirement prefers a tag that is the exact requirement", %{
++    access_token: access_token,
++    conn: conn,
++    user: user,
++    project: project,
++    revision: revision,
++    language: language
++  } do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++
++    for tag <- ["1.2.0", "~> 1.1"] do
++      insert_translation(revision, document, "test", "text of #{tag}", insert_version(project, user, tag))
++    end
++
++    body = %{file: file(), version: "~> 1.1", project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++
++    Accent.Hook.BroadcasterMock
++    |> expect(:notify, fn %{event: "peek_sync"} -> :ok end)
++
++    response =
++      conn
++      |> put_req_header("authorization", "Bearer #{access_token.token}")
++      |> post(peek_sync_path(conn, :sync), body)
++      |> json_response(200)
++
++    assert get_in(response, ["data", "operations", revision.id, Access.at(0), "previous-text"]) == "text of ~> 1.1"
++  end
++
++  test "sync with an unknown version", %{access_token: access_token, conn: conn, user: user, project: project, revision: revision, language: language} do
++    document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
++    insert_translation(revision, document, "test", "initial", insert_version(project, user, "1.0.0"))
++
++    for version <- ["foo", "~> 1.1", "> 1.0.0"] do
++      body = %{file: file(), version: version, project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++
++      response =
++        conn
++        |> put_req_header("authorization", "Bearer #{access_token.token}")
++        |> post(peek_sync_path(conn, :sync), body)
++
++      assert response.status == 422, "version #{version}"
++      assert response.resp_body == "unknown version", "version #{version}"
++    end
++  end
++
++  defp insert_version(project, user, tag) do
++    %Version{project_id: project.id, user_id: user.id, name: "Version #{tag}", tag: tag} |> Repo.insert!()
++  end
++
++  defp insert_translation(revision, document, key, text, version) do
++    %Translation{revision_id: revision.id, key: key, conflicted: true, corrected_text: text, proposed_text: text, document_id: document.id, version_id: version && version.id}
++    |> Repo.insert!()
++  end
+ end
+diff --git a/test/web/controllers/sync_controller_test.exs b/test/web/controllers/sync_controller_test.exs
+index 2830e48..259a9c3 100644
+--- a/test/web/controllers/sync_controller_test.exs
++++ b/test/web/controllers/sync_controller_test.exs
+@@ -14,7 +14,9 @@ defmodule AccentTest.SyncController do
+     Project,
+     Repo,
+     Revision,
+-    User
++    Translation,
++    User,
++    Version
+   }
+ 
+   @user %User{email: "test@test.com"}
+@@ -30,9 +32,9 @@ defmodule AccentTest.SyncController do
+     project = %Project{main_color: "#f00", name: "My project"} |> Repo.insert!()
+ 
+     %Collaborator{project_id: project.id, user_id: user.id, role: "admin"} |> Repo.insert!()
+-    %Revision{language_id: french_language.id, project_id: project.id, master: true} |> Repo.insert!()
++    revision = %Revision{language_id: french_language.id, project_id: project.id, master: true} |> Repo.insert!()
+ 
+-    {:ok, [access_token: access_token, user: user, project: project, language: french_language]}
++    {:ok, [access_token: access_token, user: user, project: project, revision: revision, language: french_language]}
+   end
+ 
+   test "sync with operations", %{user: user, access_token: access_token, conn: conn, project: project, language: language} do
+@@ -64,4 +66,195 @@ defmodule AccentTest.SyncController do
+ 
+     assert response.status == 200
+   end
++
++  test "sync with a version", %{user: user, access_token: access_token, conn: conn, project: project, revision: revision, language: language} do
++    insert_version(project, user, "master")
++    version = insert_version(project, user, "1.0.0")
++    document = %Document{project_id: project.id, path: "simple", format: "json"} |> Repo.insert!()
++    unversioned_translation = insert_translation(revision, document, "test", nil)
++
++    body = %{file: file(), version: "1.0.0", project_id: project.id, language: language.slug, document_format: "json", document_path: "simple"}
++
++    Accent.Hook.BroadcasterMock
++    |> expect(:notify, fn _ -> :ok end)
++
++    response =
++      conn
++      |> put_req_header("authorization", "Bearer #{access_token.token}")
++      |> post(sync_path(conn, []), body)
++
++    assert response.status == 200
++
++    sync_operation = from(o in Operation, where: [action: ^"sync"]) |> Repo.one()
++
++    assert sync_operation.version_id == version.id
++    assert translation_keys(version) == ~w(test test2 test3)
++    assert_unchanged([unversioned_translation])
++  end
++
++  test "sync with a version requirement", %{user: user, access_token: access_token, conn: conn, project: project, revision: revision, language: language} do
++    # The versions are created in an order that is neither the semantic order nor the alphabetical order of their tags
++    versions = for tag <- ~w(1.2.0 2.0.0 v1.10.0 1.0.0 latest 1.9.0), do: insert_version(project, user, tag)
++    selected_version = Enum.find(versions, &(&1.tag == "v1.10.0"))
++    document = %Document{project_id: project.id, path: "simple", format: "json"} |> Repo.insert!()
++
++    # The translations outside of the selected version are not changed, with keys that are in the file or not
++    other_translations =
++      for version <- [nil | versions -- [selected_version]], key <- ~w(test test3 other) do
++        insert_translation(revision, document, key, version)
++      end
++
++    body = %{file: file(), version: "~> 1.1", project_id: project.id, language: language.slug, document_format: "json", document_path: "simple"}
++
++    Accent.Hook.BroadcasterMock
++    |> expect(:notify, fn _ -> :ok end)
++
++    response =
++      conn
++      |> put_req_header("authorization", "Bearer #{access_token.token}")
++      |> post(sync_path(conn, []), body)
++
++    assert response.status == 200
++
++    sync_operation = from(o in Operation, where: [action: ^"sync"]) |> Repo.one()
++    new_operations = from(o in Operation, where: [action: ^"new"]) |> Repo.all()
++
++    assert sync_operation.version_id == selected_version.id
++    assert sync_operation.project_id == project.id
++    assert length(new_operations) == 3
++    assert Enum.all?(new_operations, &(&1.version_id == selected_version.id))
++    assert translation_keys(selected_version) == ~w(test test2 test3)
++    assert_unchanged(other_translations)
++  end
++
++  test "sync with a version requirement removes the missing translations of the selected version only", %{
++    user: user,
++    access_token: access_token,
++    conn: conn,
++    project: project,
++    revision: revision,
++    language: language
++  } do
++    versions = for tag <- ~w(1.0.0 v1.1.0 2.0.0), do: insert_version(project, user, tag)
++    document = %Document{project_id: project.id, path: "simple", format: "json"} |> Repo.insert!()
++
++    [old_translation, selected_translation, next_translation, unversioned_translation] =
++      for version <- versions ++ [nil] do
++        insert_translation(revision, document, "removed", version)
++      end
++
++    body = %{file: file(), version: "~> 1.1", project_id: project.id, language: language.slug, document_format: "json", document_path: "simple"}
++
++    Accent.Hook.BroadcasterMock
++    |> expect(:notify, fn _ -> :ok end)
++
++    response =
++      conn
++      |> put_req_header("authorization", "Bearer #{access_token.token}")
++      |> post(sync_path(conn, []), body)
++
++    assert response.status == 200
++
++    assert Repo.get!(Translation, selected_translation.id).removed
++    assert_unchanged([old_translation, next_translation, unversioned_translation])
++  end
++
++  test "sync with a version requirement prefers a tag that is the exact requirement", %{user: user, access_token: access_token, conn: conn, project: project, language: language} do
++    compatible_version = insert_version(project, user, "1.2.0")
++    version = insert_version(project, user, "~> 1.1")
++
++    body = %{file: file(), version: "~> 1.1", project_id: project.id, language: language.slug, document_format: "json", document_path: "simple"}
++
++    Accent.Hook.BroadcasterMock
++    |> expect(:notify, fn _ -> :ok end)
++
++    response =
++      conn
++      |> put_req_header("authorization", "Bearer #{access_token.token}")
++      |> post(sync_path(conn, []), body)
++
++    assert response.status == 200
++    assert translation_keys(version) == ~w(test test2 test3)
++    assert translation_keys(compatible_version) == []
++  end
++
++  test "sync with a version requirement ignores the versions of the other projects", %{user: user, access_token: access_token, conn: conn, project: project, language: language} do
++    version = insert_version(project, user, "1.1.0")
++    other_project = %Project{main_color: "#f00", name: "Other project"} |> Repo.insert!()
++    other_version = insert_version(other_project, user, "1.9.0")
++
++    body = %{file: file(), version: "~> 1.1", project_id: project.id, language: language.slug, document_format: "json", document_path: "simple"}
++
++    Accent.Hook.BroadcasterMock
++    |> expect(:notify, fn _ -> :ok end)
++
++    response =
++      conn
++      |> put_req_header("authorization", "Bearer #{access_token.token}")
++      |> post(sync_path(conn, []), body)
++
++    assert response.status == 200
++    assert translation_keys(version) == ~w(test test2 test3)
++    assert translation_keys(other_version) == []
++  end
++
++  test "sync with an unknown version", %{access_token: access_token, conn: conn, project: project, language: language} do
++    body = %{file: file(), version: "foo", project_id: project.id, language: language.slug, document_format: "json", document_path: "simple"}
++
++    response =
++      conn
++      |> put_req_header("authorization", "Bearer #{access_token.token}")
++      |> post(sync_path(conn, []), body)
++
++    assert response.status == 422
++    assert response.resp_body == "unknown version"
++    assert Repo.all(Document) == []
++    assert Repo.all(Operation) == []
++  end
++
++  test "sync with a version requirement that no version of the project satisfies", %{user: user, access_token: access_token, conn: conn, project: project, language: language} do
++    for tag <- ~w(1.0.0 2.0.0 latest) do
++      insert_version(project, user, tag)
++    end
++
++    other_project = %Project{main_color: "#f00", name: "Other project"} |> Repo.insert!()
++    insert_version(other_project, user, "1.5.0")
++
++    for requirement <- ["~> 1.1", "> 2.0.0", "~> 1.x"] do
++      body = %{file: file(), version: requirement, project_id: project.id, language: language.slug, document_format: "json", document_path: "simple"}
++
++      response =
++        conn
++        |> put_req_header("authorization", "Bearer #{access_token.token}")
++        |> post(sync_path(conn, []), body)
++
++      assert response.status == 422, "requirement #{requirement}"
++      assert response.resp_body == "unknown version", "requirement #{requirement}"
++    end
++
++    assert Repo.all(Document) == []
++    assert Repo.all(Operation) == []
++  end
++
++  @translation_fields ~w(key proposed_text corrected_text conflicted_text conflicted removed locked version_id document_id revision_id)a
++
++  defp insert_version(project, user, tag) do
++    %Version{project_id: project.id, user_id: user.id, name: "Version #{tag}", tag: tag} |> Repo.insert!()
++  end
++
++  defp insert_translation(revision, document, key, version) do
++    text = "text of #{key}"
++
++    %Translation{revision_id: revision.id, key: key, corrected_text: text, proposed_text: text, document_id: document.id, version_id: version && version.id} |> Repo.insert!()
++  end
++
++  defp translation_keys(version) do
++    from(t in Translation, where: t.version_id == ^version.id, order_by: t.key, select: t.key) |> Repo.all()
++  end
++
++  defp assert_unchanged(translations) do
++    for translation <- translations do
++      assert Map.take(Repo.get!(Translation, translation.id), @translation_fields) == Map.take(translation, @translation_fields)
++    end
++  end
+ end
