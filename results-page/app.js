@@ -36,6 +36,14 @@
   const effort = r => ({minimal: "Minimal", low: "Low", medium: "Medium", high: "High", xhigh: "Extra", max: "Max",
     on: "Thinking", off: "No thinking"})[r.settings.reasoning_effort];
   const chartName = r => [r.model.name, r.model.quantization, effort(r)].filter(Boolean).join(" ");
+  // Claude Code cannot enforce the declared generation budget, so going over it is flagged, not failed (ADR 0010).
+  const overBudget = (r, c) => Number.isInteger(r.settings.max_tokens) && Number.isInteger(c?.generated_tokens) &&
+    c.generated_tokens > r.settings.max_tokens;
+  const budgetTag = (r, n, of) => {
+    const tag = node("span", "budget-tag", `over ${Math.round(r.settings.max_tokens / 1000)}k` + (n > 1 ? ` ×${n}` : ""));
+    tag.title = `Generated more than the declared ${fmt(r.settings.max_tokens)}-token budget ${of}. It is flagged, not failed.`;
+    return tag;
+  };
   const vram = r => r.resources ? (r.resources.peak_vram_bytes ?? r.resources.gpus.reduce((sum, gpu) => sum + gpu.used_bytes, 0)) : null;
   const context = r => r.settings.window_tokens ? `${fmt(r.settings.window_tokens)} context` : "API";
   const sum = (run, key) => run.cases.every(c => Number.isInteger(c[key])) ? run.cases.reduce((n, c) => n + c[key], 0) : null;
@@ -94,8 +102,10 @@
     head.append(hr); table.append(head);
     const tbody = node("tbody");
     for (const c of r.runs[0].cases) {
-      const row = node("tr"), count = r.case_passes[c.id];
-      row.append(node("td", "case-id", c.id),
+      const row = node("tr"), count = r.case_passes[c.id], name = node("td", "case-id", c.id);
+      const over = r.runs.filter(run => overBudget(r, run.cases.find(other => other.id === c.id))).length;
+      if (over) name.append(budgetTag(r, over, `in ${over} of ${r.run_count} runs`));
+      row.append(name,
         node("td", count === r.run_count ? "passed" : count === 0 ? "failed" : "numeric", `${count}/${r.run_count}`));
       tbody.append(row);
     }
@@ -108,10 +118,12 @@
     const runBody = node("tbody");
     for (const run of r.runs) {
       const row = node("tr"), tokens = sum(run, "generated_tokens"), calls = sum(run, "model_calls");
+      const over = run.cases.filter(c => overBudget(r, c)).length, tokenCell = node("td", "numeric", tokens == null ? "—" : fmt(tokens));
+      if (over) tokenCell.append(budgetTag(r, over, `in ${over} of this run's ${run.cases.length} cases`));
       row.append(node("td", "case-id", `${run.created_at.slice(0, 10)} · ${run.run_id}`), node("td", "numeric", run.seed ?? "—"),
         node("td", "numeric", run.deployment?.parallel_attempts ?? 1),
         node("td", "numeric", `${run.cases.filter(c => c.passed).length}/${run.cases.length}`),
-        node("td", "numeric", tokens == null ? "—" : fmt(tokens)), node("td", "numeric", calls == null ? "—" : fmt(calls)));
+        tokenCell, node("td", "numeric", calls == null ? "—" : fmt(calls)));
       runBody.append(row);
     }
     runs.append(runBody); outcomes.append(runs);
