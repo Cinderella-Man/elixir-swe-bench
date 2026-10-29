@@ -97,6 +97,10 @@ defmodule Eab.MemoryMonitorTest do
     assert result["sample_count"] == 1
     configure("startup_error")
     assert {:error, _} = MemoryMonitor.start(run("bad-model"))
+    configure("ssh_error")
+
+    assert {:error, "SSH or collector returned invalid output: Host key verification failed."} =
+             MemoryMonitor.start(run("unknown-host"))
   end
 
   test "collector follows coordinator lifetime and recovery marks unfinished sessions partial" do

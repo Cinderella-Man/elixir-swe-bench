@@ -224,7 +224,7 @@ defmodule Eab.MemoryMonitor do
         result =
           case Jason.decode(line) do
             {:ok, event} when is_map(event) -> event(event, current)
-            _ -> end_session(current, "partial", "SSH or collector returned invalid output")
+            _ -> end_session(current, "partial", invalid_output(line))
           end
 
         if elem(result, 0) == :stop, do: {:halt, result}, else: {:cont, result}
@@ -383,6 +383,21 @@ defmodule Eab.MemoryMonitor do
     |> Enum.group_by(& &1["uuid"])
     |> Enum.sort_by(&elem(&1, 0))
     |> Enum.map(fn {_, rows} -> Enum.max_by(rows, & &1["used_bytes"]) end)
+  end
+
+  # SSH failures (an unknown host key, refused login) arrive here as plain text on
+  # the merged stderr; name the first such line so the cause is visible.
+  defp invalid_output(line) do
+    excerpt =
+      line
+      |> String.replace_invalid()
+      |> String.replace(~r/[^[:print:]]/u, "")
+      |> String.trim()
+      |> String.slice(0, 200)
+
+    if excerpt == "",
+      do: "SSH or collector returned invalid output",
+      else: "SSH or collector returned invalid output: #{excerpt}"
   end
 
   defp quote_shell(text), do: "'" <> String.replace(text, "'", "'\\''") <> "'"

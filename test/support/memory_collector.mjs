@@ -14,6 +14,10 @@ process.stdin.on('data', text => {
     buffer = buffer.slice(buffer.indexOf('\n') + 1);
     if (!started) {
       started = true;
+      if (mode === 'ssh_error') {
+        process.stdout.write('Host key verification failed.\r\n');
+        process.exit(255);
+      }
       if (mode === 'startup_error') {
         emit({type: 'error', message: 'Model identity changed'});
         process.exit(1);
