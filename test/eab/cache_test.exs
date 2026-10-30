@@ -34,6 +34,20 @@ defmodule Eab.CacheTest do
     assert {:ok, ^artifact} = Cache.lookup("test", Cache.key(inputs), opts)
   end
 
+  test "offline mode reuses prepared artifacts and refuses to build missing ones", %{opts: opts} do
+    on_exit(fn -> Application.delete_env(:eab, :offline) end)
+    artifact = %{"images" => []}
+    Cache.fetch("test", %{"case" => "prepared"}, fn _ -> artifact end, opts)
+    Application.put_env(:eab, :offline, true)
+
+    assert {^artifact, :reused} =
+             Cache.fetch("test", %{"case" => "prepared"}, fn _ -> flunk("warm build") end, opts)
+
+    assert_raise RuntimeError, ~r/Offline mode cannot prepare test: no saved artifact/, fn ->
+      Cache.fetch("test", %{"case" => "missing"}, fn _ -> flunk("offline build") end, opts)
+    end
+  end
+
   test "failed or incomplete publication cannot become reusable", %{opts: opts} do
     inputs = %{"case" => "failed"}
 

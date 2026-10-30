@@ -7,12 +7,7 @@ defmodule Eab.Provenance do
     provenance = Inventory.read_json(Inventory.case_path(id, "provenance.json"))
     validate!(spec, provenance)
 
-    tests =
-      if File.regular?(Inventory.case_path(id, "upstream-tests.patch")),
-        do: "upstream-tests.patch",
-        else: "reference-tests.patch"
-
-    patches = ["reference.patch", tests, "upstream-docs.patch"]
+    tests = tests_patch(id)
     protected = Eab.TaskContract.read(spec)["protected_paths"]
 
     for file <- Enum.uniq([tests, "reference-tests.patch"]),
@@ -37,24 +32,35 @@ defmodule Eab.Provenance do
              do: raise("Upstream documentation patch cannot hide implementation differences")
     end
 
-    inputs = %{
-      "provenance" => provenance,
-      "patches" => Map.take(Inventory.fixture_hashes(id), patches),
-      "verifier" => Inventory.hash_file(Inventory.path("lib/eab/provenance.ex")),
-      "exporter" => Inventory.hash_file(Inventory.path("lib/eab/source.ex"))
-    }
-
     {receipt, _} =
       Cache.fetch(
         "provenance",
-        inputs,
+        inputs(id),
         fn _ ->
-          verify_pair(spec, provenance, Enum.map(patches, &Inventory.case_path(id, &1)), emit)
+          patches = Enum.map(patches(id), &Inventory.case_path(id, &1))
+          verify_pair(spec, provenance, patches, emit)
         end,
         opts
       )
 
     receipt
+  end
+
+  def inputs(id) do
+    %{
+      "provenance" => Inventory.read_json(Inventory.case_path(id, "provenance.json")),
+      "patches" => Map.take(Inventory.fixture_hashes(id), patches(id)),
+      "verifier" => Inventory.hash_file(Inventory.path("lib/eab/provenance.ex")),
+      "exporter" => Inventory.hash_file(Inventory.path("lib/eab/source.ex"))
+    }
+  end
+
+  defp patches(id), do: ["reference.patch", tests_patch(id), "upstream-docs.patch"]
+
+  defp tests_patch(id) do
+    if File.regular?(Inventory.case_path(id, "upstream-tests.patch")),
+      do: "upstream-tests.patch",
+      else: "reference-tests.patch"
   end
 
   def validate!(spec, provenance) do

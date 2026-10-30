@@ -74,6 +74,73 @@ Completed baselines remain retained across model runs and controller restarts. *
 
 Deleting images outside the application is detected as missing cache state. Deleting `/data` loses receipts, releases and run evidence even if image layers survive. Back up both persistence domains if required.
 
+## Running with no internet
+
+Preparation needs the internet; a prepared machine does not. Attempts and grading already run in containers with no network, and only the controller talks to the model, so once every case is prepared a run contacts no registry, Git host or package server. This covers local model servers only: ChatGPT and Claude need their hosted services.
+
+Prepare on the machine that will run the benchmark, while it is still online:
+
+1. Install Docker, clone this repository and run `docker compose up --build -d`.
+2. Open the website and click **Prepare all cases** under **Offline readiness**. Each missing case is downloaded and built, gets its Pi image and has its fixtures checked. No model is needed. Finished cases stay prepared, so you can stop and click again, including after fixing a failure. Failed cases are listed with the end of their error; full build logs are under `/data/build/`.
+3. Wait until the panel says every case is ready. **Check again** repeats the read-only check, which finds records missing from `/data`, images missing from Docker and qualifications that no longer match.
+4. Add `EAB_OFFLINE=1` to `.env` and run `docker compose up -d`.
+5. Disconnect the internet.
+
+Prepared images and `/data` survive a reboot, and Compose restarts the controller. One installation's 20 cases held about 24 GB of images, estimated from layer history, plus 1.2 GB of source archives. Build cache comes on top during a cold preparation, so allow about 100 GB free.
+
+Offline mode refuses to start, resume or repeat a run whose cases are not all ready, and names them, so a missing part cannot stop a run halfway and cost it its final score. Any preparation step that would have to build or download stops with an error instead, and cached state cannot be removed, because it could not be rebuilt. **Prepare all cases** still works for parts that need no network, such as repeating fixture checks.
+
+While disconnected:
+
+- Use `docker compose up -d`, never `--build`, which may contact registries.
+- Do not run `docker system prune -a` or `docker image prune -a`. Prepared images have no running container, so these commands delete them.
+
+After `git pull`, a Pi update or a case change, reconnect, remove `EAB_OFFLINE`, run `docker compose up --build -d` and click **Prepare all cases** again. Changed benchmark code can invalidate project images and qualification receipts, and only a rebuild with internet can replace project images.
+
+### Direct cable to the model host
+
+Give each end a static address with no gateway, for example `10.77.0.1/30` on the benchmark machine and `10.77.0.2/30` on the model host. The controller uses host networking, so Compose needs no change.
+
+The model host must listen on that address, because Tailscale Serve cannot be relied on without Tailscale's coordination service. Either bind the server to `0.0.0.0`, or keep it on `127.0.0.1` and forward `10.77.0.2:<port>` to it. Do not bind it to the cable address alone: the memory collector needs a listener it can reach on `127.0.0.1:<port>`. Check that the serving stack itself starts without internet; it is not part of this repository.
+
+Enter the server as an IP address, such as `http://10.77.0.2:8080`, because the cable has no DNS. The address is part of the experiment identity, so a run started through Tailscale cannot resume over the cable. New runs still join the same run series, which ignores the endpoint.
+
+The website listens only on the benchmark machine's loopback. Use a screen on that machine, or tunnel to it from the other end of the cable:
+
+```sh
+ssh -L 4000:127.0.0.1:4000 <user>@10.77.0.1
+```
+
+### Memory collection over the cable
+
+Tailscale SSH has the same dependency, so give the collector a dedicated key for the model host's ordinary `sshd`. To run without RAM/VRAM data instead, leave the cable address out of `EAB_MEMORY_HOSTS`; listing it without working SSH stops runs from starting.
+
+Create the key on the benchmark machine and print its public half:
+
+```sh
+docker compose exec benchmark sh -c 'mkdir -p -m 700 /data/memory && ssh-keygen -t ed25519 -N "" -C eab-memory -f /data/memory/id_ed25519 && cat /data/memory/id_ed25519.pub'
+```
+
+On the model host, add it to `/root/.ssh/authorized_keys`, limited to the collector:
+
+```text
+command="/srv/elixir-agent-benchmark/memory-collector/bin/eab_memory_collector eval 'Eab.MemoryCollector.CLI.main()'",restrict ssh-ed25519 AAAA… eab-memory
+```
+
+Record the host key, then compare its fingerprint with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the model host:
+
+```sh
+docker compose exec benchmark sh -c 'ssh-keyscan -t ed25519 10.77.0.2 >> /data/memory/known_hosts && chmod 600 /data/memory/known_hosts && ssh-keygen -lf /data/memory/known_hosts'
+```
+
+Set these in `.env` and run `docker compose up -d`:
+
+```dotenv
+EAB_MEMORY_SSH_TARGET=root@10.77.0.2
+EAB_MEMORY_SSH_KEY=/data/memory/id_ed25519
+EAB_MEMORY_HOSTS=10.77.0.2
+```
+
 ## ChatGPT subscription connection
 
 Choose **ChatGPT** under **Model source**, choose a saved registration if needed, and select **Continue with ChatGPT**. The endpoint is configured automatically. Use your usual sign-in method, including Google, on the hosted sign-in page. The browser returns to `http://127.0.0.1:<PORT>/auth/chatgpt/callback`; use the same computer as the controller. Choose an account-visible model and click the existing **Run benchmark** button. Connecting lists models without generating a response. Actual plan/model eligibility is established only by completed inference. Switching to **Local server** restores its entered address, credentials and run settings within the current page session.

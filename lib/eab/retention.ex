@@ -186,6 +186,9 @@ defmodule Eab.Retention do
   end
 
   def remove(id, expected, opts \\ []) do
+    if Eab.Readiness.offline?(),
+      do: raise("Offline mode keeps prepared state: it cannot be rebuilt without internet")
+
     key = {:cache_removal, Store.root()}
     Registry.register(Eab.Commands, key, nil)
 

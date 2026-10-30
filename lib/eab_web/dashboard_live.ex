@@ -7,6 +7,7 @@ defmodule EabWeb.DashboardLive do
     Evidence,
     Inventory,
     Model,
+    Readiness,
     Results,
     Retention,
     Runner,
@@ -81,6 +82,9 @@ defmodule EabWeb.DashboardLive do
         cache_failures: [],
         storage: nil,
         storage_busy: false,
+        offline: Readiness.offline?(),
+        readiness: nil,
+        readiness_error: nil,
         selected_case: nil,
         log_case: nil,
         case_attempt: nil,
@@ -95,6 +99,8 @@ defmodule EabWeb.DashboardLive do
         cases: Enum.map(Inventory.all(), &Inventory.spec/1)
       )
       |> load_log()
+
+    socket = if connected?(socket), do: check_readiness(socket), else: socket
 
     if params["chatgpt"],
       do:
@@ -410,6 +416,20 @@ defmodule EabWeb.DashboardLive do
      end)}
   end
 
+  def handle_event("readiness", _, socket), do: {:noreply, check_readiness(socket)}
+
+  def handle_event("prepare_all", _, socket) do
+    case Runs.prepare_all() do
+      :ok -> {:noreply, refresh(assign(socket, error: nil))}
+      {:error, message} -> {:noreply, assign(socket, error: message)}
+    end
+  end
+
+  def handle_event("stop_preparation", _, socket) do
+    Runs.stop_preparation()
+    {:noreply, refresh(socket)}
+  end
+
   def handle_event("cache_remove", _, %{assigns: %{cache_preview: nil}} = socket),
     do: {:noreply, socket}
 
@@ -511,6 +531,17 @@ defmodule EabWeb.DashboardLive do
   def handle_async(:discovery, {:ok, {:ok, endpoint}}, socket),
     do: {:noreply, assign(socket, endpoint: endpoint, detecting: false, error: nil)}
 
+  def handle_async(:readiness, {:ok, {:ok, readiness}}, socket),
+    do: {:noreply, assign(socket, readiness: readiness, readiness_error: nil)}
+
+  def handle_async(:readiness, {:ok, {:error, error}}, socket),
+    do: {:noreply, assign(socket, readiness: nil, readiness_error: error)}
+
+  def handle_async(:readiness, {:exit, _}, socket),
+    do:
+      {:noreply,
+       assign(socket, readiness: nil, readiness_error: "Readiness check stopped. Try again.")}
+
   def handle_async(:storage, {:ok, {:ok, storage}}, socket),
     do: {:noreply, assign(socket, storage: storage, storage_busy: false)}
 
@@ -546,7 +577,8 @@ defmodule EabWeb.DashboardLive do
        cache_status: Retention.status(),
        cache_failures: result["retained_images"],
        cache_message: message
-     )}
+     )
+     |> check_readiness()}
   end
 
   def handle_async(:cache_remove, {:ok, {:error, error}}, socket),
@@ -571,12 +603,32 @@ defmodule EabWeb.DashboardLive do
       {:noreply,
        assign(socket, detecting: false, error: "Model discovery stopped. Try connecting again.")}
 
-  def handle_info(:runs_changed, socket), do: {:noreply, refresh(socket)}
+  # Runs and preparation change what is ready, so the check repeats when either ends.
+  def handle_info(:runs_changed, socket) do
+    busy = busy?(socket.assigns.snapshot)
+    socket = refresh(socket)
+
+    {:noreply,
+     if(busy and not busy?(socket.assigns.snapshot), do: check_readiness(socket), else: socket)}
+  end
 
   def handle_info(:poll_log, socket) do
     Process.send_after(self(), :poll_log, 1_000)
     {:noreply, load_log(socket)}
   end
+
+  defp check_readiness(socket) do
+    start_async(socket, :readiness, fn ->
+      try do
+        {:ok, Readiness.check()}
+      rescue
+        error -> {:error, Exception.message(error)}
+      end
+    end)
+  end
+
+  defp preparing?(snapshot), do: (snapshot.preparation || %{})["status"] == "running"
+  defp busy?(snapshot), do: not is_nil(snapshot.active) or preparing?(snapshot)
 
   # Each model source keeps its own unsaved settings while the user switches between them.
   defp switch_provider(%{assigns: %{provider: provider}} = socket, provider), do: socket
@@ -1281,7 +1333,7 @@ defmodule EabWeb.DashboardLive do
             class="primary"
             phx-click="run"
             disabled={
-              is_nil(@endpoint) or @detecting or @cache_busy or not is_nil(@snapshot.active) or
+              is_nil(@endpoint) or @detecting or @cache_busy or busy?(@snapshot) or
                 @snapshot.cleaning or
                 not is_nil(@snapshot.cleanup_error)
             }
@@ -1383,7 +1435,7 @@ defmodule EabWeb.DashboardLive do
               class="secondary"
               phx-click="resume"
               disabled={
-                is_nil(@endpoint) or @detecting or @cache_busy or not is_nil(@snapshot.active) or
+                is_nil(@endpoint) or @detecting or @cache_busy or busy?(@snapshot) or
                   @snapshot.cleaning or
                   not is_nil(@snapshot.cleanup_error)
               }
@@ -1720,6 +1772,69 @@ defmodule EabWeb.DashboardLive do
           </div>
         </section>
       </div>
+      <section id="offline-readiness" class="history panel">
+        <div class="section-title">
+          <h2>Offline readiness</h2><span class="muted">What a run needs with no internet.</span>
+        </div>
+        <p :if={@offline} id="offline-mode" class="notice">
+          Offline mode is on. Nothing is downloaded or built, and missing cases stop a run from starting.
+        </p>
+        <p :if={@readiness_error} class="notice error">{@readiness_error}</p>
+        <p :if={is_nil(@readiness) and is_nil(@readiness_error)} role="status">
+          Checking prepared cases…
+        </p>
+        <div :if={@readiness} id="readiness-summary">
+          <p :if={@readiness["ready"] == @readiness["total"]}>
+            <strong>{@readiness["ready"]} of {@readiness["total"]} cases are ready.</strong>
+            You can disconnect from the internet.
+          </p>
+          <p :if={@readiness["ready"] != @readiness["total"]}>
+            <strong>{@readiness["ready"]} of {@readiness["total"]} cases are ready.</strong>
+            Stay online and prepare the rest.
+          </p>
+          <ul :if={@readiness["ready"] != @readiness["total"]}>
+            <li :for={row <- Enum.reject(@readiness["cases"], & &1["ready"])}>
+              {row["case"]}: needs {Enum.join(row["missing"], ", ")}
+            </li>
+          </ul>
+        </div>
+        <div :if={@snapshot.preparation} id="preparation-status" role="status">
+          <p>
+            {@snapshot.preparation["finished"]} of {@snapshot.preparation["total"]} cases finished. {@snapshot.preparation[
+              "message"
+            ]}
+          </p>
+          <details :if={@snapshot.preparation["errors"] != %{}} open>
+            <summary>{map_size(@snapshot.preparation["errors"])} cases could not be prepared</summary>
+            <div :for={{id, error} <- Enum.sort(@snapshot.preparation["errors"])}>
+              <strong>{id}</strong>
+              <pre>{error}</pre>
+            </div>
+          </details>
+        </div>
+        <div class="console-actions">
+          <button
+            :if={!preparing?(@snapshot)}
+            id="prepare-all"
+            class="secondary"
+            phx-click="prepare_all"
+            disabled={
+              not is_nil(@snapshot.active) or @snapshot.cleaning or @cache_busy or
+                not is_nil(@snapshot.cleanup_error)
+            }
+          >Prepare all cases</button>
+          <button
+            :if={preparing?(@snapshot)}
+            id="stop-preparation"
+            class="secondary"
+            phx-click="stop_preparation"
+          >Stop preparation</button>
+          <button id="check-readiness" class="secondary" phx-click="readiness">Check again</button>
+        </div>
+        <p class="fine-print">
+          Preparing downloads and builds each missing case, attaches Pi and checks its fixtures. A cold first preparation needs internet and a long build. Prepared cases are skipped. Repeat it after any update, while still online.
+        </p>
+      </section>
       <section class="history panel">
         <div class="section-title">
           <h2>Run history</h2><span class="muted">Each run stands on its own.</span>
@@ -1967,7 +2082,7 @@ defmodule EabWeb.DashboardLive do
           <button
             class="secondary"
             type="submit"
-            disabled={@cache_busy or not is_nil(@cache_status["error"])}
+            disabled={@cache_busy or @offline or not is_nil(@cache_status["error"])}
           >Preview removal</button>
         </form>
         <div :if={@cache_preview}>
@@ -1982,7 +2097,7 @@ defmodule EabWeb.DashboardLive do
           <button
             class="danger"
             phx-click="cache_remove"
-            disabled={@cache_busy or not is_nil(@snapshot.active) or @snapshot.cleaning}
+            disabled={@cache_busy or busy?(@snapshot) or @snapshot.cleaning}
           >Remove this cached state</button>
         </div>
         <p :if={@cache_busy} role="status">Removing unused cached state…</p>

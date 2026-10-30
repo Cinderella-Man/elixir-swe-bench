@@ -43,6 +43,8 @@ _Avoid_: repeats, trial set, epochs
 
 **Prepared case**: A case whose starting environment is available and whose fixture qualification is valid for that environment.
 
+**Offline-ready case**: A prepared case that also has its source check, its image with Pi attached and a matching qualification receipt, so a run can use it with no internet.
+
 **Case baseline**: The reusable pristine starting state of a case, including prepared source, dependencies and initial service data. It excludes changes and observations produced by attempts or grading checks.
 
 **Build seed**: A pristine preparation build whose compatible artifacts can be reused when preparing another case. It contains no agent investigation, reference repair or grading state.

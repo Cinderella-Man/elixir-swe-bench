@@ -7,6 +7,8 @@ defmodule Eab.Runs do
     MemoryMonitor,
     Model,
     Pipeline,
+    Qualification,
+    Readiness,
     Release,
     Runner,
     Sandbox,
@@ -38,6 +40,10 @@ defmodule Eab.Runs do
   def stop, do: GenServer.call(__MODULE__, :stop, 10_000)
   def retry_cleanup, do: GenServer.call(__MODULE__, :retry_cleanup)
 
+  @doc "Prepares and checks every case with no model, so a later run needs no internet."
+  def prepare_all, do: GenServer.call(__MODULE__, :prepare_all, 30_000)
+  def stop_preparation, do: GenServer.call(__MODULE__, :stop_preparation, 10_000)
+
   @impl true
   def init(_) do
     Sandbox.installation()
@@ -66,7 +72,16 @@ defmodule Eab.Runs do
             Enum.each(pending_ids, &cleanup/1)
           end)
 
-    {:ok, %{active: nil, worker: nil, memory_monitor: nil, cleanup: task, cleanup_error: nil}}
+    {:ok,
+     %{
+       active: nil,
+       worker: nil,
+       memory_monitor: nil,
+       cleanup: task,
+       cleanup_error: nil,
+       preparing: nil,
+       preparation: nil
+     }}
   end
 
   @impl true
@@ -77,8 +92,58 @@ defmodule Eab.Runs do
          active: state.active,
          history: Store.run_page().items,
          cleanup_error: state.cleanup_error,
-         cleaning: state.cleanup != nil
+         cleaning: state.cleanup != nil,
+         preparation: state.preparation
        }, state}
+
+  def handle_call(request, _from, %{preparing: preparing} = state)
+      when not is_nil(preparing) and is_tuple(request) and
+             elem(request, 0) in [:start, :partial, :resume],
+      do: {:reply, {:error, "Preparation is running; wait for it to finish or stop it"}, state}
+
+  def handle_call(:prepare_all, _from, state)
+      when not is_nil(state.active) or not is_nil(state.preparing) or not is_nil(state.cleanup) or
+             not is_nil(state.cleanup_error),
+      do: {:reply, {:error, "Wait for the active work and container cleanup to finish"}, state}
+
+  def handle_call(:prepare_all, _from, state) do
+    id = "preparation-#{System.system_time(:second)}"
+    parent = self()
+    qualification = Application.get_env(:eab, :qualification, &Qualification.run/2)
+
+    task =
+      Task.Supervisor.async_nolink(Eab.Tasks, fn ->
+        try do
+          qualification.(&send(parent, {:preparation, id, &1}),
+            id: id,
+            on_result: &send(parent, {:preparation_result, id, &1, &2})
+          )
+        rescue
+          error -> %{"status" => "error", "error" => Exception.message(error)}
+        end
+      end)
+
+    preparation = %{
+      "id" => id,
+      "status" => "running",
+      "message" => "Starting preparation",
+      "total" => length(Inventory.all()),
+      "finished" => 0,
+      "errors" => %{}
+    }
+
+    broadcast()
+    {:reply, :ok, %{state | preparing: task, preparation: preparation}}
+  end
+
+  def handle_call(:stop_preparation, _from, %{preparing: nil} = state), do: {:reply, :ok, state}
+
+  def handle_call(:stop_preparation, _from, state) do
+    owner = state.preparing.pid
+    Task.shutdown(state.preparing, :brutal_kill)
+    state = end_preparation(state, "cancelled", "Stopped. Finished cases stay prepared.")
+    {:reply, :ok, %{state | cleanup: preparation_cleanup(owner, state.preparation["id"])}}
+  end
 
   def handle_call({:start, _, _, _, _}, _from, %{active: active} = state)
       when not is_nil(active),
@@ -116,6 +181,7 @@ defmodule Eab.Runs do
           run
       end
 
+    Readiness.enforce!(run["cases"])
     launch(run, key, state)
   rescue
     error -> {:reply, {:error, Exception.message(error)}, state}
@@ -158,6 +224,7 @@ defmodule Eab.Runs do
            do: raise("Case inputs or agent changed; start a new full run")
 
     {kind, cases} = partial_cases(source, mode)
+    Readiness.enforce!(cases)
     endpoint = source["model"]
     settings = source["settings"]
     unless Model.settings(endpoint, settings) == settings, do: raise("Model settings changed")
@@ -208,6 +275,7 @@ defmodule Eab.Runs do
           "No unfinished cases to resume; completed failures and evaluation errors are preserved"
         )
 
+    Readiness.enforce!(plan.restart ++ Map.keys(plan.submissions))
     run = Checkpoints.archive_unfinished(run, plan.restart)
 
     run =
@@ -240,7 +308,7 @@ defmodule Eab.Runs do
 
   def handle_call(:stop, _from, %{active: nil} = state), do: {:reply, :ok, state}
 
-  def handle_call(:retry_cleanup, _from, %{active: nil, cleanup: nil} = state) do
+  def handle_call(:retry_cleanup, _from, %{active: nil, preparing: nil, cleanup: nil} = state) do
     task =
       Task.Supervisor.async_nolink(Eab.Tasks, fn ->
         pending = Store.runs() |> Enum.filter(& &1["cleanup_pending"]) |> Enum.map(& &1["id"])
@@ -344,6 +412,46 @@ defmodule Eab.Runs do
 
   def handle_info({:DOWN, ref, :process, _, _reason}, %{worker: %{ref: ref}} = state),
     do: finish(state, "error", "Run worker stopped unexpectedly")
+
+  def handle_info({:preparation, id, message}, %{preparation: %{"id" => id}} = state)
+      when not is_nil(state.preparing) do
+    broadcast()
+    {:noreply, put_in(state.preparation["message"], message)}
+  end
+
+  def handle_info(
+        {:preparation_result, id, case_id, result},
+        %{preparation: %{"id" => id}} = state
+      )
+      when not is_nil(state.preparing) do
+    preparation = Map.update!(state.preparation, "finished", &(&1 + 1))
+
+    preparation =
+      if result["status"] == "error",
+        do: put_in(preparation, ["errors", case_id], log_tail(result["error"])),
+        else: preparation
+
+    broadcast()
+    {:noreply, %{state | preparation: preparation}}
+  end
+
+  def handle_info({ref, result}, %{preparing: %{ref: ref}} = state) do
+    Process.demonitor(ref, [:flush])
+
+    message =
+      cond do
+        result["error"] -> log_tail(result["error"])
+        result["status"] == "qualified" -> "Every case is prepared and checked."
+        true -> "Some cases could not be prepared. Fix them and try again."
+      end
+
+    {:noreply, end_preparation(state, result["status"], message)}
+  end
+
+  def handle_info({:DOWN, ref, :process, pid, _reason}, %{preparing: %{ref: ref}} = state) do
+    state = end_preparation(state, "error", "Preparation stopped unexpectedly")
+    {:noreply, %{state | cleanup: preparation_cleanup(pid, state.preparation["id"])}}
+  end
 
   def handle_info({ref, _}, %{cleanup: %{ref: ref}} = state) do
     Process.demonitor(ref, [:flush])
@@ -488,6 +596,23 @@ defmodule Eab.Runs do
     broadcast()
     {:noreply, %{state | active: nil, worker: nil, memory_monitor: nil, cleanup: task}}
   end
+
+  defp end_preparation(state, status, message) do
+    preparation = Map.merge(state.preparation, %{"status" => status, "message" => message})
+    broadcast()
+    %{state | preparing: nil, preparation: preparation}
+  end
+
+  # A killed job skips its own cleanup, so its containers and lease are released here.
+  defp preparation_cleanup(owner, id) do
+    Task.Supervisor.async_nolink(Eab.Tasks, fn ->
+      Pipeline.await_owner(owner)
+      cleanup(id)
+    end)
+  end
+
+  # Build failures carry their whole log, and the cause is at the end.
+  defp log_tail(text), do: String.slice(text, max(String.length(text) - 2000, 0), 2000)
 
   defp persist(run) do
     run = if run["status"] in @terminal, do: finalize_attempts(run), else: run

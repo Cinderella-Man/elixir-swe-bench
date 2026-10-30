@@ -44,6 +44,19 @@ defmodule Eab.MemoryMonitorTest do
       }
     }
 
+  test "SSH uses a configured key and otherwise offers none" do
+    config = [target: "root@10.77.0.2", collector: "/srv/collector", known_hosts: "/data/hosts"]
+    assert "IdentityFile=none" in MemoryMonitor.ssh_args(config)
+
+    args = MemoryMonitor.ssh_args([ssh_key: "/data/memory/id_ed25519"] ++ config)
+    assert "IdentityFile=/data/memory/id_ed25519" in args
+    assert "IdentitiesOnly=yes" in args
+    assert "IdentityAgent=none" in args
+    assert "StrictHostKeyChecking=yes" in args
+    assert "UserKnownHostsFile=/data/hosts" in args
+    assert "root@10.77.0.2" in args
+  end
+
   test "saves attributed peaks and simultaneous total, including the final sample and resume sessions" do
     assert {:ok, pid, initial} = MemoryMonitor.start(run())
     assert initial["status"] == "sampling"

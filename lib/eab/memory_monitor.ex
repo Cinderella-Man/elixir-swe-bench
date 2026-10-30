@@ -103,6 +103,37 @@ defmodule Eab.MemoryMonitor do
     end
   end
 
+  # With no key the connection relies on the host's own SSH service, such as Tailscale
+  # SSH. A key is for a plain sshd, such as a rig on a direct cable.
+  @doc false
+  def ssh_args(config) do
+    [
+      "-F",
+      "/dev/null",
+      "-T",
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "ConnectTimeout=5",
+      "-o",
+      "ServerAliveInterval=5",
+      "-o",
+      "ServerAliveCountMax=2",
+      "-o",
+      "IdentityAgent=none",
+      "-o",
+      "IdentityFile=#{config[:ssh_key] || "none"}",
+      "-o",
+      "IdentitiesOnly=yes",
+      "-o",
+      "StrictHostKeyChecking=yes",
+      "-o",
+      "UserKnownHostsFile=#{config[:known_hosts]}",
+      config[:target],
+      "#{quote_shell(config[:collector])} eval 'Eab.MemoryCollector.CLI.main()'"
+    ]
+  end
+
   @impl true
   def init({owner, run, config}) do
     Process.flag(:trap_exit, true)
@@ -126,32 +157,6 @@ defmodule Eab.MemoryMonitor do
         if(run["resume_count"] && sessions == [], do: "Earlier run segment was not sampled")
     }
 
-    args = [
-      "-F",
-      "/dev/null",
-      "-T",
-      "-o",
-      "BatchMode=yes",
-      "-o",
-      "ConnectTimeout=5",
-      "-o",
-      "ServerAliveInterval=5",
-      "-o",
-      "ServerAliveCountMax=2",
-      "-o",
-      "IdentityAgent=none",
-      "-o",
-      "IdentityFile=none",
-      "-o",
-      "IdentitiesOnly=yes",
-      "-o",
-      "StrictHostKeyChecking=yes",
-      "-o",
-      "UserKnownHostsFile=#{config[:known_hosts]}",
-      config[:target],
-      "#{quote_shell(config[:collector])} eval 'Eab.MemoryCollector.CLI.main()'"
-    ]
-
     executable =
       config[:executable] || System.find_executable("ssh") || raise "SSH client is not installed"
 
@@ -161,7 +166,7 @@ defmodule Eab.MemoryMonitor do
         :exit_status,
         :use_stdio,
         :stderr_to_stdout,
-        args: config[:args] || args
+        args: config[:args] || ssh_args(config)
       ])
 
     request = %{

@@ -2,8 +2,10 @@ defmodule Eab.Qualification do
   @moduledoc "Prepare and qualify the frozen inventory without a model or Pi calls."
   alias Eab.{
     Activity,
+    AgentImage,
     Fixtures,
     Grader,
+    Inventory,
     Pipeline,
     Preparation,
     Provenance,
@@ -17,6 +19,7 @@ defmodule Eab.Qualification do
     release = Release.freeze()
     ids = release["protocol"]["inventory"]["cases"]
     id = Keyword.get(opts, :id, "qualification-#{System.system_time(:second)}")
+    on_result = Keyword.get(opts, :on_result, fn _, _ -> :ok end)
     unless Store.valid_id?(id), do: raise("Invalid qualification job ID")
 
     job = %{
@@ -35,10 +38,7 @@ defmodule Eab.Qualification do
           Activity.with_case(id, case_id, "", fn ->
             Release.verify!(release, case_id)
             progress(id, case_id, "preparing", emit)
-            Provenance.verify(case_id, emit)
-            runtime = Fixtures.ensure(case_id, emit, run_id: id)
-            Retention.retain(case_id, runtime, release["id"])
-            runtime
+            prepare_case(case_id, id, release["id"], emit)
           end)
         end,
         prepare: fn case_id ->
@@ -58,6 +58,7 @@ defmodule Eab.Qualification do
         end,
         result: fn case_id, result ->
           Store.write("jobs/#{id}/#{case_id}.json", result)
+          on_result.(case_id, result)
 
           emit.(
             "#{case_id}: #{result["status"]}" <>
@@ -90,6 +91,21 @@ defmodule Eab.Qualification do
       Sandbox.cleanup(id)
       Retention.release(id)
     end
+  end
+
+  @doc """
+  Everything a case needs before its first attempt. Attempts would otherwise attach Pi on
+  first use, and that build runs npm, so a case prepared here can start with no internet.
+  """
+  def prepare_case(case_id, id, release_id, emit, opts \\ []) do
+    attach_agent = Keyword.get(opts, :attach_agent, &AgentImage.ensure/2)
+    images = Keyword.take(opts, [:image_exists?])
+    Provenance.verify(case_id, emit, images)
+    runtime = Fixtures.ensure(case_id, emit, [run_id: id] ++ images)
+    Retention.retain(case_id, runtime, release_id)
+    emit.("#{case_id}: attaching Pi")
+    attach_agent.(Inventory.spec(case_id), runtime["image"])
+    runtime
   end
 
   defp progress(id, case_id, status, emit) do

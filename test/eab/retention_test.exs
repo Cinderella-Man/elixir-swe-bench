@@ -45,6 +45,20 @@ defmodule Eab.RetentionTest do
     assert Cache.records("projects") == []
   end
 
+  test "offline mode refuses removal, because nothing can be rebuilt" do
+    on_exit(fn -> Application.delete_env(:eab, :offline) end)
+    cache("projects", %{"source" => 1}, %{"images" => ["one"]})
+    Retention.retain("case", %{"image" => "one"})
+    plan = Retention.preview("case")
+    Application.put_env(:eab, :offline, true)
+
+    assert_raise RuntimeError, ~r/Offline mode keeps prepared state/, fn ->
+      Retention.remove("case", plan["id"], remove_image: fn _ -> flunk("offline removal") end)
+    end
+
+    assert Retention.status()["baselines"] == 1
+  end
+
   test "active leases and nested uses prevent removal, and stale previews are rejected" do
     cache("projects", %{"source" => 1}, %{"images" => ["one"]})
     Retention.retain("case", %{"image" => "one"})

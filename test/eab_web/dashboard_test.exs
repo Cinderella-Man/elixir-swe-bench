@@ -105,6 +105,59 @@ defmodule EabWeb.DashboardTest do
     for id <- ids, do: assert(has_element?(view, ".case-inventory article .eyebrow", id))
   end
 
+  test "offline readiness lists what is missing and preparation can be started and stopped" do
+    parent = self()
+    cleanup = Application.get_env(:eab, :cleanup)
+    Application.put_env(:eab, :cleanup, fn _ -> :ok end)
+
+    on_exit(fn ->
+      Application.delete_env(:eab, :qualification)
+
+      if cleanup,
+        do: Application.put_env(:eab, :cleanup, cleanup),
+        else: Application.delete_env(:eab, :cleanup)
+    end)
+
+    Application.put_env(:eab, :qualification, fn emit, _ ->
+      emit.("first: preparing")
+      send(parent, :preparing)
+
+      receive do
+        :finish -> %{"status" => "qualified"}
+      end
+    end)
+
+    {:ok, view, _} = live(build_conn(), "/")
+    total = length(Eab.Inventory.all())
+    assert render_async(view) =~ "0 of #{total} cases are ready."
+    assert has_element?(view, "#readiness-summary li", "plausible-pr-5939: needs source check")
+    assert has_element?(view, "#readiness-summary", "Stay online and prepare the rest.")
+
+    view |> element("#prepare-all") |> render_click()
+    assert_receive :preparing, 3000
+    assert has_element?(view, "#stop-preparation")
+    refute has_element?(view, "#prepare-all")
+    assert has_element?(view, "#run[disabled]")
+    assert render(view) =~ "0 of #{total} cases finished."
+
+    view |> element("#stop-preparation") |> render_click()
+    assert has_element?(view, "#preparation-status", "Finished cases stay prepared")
+    assert has_element?(view, "#prepare-all")
+
+    Enum.find(1..200, fn _ ->
+      Process.sleep(10)
+      not Eab.Runs.snapshot().cleaning
+    end)
+  end
+
+  test "offline mode says so and keeps prepared state from being removed" do
+    on_exit(fn -> Application.delete_env(:eab, :offline) end)
+    Application.put_env(:eab, :offline, true)
+    {:ok, view, _} = live(build_conn(), "/")
+    assert has_element?(view, "#offline-mode", "Nothing is downloaded or built")
+    assert has_element?(view, "#cache-preview button[disabled]", "Preview removal")
+  end
+
   test "completed runs can be added from the dashboard and viewed without exporting a file" do
     run = publication_run()
     page = publication_page(run)

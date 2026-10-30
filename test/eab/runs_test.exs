@@ -91,6 +91,114 @@ defmodule Eab.RunsTest do
 
   defp endpoint, do: %{"model" => "fixture", "context" => 32768}
 
+  defp stub_preparation do
+    parent = self()
+    on_exit(fn -> Application.delete_env(:eab, :qualification) end)
+
+    Application.put_env(:eab, :qualification, fn emit, opts ->
+      send(parent, {:preparing, self(), emit, opts})
+
+      receive do
+        {:finish, result} -> result
+      end
+    end)
+  end
+
+  defp await_preparation(condition, attempts \\ 100) do
+    preparation = Runs.snapshot().preparation
+
+    cond do
+      condition.(preparation) ->
+        preparation
+
+      attempts == 0 ->
+        flunk("Preparation did not reach the expected state: #{inspect(preparation)}")
+
+      true ->
+        Process.sleep(10)
+        await_preparation(condition, attempts - 1)
+    end
+  end
+
+  test "preparing every case excludes runs and reports each finished case" do
+    stub_preparation()
+    assert :ok = Runs.prepare_all()
+    assert_receive {:preparing, worker, emit, opts}, 3000
+    assert String.starts_with?(opts[:id], "preparation-")
+    assert {:error, message} = Runs.prepare_all()
+    assert message =~ "Wait for the active work"
+    assert {:error, message} = Runs.start(endpoint(), "", %{})
+    assert message =~ "Preparation is running"
+    assert {:error, message} = Runs.resume("any", endpoint(), "", %{})
+    assert message =~ "Preparation is running"
+
+    emit.("first: preparing")
+    await_preparation(&(&1["message"] == "first: preparing"))
+    opts[:on_result].("first", %{"status" => "qualified"})
+    opts[:on_result].("second", %{"status" => "error", "error" => String.duplicate("x", 5000)})
+
+    running = await_preparation(&(&1["finished"] == 2))
+    assert running["status"] == "running"
+    assert Map.keys(running["errors"]) == ["second"]
+    assert String.length(running["errors"]["second"]) == 2000
+
+    send(worker, {:finish, %{"status" => "error"}})
+    finished = await_preparation(&(&1["status"] == "error"))
+    assert finished["message"] =~ "could not be prepared"
+    assert :ok = Runs.prepare_all()
+    assert_receive {:preparing, worker, _, _}, 3000
+    send(worker, {:finish, %{"status" => "qualified"}})
+    assert await_preparation(&(&1["status"] == "qualified"))["errors"] == %{}
+  end
+
+  test "a failed preparation job reports its error and allows another attempt" do
+    on_exit(fn -> Application.delete_env(:eab, :qualification) end)
+    Application.put_env(:eab, :qualification, fn _, _ -> raise "Cache removal is active" end)
+    assert :ok = Runs.prepare_all()
+    finished = await_preparation(&(&1["status"] == "error"))
+    assert finished["message"] == "Cache removal is active"
+    assert :ok = Runs.prepare_all()
+    await_preparation(&(&1["status"] == "error"))
+  end
+
+  test "stopping preparation releases its work and allows a run" do
+    parent = self()
+    Runs.subscribe()
+    stub_preparation()
+    assert :ok = Runs.prepare_all()
+    assert_receive {:preparing, worker, _, opts}, 3000
+    assert Eab.Retention.lease(opts[:id])
+    monitor = Process.monitor(worker)
+    assert :ok = Runs.stop_preparation()
+    assert_receive {:DOWN, ^monitor, :process, ^worker, _}, 3000
+    await_cleanup()
+    assert Eab.Retention.leased_runs() == []
+    stopped = Runs.snapshot().preparation
+    assert stopped["status"] == "cancelled"
+    assert stopped["message"] =~ "Finished cases stay prepared"
+
+    Application.put_env(:eab, :runner, fn _, _, _ ->
+      send(parent, :run_started)
+      :ok
+    end)
+
+    assert {:ok, id} = Runs.start(endpoint(), "", %{})
+    assert_receive :run_started, 3000
+    await_terminal(id)
+    await_cleanup()
+  end
+
+  test "offline mode refuses a run with unprepared cases before any work starts" do
+    on_exit(fn -> Application.delete_env(:eab, :offline) end)
+    Application.put_env(:eab, :offline, true)
+    Application.put_env(:eab, :runner, fn _, _, _ -> flunk("offline run started") end)
+    assert {:error, message} = Runs.start(endpoint(), "", %{})
+    assert message =~ "Offline mode:"
+    assert message =~ "Prepare all cases"
+    assert Runs.snapshot().active == nil
+    assert Store.runs() == []
+  end
+
   test "error retries are fresh, bounded to errors, preserve the source and have no full score" do
     parent = self()
     Runs.subscribe()

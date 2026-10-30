@@ -17,6 +17,12 @@ defmodule Eab.Cache do
           {artifact, :reused}
 
         {:missing, reason} ->
+          if Eab.Readiness.offline?(),
+            do:
+              raise(
+                "Offline mode cannot prepare #{kind}: #{reason}. Reconnect the internet and click Prepare all cases."
+              )
+
           File.mkdir_p!(Store.root())
           Eab.Retention.ensure_space!(opts)
           artifact = build.(reason) |> Map.put_new("images", [])

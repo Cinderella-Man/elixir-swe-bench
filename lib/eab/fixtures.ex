@@ -52,7 +52,7 @@ defmodule Eab.Fixtures do
         do: id
   end
 
-  defp cached_images(id) do
+  def cached_images(id) do
     spec = Inventory.spec(id)
     inputs = build_inputs(id, spec)
     engines = %{"services" => spec["services"] || %{}}
