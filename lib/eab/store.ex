@@ -185,31 +185,5 @@ defmodule Eab.Store do
     end
   end
 
-  def tail_artifact(id, relative, limit \\ 131_072) do
-    with {:ok, path} <- artifact(id, relative),
-         {:ok, file} <- :file.open(String.to_charlist(path), [:read, :binary, :raw]) do
-      try do
-        {:ok, size} = :file.position(file, :eof)
-        offset = max(size - limit, 0)
-
-        body =
-          case :file.pread(file, offset, limit) do
-            {:ok, body} -> body
-            :eof -> ""
-          end
-
-        # A byte tail can start or end in the middle of an encoded character.
-        body = for <<c::utf8 <- body>>, into: "", do: <<c::utf8>>
-
-        {:ok,
-         if(offset > 0, do: "[Earlier output omitted; download the full log]\n", else: "") <> body}
-      after
-        :file.close(file)
-      end
-    else
-      _ -> :error
-    end
-  end
-
   def valid_id?(id), do: is_binary(id) and Regex.match?(~r/^[a-z0-9-]+$/, id)
 end

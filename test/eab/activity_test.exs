@@ -136,13 +136,8 @@ defmodule Eab.ActivityTest do
     assert Task.await(task) == first <> second
   end
 
-  test "tail reads are bounded and cannot escape artifact paths", %{id: id} do
-    Store.write_text("runs/#{id}/case/activity.log", String.duplicate("a", 100) <> "latest")
-
-    assert {:ok, "[Earlier output omitted; download the full log]\nlatest"} =
-             Store.tail_artifact(id, "case/activity.log", 6)
-
-    assert :error = Store.tail_artifact(id, "../outside")
+  test "log reads cannot escape artifact paths", %{id: id} do
+    assert :error = Store.artifact(id, "../outside")
   end
 
   test "real HTTP streaming preserves the response and writes model text", %{id: id, path: path} do

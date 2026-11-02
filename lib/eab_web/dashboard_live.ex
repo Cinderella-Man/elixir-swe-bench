@@ -6,6 +6,7 @@ defmodule EabWeb.DashboardLive do
     Comparison,
     Evidence,
     Inventory,
+    LogSections,
     Model,
     Readiness,
     Results,
@@ -88,7 +89,10 @@ defmodule EabWeb.DashboardLive do
         selected_case: nil,
         log_case: nil,
         case_attempt: nil,
-        log_text: "",
+        log_sections: [],
+        log_open: MapSet.new(),
+        log_followed: nil,
+        log_read: nil,
         log_available: false,
         follow_output: true,
         evidence_links: [],
@@ -515,14 +519,28 @@ defmodule EabWeb.DashboardLive do
          load_log(
            assign(socket,
              selected_case: if(socket.assigns.selected_case == id, do: nil, else: id),
-             follow_output: true
+             follow_output: true,
+             log_open: MapSet.new(),
+             log_followed: nil,
+             log_read: nil
            )
          )},
       else: {:noreply, socket}
   end
 
-  def handle_event("follow_output", _, socket),
-    do: {:noreply, assign(socket, follow_output: not socket.assigns.follow_output)}
+  def handle_event("follow_output", _, socket) do
+    {:noreply, assign(socket, follow_output: not socket.assigns.follow_output, log_followed: nil)}
+  end
+
+  def handle_event("toggle_log_section", %{"index" => index}, socket) do
+    index = String.to_integer(index)
+    open = socket.assigns.log_open
+
+    open =
+      if index in open, do: MapSet.delete(open, index), else: MapSet.put(open, index)
+
+    {:noreply, load_log(assign(socket, log_open: open))}
+  end
 
   def handle_async(:discovery, {:ok, {:catalog, rows}}, socket) do
     {:noreply, assign(socket, models: rows, detecting: false, error: nil)}
@@ -728,17 +746,56 @@ defmodule EabWeb.DashboardLive do
         result_added: run && Results.added?(run["id"])
       )
 
-    case run && id && Store.tail_artifact(run["id"], "#{id}/activity.log") do
-      {:ok, text} ->
-        assign(socket, log_case: id, log_text: text, log_available: true)
-
-      _ ->
-        assign(socket,
-          log_case: id,
-          log_text: "No command output has been recorded for this case yet.",
-          log_available: false
-        )
+    case run && id && Store.artifact(run["id"], "#{id}/activity.log") do
+      {:ok, path} -> read_log(socket, run, id, path)
+      _ -> no_log(socket, id)
     end
+  end
+
+  # A finished log stops growing, so only new output or a click reads it again.
+  defp read_log(socket, run, id, path) do
+    with {:ok, %{size: size}} <- File.stat(path),
+         true <- {run["id"], id, size, socket.assigns.log_open} != socket.assigns.log_read,
+         {:ok, log} <- File.read(path) do
+      sections = LogSections.split(log, get_in(run, ["case_metadata", id, "task_kind"]))
+      socket = follow_log(socket, sections, run)
+      open = socket.assigns.log_open
+
+      assign(socket,
+        log_case: id,
+        log_available: true,
+        log_read: {run["id"], id, size, open},
+        log_sections:
+          Enum.map(
+            sections,
+            &Map.put(&1, :body, if(&1.index in open, do: LogSections.body(log, &1)))
+          )
+      )
+    else
+      false -> socket
+      _ -> no_log(socket, id)
+    end
+  end
+
+  defp no_log(socket, id),
+    do: assign(socket, log_case: id, log_sections: [], log_read: nil, log_available: false)
+
+  # While a case runs, following moves on to each new section. Anything opened by hand stays.
+  defp follow_log(socket, sections, run) do
+    %{follow_output: follow, log_followed: followed, log_open: open} = socket.assigns
+    newest = sections |> List.last(%{}) |> Map.get(:index)
+
+    running =
+      run["status"] == "running" and
+        (socket.assigns.case_attempt || %{})["status"] not in ["completed", "error"]
+
+    if follow and running and newest != followed,
+      do:
+        assign(socket,
+          log_open: open |> MapSet.delete(followed) |> MapSet.put(newest),
+          log_followed: newest
+        ),
+      else: socket
   end
 
   defp selected(assigns) do
@@ -1707,15 +1764,55 @@ defmodule EabWeb.DashboardLive do
                       download
                     >Download full log ↓</a>
                   </div>
-                  <pre
+                  <div
                     id="case-log"
-                    phx-hook="LogTail"
                     data-follow={to_string(@follow_output)}
                     data-case={"#{@run["id"]}/#{@log_case}"}
-                    tabindex="0"
-                  >{@log_text}</pre>
+                  >
+                    <p :if={@log_sections == []} class="fine-print">
+                      No command output has been recorded for this case yet.
+                    </p>
+                    <section
+                      :for={section <- @log_sections}
+                      class={["log-section", section.body && "is-open"]}
+                    >
+                      <h5 class="log-section-heading">
+                        <button
+                          id={"log-section-toggle-#{@log_case}-#{section.index}"}
+                          class="log-section-toggle"
+                          phx-click="toggle_log_section"
+                          phx-value-index={section.index}
+                          aria-controls={"log-section-#{@log_case}-#{section.index}"}
+                          aria-expanded={to_string(not is_nil(section.body))}
+                        >
+                          <span class="log-section-label">{section.label}</span>
+                          <span :if={section.result} class={"case-status " <> section.tone}><i aria-hidden="true"></i>{section.result}</span>
+                          <span :if={!section.result}></span>
+                          <svg
+                            class="case-chevron"
+                            width="14"
+                            height="14"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="1.8"
+                            aria-hidden="true"
+                          ><path d="m6 9 6 6 6-6" /></svg>
+                        </button>
+                      </h5>
+                      <p :if={section.expected_failures} class="log-section-note">
+                        Runs the submitted tests on the original code, so failures here are expected.
+                      </p>
+                      <pre
+                        :if={section.body}
+                        id={"log-section-#{@log_case}-#{section.index}"}
+                        phx-hook="LogTail"
+                        tabindex="0"
+                      >{section.body}</pre>
+                    </section>
+                  </div>
                   <p class="fine-print">
-                    Updates every second. Docker setup, test output, model responses and agent tool commands appear here.
+                    Updates every second. Docker setup, test output, model responses and agent tool commands appear here, split by stage.
                   </p>
                 </section>
               </article>

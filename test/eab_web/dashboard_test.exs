@@ -85,6 +85,131 @@ defmodule EabWeb.DashboardTest do
     assert has_element?(view, "#case-panel-#{case_id} #case-log", "Tests finished")
   end
 
+  defp log_note(text), do: "\n[10:00:00 UTC] #{text}\n"
+
+  defp log_test_run(states, code) do
+    command =
+      Enum.map_join(
+        ~w(docker exec -w /workspace eab-1 timeout -k 5 300 bash -lc) ++
+          [Eab.TestAdapter.command("exunit", "mix test test/a_test.exs", [])],
+        " ",
+        &Eab.Command.quote/1
+      )
+
+    log_note("$ " <> command) <>
+      Enum.map_join(states, fn state -> "\nEAB_TEST:#{state}:#{Base.encode64(state)}\n" end) <>
+      log_note("Process exited with code #{code}")
+  end
+
+  defp log_run(id, case_id, status, log) do
+    Eab.Store.write("runs/#{id}/run.json", %{
+      "id" => id,
+      "created_at" => "9999-01-01T00:00:00Z",
+      "status" => status,
+      "phase" => status,
+      "message" => "Synthetic",
+      "current_case" => case_id,
+      "cases" => [case_id],
+      "attempts" => %{},
+      "settings" => %{},
+      "model" => %{"model" => "synthetic"}
+    })
+
+    Eab.Store.write_text("runs/#{id}/#{case_id}/activity.log", log)
+    on_exit(fn -> File.rm_rf!(Eab.Store.path("runs/#{id}")) end)
+  end
+
+  test "a finished case's log opens as one collapsed accordion per stage" do
+    id = "log-sections-test"
+    case_id = "plausible-pr-6300"
+
+    log_run(
+      id,
+      case_id,
+      "cancelled",
+      log_note("Preparing #{case_id}") <>
+        "build output\n" <>
+        log_note("Starting Pi for #{case_id}") <>
+        "model output\n" <>
+        log_note("Grading #{case_id}") <>
+        log_test_run(["passed"], 0) <>
+        log_test_run(["passed", "failed"], 2) <>
+        log_test_run(["passed"], 0) <>
+        log_test_run(["passed", "failed"], 2)
+    )
+
+    {:ok, view, _} = live(build_conn(), "/")
+    view |> element("#case-#{case_id}") |> render_click()
+
+    panel = "#case-panel-#{case_id} #case-log"
+    assert has_element?(view, panel, "Preparation")
+    assert has_element?(view, panel, "Pi attempt")
+    assert has_element?(view, panel, "Grading · Submitted tests")
+    assert has_element?(view, panel, "Grading · Preservation")
+
+    # Each outcome reads from the header, so nothing has to be opened to see it.
+    assert has_element?(view, "#{panel} .case-status.passed", "1 test, 0 failed")
+    assert has_element?(view, "#{panel} .case-status.failed", "2 tests, 1 failed")
+    assert has_element?(view, "#{panel} .case-status.pending", "2 tests, 1 failed")
+    assert has_element?(view, "#{panel} .log-section-note", "failures here are expected")
+
+    refute has_element?(view, "#{panel} pre")
+    refute render(view) =~ "build output"
+
+    toggle = "#log-section-toggle-#{case_id}-0"
+    assert has_element?(view, "#{toggle}[aria-expanded=false]")
+    view |> element(toggle) |> render_click()
+    assert has_element?(view, "#{toggle}[aria-expanded=true]")
+    assert has_element?(view, "#log-section-#{case_id}-0", "build output")
+    refute render(view) =~ "model output"
+
+    send(view.pid, :poll_log)
+    assert has_element?(view, "#log-section-#{case_id}-0", "build output")
+
+    view |> element(toggle) |> render_click()
+    refute has_element?(view, "#{panel} pre")
+  end
+
+  test "following a running case moves to each new section and leaves opened ones alone" do
+    id = "log-follow-test"
+    case_id = "plausible-pr-6300"
+    log = log_note("Preparing #{case_id}") <> "build output\n"
+    log_run(id, case_id, "running", log)
+
+    {:ok, view, _} = live(build_conn(), "/")
+    view |> element("#case-#{case_id}") |> render_click()
+    assert has_element?(view, "#log-section-#{case_id}-0", "build output")
+
+    log = log <> log_note("Starting workspace and services for #{case_id}") <> "workspace up\n"
+    Eab.Store.write_text("runs/#{id}/#{case_id}/activity.log", log)
+    send(view.pid, :poll_log)
+    assert has_element?(view, "#log-section-#{case_id}-1", "workspace up")
+    refute has_element?(view, "#log-section-#{case_id}-0")
+
+    view |> element("#log-section-toggle-#{case_id}-0") |> render_click()
+    assert has_element?(view, "#log-section-#{case_id}-0", "build output")
+
+    log = log <> log_note("Starting Pi for #{case_id}") <> "model output\n"
+    Eab.Store.write_text("runs/#{id}/#{case_id}/activity.log", log)
+    send(view.pid, :poll_log)
+    assert has_element?(view, "#log-section-#{case_id}-2", "model output")
+    assert has_element?(view, "#log-section-#{case_id}-0", "build output")
+    refute has_element?(view, "#log-section-#{case_id}-1")
+
+    # A section closed by hand stays closed while its output keeps growing.
+    view |> element("#log-section-toggle-#{case_id}-2") |> render_click()
+    log = log <> "more model output\n"
+    Eab.Store.write_text("runs/#{id}/#{case_id}/activity.log", log)
+    send(view.pid, :poll_log)
+    refute has_element?(view, "#log-section-#{case_id}-2")
+
+    view |> element("button[phx-click=follow_output]") |> render_click()
+    log = log <> log_note("Grading #{case_id}") <> "grading\n"
+    Eab.Store.write_text("runs/#{id}/#{case_id}/activity.log", log)
+    send(view.pid, :poll_log)
+    refute has_element?(view, "#log-section-#{case_id}-3")
+  end
+
   test "local setup page shows current PR cases and waits for a model connection" do
     {:ok, view, html} = live(build_conn(), "/")
     assert html =~ "Benchmark dashboard"
