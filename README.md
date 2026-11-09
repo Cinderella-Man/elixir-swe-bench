@@ -35,13 +35,13 @@ The website is available only from the computer running it. The model endpoint c
 
 ## Run memory on the model host
 
-The benchmark can sample the served model's VRAM and RAM throughout each run. This is independent of optional performance measurements. On this installation it is configured for **ratx570**, using its existing Tailscale SSH access; it does not start, stop or switch the model.
+The benchmark can sample the served model's VRAM and RAM throughout each run. This is independent of optional performance measurements. On this installation it is configured for **rigaorusultra** (formerly ratx570), using its existing Tailscale SSH access; it does not start, stop or switch the model.
 
 The [Elixir collector](tools/memory_collector/README.md) requires Linux cgroup v2, a dedicated model service, `ss` and NVIDIA's `nvidia-smi`. Its release includes Erlang/OTP, so the model host does not need Elixir installed. Build and install the release as described in its README, then set these values in the benchmark's ignored `.env` and rebuild/recreate the benchmark container:
 
 ```dotenv
-EAB_MEMORY_SSH_TARGET=root@ratx570
-EAB_MEMORY_HOSTS=ratx570,100.70.151.84
+EAB_MEMORY_SSH_TARGET=root@rigaorusultra.tail94b7b1.ts.net
+EAB_MEMORY_HOSTS=rigaorusultra,rigaorusultra.tail94b7b1.ts.net,100.119.148.116
 EAB_MEMORY_REMOTE_COLLECTOR=/srv/elixir-agent-benchmark/memory-collector/bin/eab_memory_collector
 EAB_MEMORY_REMOTE_KEY_FILE=/srv/model-rig-lab/.local/secrets/api-key
 ```
@@ -50,7 +50,7 @@ Copy the model host's **already verified** SSH public host entry into `/data/mem
 
 Sampling starts before benchmark work and takes a final reading on completion, failure or cancellation. It resolves the local model listener, checks the artifact and configured context, and follows all GPU processes in its dedicated service cgroup. GPU allocations are mapped by physical UUID; unrelated services are excluded. RAM is cgroup `memory.current`, including charged page cache and kernel memory. Process RSS and whole-host RAM are retained separately in the raw observations. Collection never uses the service-lifetime `memory.peak` as a run peak.
 
-These counters work the same way for llama.cpp and Strata, including Maya's Strata wrapper. The API identifies the model and runtime; it does not supply the RAM/VRAM counters. The collector also records the installed GGUF file size, summing a complete numbered shard set when needed. Exports use this as an `artifact_files` fallback when the server omits weight size. Missing shards and unsupported artifact formats remain unknown; weight-file size is separate from RAM/VRAM usage.
+These counters work the same way for llama.cpp and Strata, including Maya's Strata wrapper. The API identifies the model and runtime; it does not supply the RAM/VRAM counters. The collector also records the installed GGUF file size, summing a complete numbered shard set when needed. Strata reports the pack folder it serves from rather than a weight file; the collector follows the pack's `tensors.txt` to the model's GGUF files. Exports use these files as an `artifact_files` fallback when the server omits weight size, and for the model name and quantization when the server reported only a pack folder. Missing shards and unsupported artifact formats remain unknown; weight-file size is separate from RAM/VRAM usage.
 
 Each run saves:
 

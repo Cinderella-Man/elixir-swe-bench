@@ -180,6 +180,56 @@ defmodule Eab.MemoryCollectorTest do
     assert Collector.identity(Collector.open(ctx.request, ctx.opts))["weight_files"] == nil
   end
 
+  test "follows a Strata pack folder to its model's GGUF shards, not its drafter", ctx do
+    weights = Path.join(ctx.proc, "weights")
+    pack = Path.join(weights, "pack")
+    File.mkdir_p!(pack)
+    first = "Model-UD-IQ1_M-00001-of-00002.gguf"
+    second = "Model-UD-IQ1_M-00002-of-00002.gguf"
+    drafter = "dspark-Model-Q8_0.gguf"
+
+    for {name, body} <- [{first, "12"}, {second, "345"}, {drafter, "6"}],
+        do: File.write!(Path.join(weights, name), body)
+
+    listing = fn names ->
+      lines = names |> Enum.with_index() |> Enum.map(fn {name, i} -> "file #{i} #{name}\n" end)
+      File.write!(Path.join(pack, "tensors.txt"), [lines, "t head.weight Q6_K 1 224 5 1 1\n"])
+    end
+
+    File.write!(Path.join(pack, "ds4.txt"), "format gguf\nmodel_dir #{weights}\n")
+    listing.([first, second, drafter])
+    original = ctx.opts[:http]
+
+    http = fn endpoint, key, route ->
+      props = original.(endpoint, key, route)
+      if route == "/props", do: Map.put(props, "model_path", pack), else: props
+    end
+
+    state =
+      Collector.open(Map.put(ctx.request, "artifact", "pack"), Keyword.put(ctx.opts, :http, http))
+
+    weights_files = Collector.identity(state)["weight_files"]
+    assert weights_files["size_bytes"] == 5
+    assert Enum.map(weights_files["files"], & &1["name"]) == [first, second]
+    refute JSON.encode!(weights_files) =~ ctx.proc
+
+    # A lone listed file stands for itself; anything ambiguous or unsafe stays unknown.
+    listing.([drafter])
+    assert Collector.identity(state)["weight_files"]["size_bytes"] == 1
+
+    for names <- [
+          [first, drafter, "other-Q4_K-00001-of-00002.gguf"],
+          [drafter, "b.gguf"],
+          ["../x.gguf"]
+        ] do
+      listing.(names)
+      assert Collector.identity(state)["weight_files"] == nil
+    end
+
+    File.rm!(Path.join(pack, "tensors.txt"))
+    assert Collector.identity(state)["weight_files"] == nil
+  end
+
   test "GPU allocations aggregate service processes by physical UUID and reject unavailable counters" do
     cards = [["b", "3090", "24576"], ["a", "3090", "24576"]]
     apps = [["b", "10", "100"], ["a", "10", "200"], ["a", "11", "30"], ["a", "99", "500"]]

@@ -23,7 +23,7 @@ defmodule Eab.Results.Schema do
     for key <- ~w(name backend), do: text!(model[key], key)
 
     require!(
-      model["quantization_source"] in ~w(reported owner_supplied not_reported),
+      model["quantization_source"] in ~w(reported artifact_files owner_supplied not_reported),
       "Invalid quantization source"
     )
 

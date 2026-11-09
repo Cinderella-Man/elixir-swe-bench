@@ -247,6 +247,56 @@ defmodule Eab.ResultsTest do
     reported = put_in(source, ["model", "metadata"], %{"model" => %{"size" => 9876}})
     assert Results.export!(reported)["model"]["size_bytes"] == 9876
     assert Results.export!(reported)["model"]["size_source"] == "reported"
+
+    # Strata reports only its pack folder; the collector names the GGUF shards behind it.
+    shards = ~w(Model-1017-UD-IQ1_M-00001-of-00002.gguf Model-1017-UD-IQ1_M-00002-of-00002.gguf)
+
+    pack =
+      source
+      |> Map.put("model", %{
+        "model" => "model-alias",
+        "backend" => "strata",
+        "profile" => %{"model_path" => "/private/hot/model/pack"}
+      })
+      |> update_in(["memory", "sessions", Access.at(0), "identity"], fn identity ->
+        Map.merge(identity, %{
+          "model_artifact" => "pack",
+          "backend" => "strata",
+          "weight_files" => %{
+            "size_bytes" => 30,
+            "files" => Enum.map(shards, &%{"name" => &1, "size_bytes" => 15})
+          }
+        })
+      end)
+
+    result = Results.export!(pack)
+    assert result["model"]["name"] == "Model-1017"
+    assert result["model"]["quantization"] == "UD-IQ1_M"
+    assert result["model"]["quantization_source"] == "artifact_files"
+    assert result["model"]["size_bytes"] == 30
+    assert result["setup"]["model"]["name"] == "model-alias"
+    assert result["setup"]["model"]["artifact"] == nil
+    refute Jason.encode!(result) =~ "/private/hot"
+
+    unobserved =
+      update_in(
+        pack,
+        ["memory", "sessions", Access.at(0), "identity"],
+        &Map.delete(&1, "weight_files")
+      )
+
+    result = Results.export!(unobserved)
+    assert result["model"]["name"] == "model-alias"
+    assert result["model"]["quantization_source"] == "not_reported"
+    assert entry(result)["resources"]["model_artifact"] == "pack"
+
+    assert Results.export!(unobserved, quantization: "IQ1_M")["model"]["quantization_source"] ==
+             "owner_supplied"
+
+    # An owner value that contradicts the observed files is still rejected.
+    assert_raise ArgumentError, ~r/different model artifact/, fn ->
+      Results.export!(pack, quantization: "IQ1_M")
+    end
   end
 
   test "incomplete, partial, mismatched and duplicated runs cannot be published" do

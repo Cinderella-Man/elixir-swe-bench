@@ -55,6 +55,47 @@ defmodule Eab.ModelIdentityTest do
     assert Eab.ModelIdentity.details(%{"model" => "gpt-6-astra"})["quantization"] == nil
   end
 
+  test "a Strata pack folder is not a model name; the alias stands until weight files name it" do
+    endpoint = %{
+      "model" => "deepseek-v41-flash-atomic",
+      "backend" => "strata",
+      "profile" => %{"model_path" => "/srv/hot/deepseek_v41_flash_atomic_iq1_m/pack"}
+    }
+
+    identity = Eab.ModelIdentity.details(endpoint)
+    assert identity["name"] == "deepseek-v41-flash-atomic"
+    assert identity["artifact"] == nil and identity["quantization"] == nil
+    assert identity["source"] == "reported_name"
+    assert Eab.ModelIdentity.served_artifact(endpoint) == "pack"
+
+    # Runs saved before the fix carry the folder as their artifact, with or without metadata.
+    stale = %{"version" => 1, "name" => "pack", "artifact" => "pack", "quantization" => nil}
+    assert Eab.ModelIdentity.label(Map.put(endpoint, "identity", stale)) == identity["name"]
+
+    summary = Map.take(endpoint, ~w(model backend)) |> Map.put("identity", stale)
+    assert Eab.ModelIdentity.label(summary) == "deepseek-v41-flash-atomic"
+
+    claude = %{"backend" => "anthropic", "identity" => %{"version" => 1, "name" => "Claude"}}
+    assert Eab.ModelIdentity.label(claude) == "Claude"
+
+    files = %{
+      "size_bytes" => 3,
+      "files" => [
+        %{"name" => "DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00001-of-00002.gguf", "size_bytes" => 1},
+        %{"name" => "DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00002-of-00002.gguf", "size_bytes" => 2}
+      ]
+    }
+
+    observed = Eab.ModelIdentity.from_files(files)
+
+    assert observed["name"] == "DeepSeek-V4.1-Flash-1017" and
+             observed["quantization"] == "UD-IQ1_M"
+
+    assert observed["artifact"] == "DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00001-of-00002.gguf"
+    assert observed["source"] == "host_files"
+    assert Eab.ModelIdentity.from_files(nil) == nil
+  end
+
   test "connection shows skipped memory collection until the exact endpoint hostname is configured" do
     old_memory = Application.get_env(:eab, :memory_monitor)
     old_http = Application.get_env(:eab, :http_request)

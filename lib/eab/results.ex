@@ -103,11 +103,19 @@ defmodule Eab.Results do
 
     model = run["model"] || %{}
     identity = ModelIdentity.details(model)
-    quant = Keyword.get(opts, :quantization, identity["quantization"])
 
-    file_size =
-      Eab.Results.Resources.weight_size(run["memory"], identity["artifact"], model["backend"])
+    weights =
+      Eab.Results.Resources.weight_files(
+        run["memory"],
+        ModelIdentity.served_artifact(model),
+        model["backend"]
+      )
 
+    file_size = weights && weights["size_bytes"]
+    # Strata reports only its pack folder; the collector names the GGUF files behind it.
+    files = if is_nil(identity["artifact"]), do: ModelIdentity.from_files(weights)
+    file_quant = files["quantization"]
+    quant = Keyword.get(opts, :quantization, identity["quantization"] || file_quant)
     size = Keyword.get(opts, :size_bytes, identity["size_bytes"] || file_size)
 
     resources =
@@ -125,10 +133,20 @@ defmodule Eab.Results do
       "series_id" => series,
       "benchmark" => selected["id"],
       "model" => %{
-        "name" => opts[:model_label] || identity["name"],
+        "name" => opts[:model_label] || files["name"] || identity["name"],
         "backend" => model["backend"],
         "quantization" => quant,
-        "quantization_source" => source(opts, :quantization, quant),
+        "quantization_source" =>
+          cond do
+            Keyword.has_key?(opts, :quantization) or identity["quantization"] ->
+              source(opts, :quantization, quant)
+
+            file_quant ->
+              "artifact_files"
+
+            true ->
+              "not_reported"
+          end,
         "size_bytes" => size,
         "size_source" =>
           cond do

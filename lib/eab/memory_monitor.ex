@@ -171,7 +171,7 @@ defmodule Eab.MemoryMonitor do
 
     request = %{
       "port" => URI.parse(run["model"]["url"]).port,
-      "artifact" => ModelIdentity.details(run["model"])["artifact"],
+      "artifact" => ModelIdentity.served_artifact(run["model"]),
       "context_tokens" => run["model"]["context"],
       "backend" => run["model"]["backend"],
       "key_file" => config[:key_file]

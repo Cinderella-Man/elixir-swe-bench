@@ -7,21 +7,22 @@ defmodule Eab.Results.Resources do
   @sampled ~w(kind started_at finished_at gpus peak_vram_bytes peak_ram_bytes peak_rss_bytes peak_combined_bytes sample_count interval_ms session_count coverage gap_count) ++
              @identity
 
-  def weight_size(nil, _artifact, _backend), do: nil
+  def weight_files(nil, _artifact, _backend), do: nil
 
-  def weight_size(memory, artifact, backend) do
-    sizes =
+  def weight_files(memory, artifact, backend) do
+    observed =
       for session <- memory["sessions"] || [], session["sample_count"] > 0 do
         identity = session["identity"] || %{}
-        size = get_in(identity, ["weight_files", "size_bytes"])
+        files = identity["weight_files"]
+        size = files["size_bytes"]
 
         if identity["model_artifact"] == artifact and identity["backend"] == backend and
              is_integer(size) and size > 0,
-           do: size
+           do: files
       end
 
-    case Enum.uniq(sizes) do
-      [size] -> size
+    case Enum.uniq(observed) do
+      [files] -> files
       _ -> nil
     end
   end
@@ -70,7 +71,20 @@ defmodule Eab.Results.Resources do
 
       peaks = memory["peaks"]
 
+      # A Strata pack folder names no model; publish the first weight file found behind it.
+      artifact =
+        case get_in(identity, ["weight_files", "files"]) do
+          [%{"name" => name} | _] when is_binary(name) ->
+            if Eab.ModelIdentity.folder?(identity["model_artifact"]),
+              do: name,
+              else: identity["model_artifact"]
+
+          _ ->
+            identity["model_artifact"]
+        end
+
       Map.merge(Map.take(identity, @identity), %{
+        "model_artifact" => artifact,
         "kind" => "run_samples",
         "started_at" => hd(sessions)["started_at"],
         "finished_at" => List.last(sessions)["finished_at"],
@@ -137,7 +151,8 @@ defmodule Eab.Results.Resources do
     identity = Eab.ModelIdentity.details(%{"profile" => %{"model_path" => artifact}})
 
     require!(
-      identity["name"] == model["name"] and identity["quantization"] == model["quantization"],
+      Eab.ModelIdentity.folder?(artifact) or
+        (identity["name"] == model["name"] and identity["quantization"] == model["quantization"]),
       "Resource observation is for a different model artifact"
     )
 
