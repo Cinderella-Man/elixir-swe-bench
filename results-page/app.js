@@ -11,12 +11,10 @@
   };
   if (!data || data.schema_version !== 5) {
     $("chart").append(node("p", "empty", "Results could not be loaded. Please reload."));
-    $("memory-limit").disabled = true;
     return;
   }
   const records = data.results;
   if (records.length === 0) {
-    document.querySelector(".memory-control").remove();
     document.querySelector("footer").remove();
     $("chart").append(node("p", "empty", "No benchmark results yet."));
     return;
@@ -55,9 +53,6 @@
   // Only a run's sampled peak is a measurement; a loaded-model snapshot is not a run's requirement.
   const required = r => r.resources?.kind === "run_samples" ? r.resources.peak_combined_bytes : null;
   const largest = records.reduce((max, r) => Math.max(max, (required(r) || 0) / 1e9), 0);
-  const allValue = Math.max(100, Math.ceil(largest / 10) * 10) + 1;
-  $("memory-limit").max = allValue;
-  $("memory-limit").value = allValue;
   const settings = {
     max_tokens: "Generation budget / case", budget_policy: "Budget policy", context_policy: "Context policy",
     window_tokens: "Context limit", response_tokens: "Tokens / response", safety_tokens: "Safety tokens",
@@ -205,9 +200,9 @@
     if (withFrontier) item("line", "Most cases passed for its memory");
     return list;
   }
-  function point(r, x, best, beyond, number) {
+  function point(r, x, best, number) {
     const point = node("button", "scatter-point" + (r.harness.name === "claude_code" ? " diamond" : "") + (r.complete ? "" : " provisional") +
-      (best ? " best" : "") + (beyond ? " beyond" : "") + (selected === r.series_id ? " selected" : ""));
+      (best ? " best" : "") + (selected === r.series_id ? " selected" : ""));
     point.id = `point-${r.series_id}`;
     point.dataset.number = number;
     point.style.left = `${x * 100}%`;
@@ -268,7 +263,7 @@
     grid.append(body); view.append(grid);
     return view;
   }
-  function scatter(shown, cap, all) {
+  function scatter(shown) {
     const figure = node("div", "scatter");
     const measured = shown.filter(r => required(r) != null), other = shown.filter(r => required(r) == null);
     const best = frontier(measured);
@@ -288,20 +283,15 @@
       area.append(line);
     }
     if (best.length > 1) area.append(frontierLine(best));
-    if (!all) {
-      const limit = node("div", "limit-line");
-      limit.style.left = `${Math.min(cap / memoryMax, 1) * 100}%`;
-      area.append(limit);
-    }
     // Numbers follow the score order, so the key below reads from the top of the chart down.
     const number = r => shown.indexOf(r) + 1;
-    for (const r of measured) area.append(point(r, required(r) / 1e9 / memoryMax, best.includes(r), !all && required(r) / 1e9 > cap, number(r)));
+    for (const r of measured) area.append(point(r, required(r) / 1e9 / memoryMax, best.includes(r), number(r)));
     body.append(area);
     if (other.length) {
       const strip = node("div", "api-strip");
       strip.append(node("span", "strip-title", other.every(hosted) ? "API" : "API or not measured"));
       // Spread across the strip: API models have no memory to place them by.
-      other.forEach((r, i) => strip.append(point(r, (i + 1) / (other.length + 1), false, !all, number(r))));
+      other.forEach((r, i) => strip.append(point(r, (i + 1) / (other.length + 1), false, number(r))));
       body.append(strip);
     }
     const tipBox = node("div", "chart-tip");
@@ -344,18 +334,13 @@
     key.hidden = numbered.length === 0;
   }
   function render() {
-    const cap = Number($("memory-limit").value), all = cap === allValue;
     const shown = [...records].sort((a, b) => b.score_percent - a.score_percent || a.model.name.localeCompare(b.model.name) || b.run_count - a.run_count);
-    $("memory-value").textContent = all ? "All" : `${cap} GB`;
-    $("memory-limit").setAttribute("aria-valuetext", all ? "All models" : `Up to ${cap} GB of VRAM and RAM`);
-    $("chart").replaceChildren(scatter(shown, cap, all));
+    $("chart").replaceChildren(scatter(shown));
     placeLabels();
     const active = shown.find(r => r.series_id === selected);
     if (active) $("chart").append(details(active)); else selected = null;
-    const within = records.filter(r => required(r) != null && required(r) / 1e9 <= cap).length;
-    $("result-status").textContent = all ? `${records.length} run series` : `${within} of ${records.length} run series within ${cap} GB`;
+    $("result-status").textContent = `${records.length} run series`;
   }
-  $("memory-limit").addEventListener("input", render);
   window.addEventListener("resize", placeLabels);
   render();
 })();
