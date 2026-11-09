@@ -265,6 +265,8 @@ On 2026-11-09 the user asked whether model tokens per second were collected. Eve
 
 On 2026-11-09, with about twenty more models planned, the user asked for each result to name who made its quantization, so same-sounding models from different makers are not confused. Public schema 6 adds `quantized_by` with its source. The memory collector reads it from the served file's GGUF header; that maker joins the series setup, so identically named files from different makers stay separate series, while a publisher-supplied maker for a file that names no one is shown only. The seven local series were re-keyed with makers read from their archived files, and the series labelled Qwen3.8-Flash-Next-GSQ-RCO now carries the Coder name its header and repository use.
 
+On 2026-11-09 the user asked to stop configuring memory collection by hand on every machine that runs the benchmark. Collection is now on by default (`EAB_MEMORY=off` turns it off): for a llama.cpp or Strata endpoint the collector runs as root on the endpoint's own host, samples only that host, and receives the model server's API key over SSH instead of a key-file path on the host. The `.env` target, host list and key file remain optional overrides. The user chose to confirm each new host's SSH key in the dashboard rather than trusting it on first contact: the dashboard connects once into a scratch known_hosts file, running only `exit` and sending no API key, shows the key's SHA-256 fingerprint, and adds exactly that key to the volume's `known_hosts` on the user's click. Until then runs proceed without RAM/VRAM.
+
 ## Selecting future new cases — 2026-10-18
 
 Status: closed at the user's request. No case-selection or combined-result feature is being pursued from this discussion.

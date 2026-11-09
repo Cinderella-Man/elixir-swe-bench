@@ -96,7 +96,7 @@ defmodule Eab.ModelIdentityTest do
     assert Eab.ModelIdentity.from_files(nil) == nil
   end
 
-  test "connection shows skipped memory collection until the exact endpoint hostname is configured" do
+  test "connection shows memory collection skipped for an unlisted or untrusted host, and trust in two clicks" do
     old_memory = Application.get_env(:eab, :memory_monitor)
     old_http = Application.get_env(:eab, :http_request)
 
@@ -140,20 +140,42 @@ defmodule Eab.ModelIdentityTest do
       assert has_element?(view, "#memory-collection-status", "rig.example.ts.net")
       assert has_element?(view, "#memory-collection-status", "EAB_MEMORY_HOSTS")
 
-      Application.put_env(:eab, :memory_monitor,
-        hosts: ["rig", "rig.example.ts.net"],
-        target: "rig"
-      )
+      # Without a target the collector would run as root on the endpoint's own host, once
+      # that host's SSH key is trusted: read it, show its fingerprint, then trust it.
+      dir = Path.join(System.tmp_dir!(), "eab-trust-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf!(dir) end)
+      blob = Base.encode64(:crypto.strong_rand_bytes(51))
+      ssh = Path.join(dir, "fake-ssh")
 
+      File.write!(ssh, """
+      #!/bin/sh
+      for a in "$@"; do case "$a" in UserKnownHostsFile=*) f="${a#UserKnownHostsFile=}";; esac; done
+      echo "rig.example.ts.net ssh-ed25519 #{blob}" > "$f"
+      """)
+
+      File.chmod!(ssh, 0o755)
+      known = Path.join(dir, "known_hosts")
+      Application.put_env(:eab, :memory_monitor, known_hosts: known, executable: ssh)
       render_submit(view, "connect", connection)
       render_async(view)
+      assert has_element?(view, "#memory-collection-status", "rig.example.ts.net's SSH host key")
+      refute has_element?(view, "#trust-host-key")
+
+      view |> element("#check-host-key") |> render_click()
+      fingerprint = Base.encode64(:crypto.hash(:sha256, Base.decode64!(blob)), padding: false)
+      assert has_element?(view, "#host-key", "SHA256:" <> fingerprint)
+
+      view |> element("#trust-host-key") |> render_click()
+      assert File.read!(known) == "rig.example.ts.net ssh-ed25519 #{blob}\n"
       assert has_element?(view, "#memory-collection-status", "RAM/VRAM collection is configured")
+      refute has_element?(view, "#host-key")
 
       Application.delete_env(:eab, :memory_monitor)
       render_submit(view, "connect", connection)
       render_async(view)
       assert has_element?(view, "#memory-collection-status", "RAM/VRAM will not be recorded")
-      assert has_element?(view, "#memory-collection-status", "EAB_MEMORY_SSH_TARGET")
+      assert has_element?(view, "#memory-collection-status", "EAB_MEMORY is off")
     end
   end
 

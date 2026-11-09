@@ -14,7 +14,7 @@ defmodule Eab.MemoryMonitor do
   defp gb(nil), do: "—"
   defp gb(bytes), do: "#{Float.round(bytes / 1_000_000_000, 1)} GB"
 
-  def start(run) do
+  def start(run, key \\ "") do
     case configuration(run["model"]) do
       nil ->
         if run["memory"],
@@ -22,6 +22,8 @@ defmodule Eab.MemoryMonitor do
           else: {:ok, nil, nil}
 
       config ->
+        config = Keyword.put(config, :api_key, key)
+
         {:ok, pid} =
           DynamicSupervisor.start_child(Eab.MemoryMonitors, {__MODULE__, {self(), run, config}})
 
@@ -81,7 +83,10 @@ defmodule Eab.MemoryMonitor do
         "RAM/VRAM collection is configured. The collector must connect before the run can start."
 
       :disabled ->
-        "RAM/VRAM will not be recorded: set EAB_MEMORY_SSH_TARGET and EAB_MEMORY_HOSTS."
+        "RAM/VRAM will not be recorded: EAB_MEMORY is off."
+
+      {:untrusted, host} ->
+        "RAM/VRAM will not be recorded until #{host}'s SSH host key is trusted below."
 
       {:unlisted_host, host} ->
         "RAM/VRAM will not be recorded: add #{host} to EAB_MEMORY_HOSTS."
@@ -91,16 +96,123 @@ defmodule Eab.MemoryMonitor do
     end
   end
 
+  @doc "The model host whose SSH key must be trusted before memory can be collected, or nil."
+  def untrusted_host(endpoint) do
+    case configuration_status(endpoint) do
+      {:untrusted, host} -> host
+      _ -> nil
+    end
+  end
+
+  # Without EAB_MEMORY_SSH_TARGET the collector runs as root on the model endpoint's own host,
+  # and without EAB_MEMORY_HOSTS only that host is sampled. Its SSH key must be trusted first.
   defp configuration_status(endpoint) do
     config = Application.get_env(:eab, :memory_monitor)
     host = URI.parse(endpoint["url"] || "").host
 
     cond do
-      endpoint["backend"] not in ["strata", "llama_cpp"] -> :unsupported
+      endpoint["backend"] not in ["strata", "llama_cpp"] or host in [nil, ""] -> :unsupported
       is_nil(config) -> :disabled
-      host not in config[:hosts] -> {:unlisted_host, host}
-      true -> {:configured, config}
+      config[:hosts] && host not in config[:hosts] -> {:unlisted_host, host}
+      true -> trusted(Keyword.put(config, :target, config[:target] || "root@" <> host))
     end
+  end
+
+  # A test collector (args) needs no host key.
+  defp trusted(config) do
+    host = ssh_host(config[:target])
+
+    if config[:args] || known?(config[:known_hosts], host),
+      do: {:configured, config},
+      else: {:untrusted, host}
+  end
+
+  defp ssh_host(target), do: target |> String.split("@") |> List.last()
+
+  defp known?(path, host) do
+    case File.read(path) do
+      {:ok, text} ->
+        text
+        |> String.split("\n", trim: true)
+        |> Enum.reject(&String.starts_with?(&1, "#"))
+        |> Enum.any?(&(hd(String.split(&1, " ", parts: 2)) |> names?(host)))
+
+      _ ->
+        false
+    end
+  end
+
+  # A known_hosts entry names its hosts in plain text, comma-separated, or hashed as
+  # |1|salt|hmac (ssh-keyscan -H): HMAC-SHA1 of the host name keyed with the salt.
+  defp names?("|1|" <> hashed, host) do
+    with [salt, mac] <- String.split(hashed, "|"),
+         {:ok, salt} <- Base.decode64(salt),
+         {:ok, mac} <- Base.decode64(mac),
+         do: :crypto.mac(:hmac, :sha, salt, host) == mac,
+         else: (_ -> false)
+  end
+
+  defp names?(hosts, host), do: host in String.split(hosts, ",")
+
+  @doc """
+  The SSH key the model host offers, read with ssh into a scratch file and not trusted, so the
+  dashboard can show its fingerprint. Where the host accepts the login, as Tailscale SSH does,
+  the connection runs only `exit`; the API key and collector request are never sent.
+  """
+  def host_key(endpoint) do
+    config = Application.get_env(:eab, :memory_monitor) || []
+    host = untrusted_host(endpoint) || raise "This model host needs no SSH key"
+    target = config[:target] || "root@" <> URI.parse(endpoint["url"]).host
+    scratch = Path.join(System.tmp_dir!(), "eab-host-key-#{System.unique_integer([:positive])}")
+
+    try do
+      ssh =
+        config[:executable] || System.find_executable("ssh") ||
+          raise "SSH client is not installed"
+
+      System.cmd(
+        ssh,
+        ~w(-F /dev/null -T -o BatchMode=yes -o ConnectTimeout=5 -o IdentityAgent=none -o IdentitiesOnly=yes) ++
+          [
+            "-o",
+            "IdentityFile=#{config[:ssh_key] || "none"}",
+            "-o",
+            "StrictHostKeyChecking=accept-new"
+          ] ++
+          [
+            "-o",
+            "UserKnownHostsFile=#{scratch}",
+            "-o",
+            "GlobalKnownHostsFile=/dev/null",
+            target,
+            "exit"
+          ],
+        stderr_to_stdout: true
+      )
+
+      with {:ok, text} <- File.read(scratch),
+           [line | _] <- String.split(text, "\n", trim: true),
+           [^host, type, blob] <- String.split(line, " ", parts: 3),
+           {:ok, bytes} <- Base.decode64(blob) do
+        fingerprint = "SHA256:" <> Base.encode64(:crypto.hash(:sha256, bytes), padding: false)
+        %{host: host, type: type, line: line, fingerprint: fingerprint}
+      else
+        _ -> raise "#{host} did not present an SSH host key"
+      end
+    after
+      File.rm(scratch)
+    end
+  end
+
+  @doc "Trusts a host key the dashboard showed, by adding exactly that line to known_hosts."
+  def trust(endpoint, %{host: host, line: line}) do
+    config = Application.get_env(:eab, :memory_monitor) || raise "Memory collection is off"
+    unless untrusted_host(endpoint) == host, do: raise("This host key is not the one to trust")
+    path = config[:known_hosts]
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, line <> "\n", [:append])
+    File.chmod!(path, 0o600)
+    :ok
   end
 
   # With no key the connection relies on the host's own SSH service, such as Tailscale
@@ -174,6 +286,8 @@ defmodule Eab.MemoryMonitor do
       "artifact" => ModelIdentity.served_artifact(run["model"]),
       "context_tokens" => run["model"]["context"],
       "backend" => run["model"]["backend"],
+      # The model server's own API key, over SSH: the collector only queries that server.
+      "key" => config[:api_key],
       "key_file" => config[:key_file]
     }
 

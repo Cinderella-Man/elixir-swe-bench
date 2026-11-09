@@ -57,6 +57,8 @@ defmodule EabWeb.DashboardLive do
           "claude_code" => %{}
         },
         validation: false,
+        host_key: nil,
+        trusted_hosts: [],
         parallel: 1,
         confirm_stop: false,
         check_kind: "",
@@ -218,6 +220,32 @@ defmodule EabWeb.DashboardLive do
        endpoint: endpoint,
        settings: Map.put(socket.assigns.settings, "reasoning_effort", effort)
      )}
+  end
+
+  # Reads the model host's SSH key without trusting it; the fingerprint is shown for confirmation.
+  def handle_event("check_host_key", _, socket) do
+    {:noreply,
+     try do
+       assign(socket, host_key: Eab.MemoryMonitor.host_key(socket.assigns.endpoint), error: nil)
+     rescue
+       error -> assign(socket, host_key: nil, error: Exception.message(error))
+     end}
+  end
+
+  # Trusts exactly the key shown above, kept on the server between the two clicks.
+  def handle_event("trust_host_key", _, socket) do
+    {:noreply,
+     try do
+       :ok = Eab.MemoryMonitor.trust(socket.assigns.endpoint, socket.assigns.host_key)
+
+       assign(socket,
+         host_key: nil,
+         trusted_hosts: [socket.assigns.host_key.host | socket.assigns.trusted_hosts],
+         error: nil
+       )
+     rescue
+       error -> assign(socket, host_key: nil, error: Exception.message(error))
+     end}
   end
 
   def handle_event("claude_code_model", %{"model" => model}, socket) do
@@ -874,6 +902,11 @@ defmodule EabWeb.DashboardLive do
     end
   end
 
+  # Memory status depends on known_hosts, not only on the endpoint; naming the hosts trusted in
+  # this session makes LiveView render these lines again after a key is trusted.
+  defp memory_label(endpoint, _trusted_hosts), do: Eab.MemoryMonitor.configuration_label(endpoint)
+  defp untrusted_host(endpoint, _trusted_hosts), do: Eab.MemoryMonitor.untrusted_host(endpoint)
+
   defp model_detail(endpoint, field) do
     metadata = endpoint["metadata"]["model"]
     get_in(metadata, ["meta", field]) || metadata[field] || "Not reported"
@@ -1266,8 +1299,29 @@ defmodule EabWeb.DashboardLive do
                   "Server-reported metadata. Artifact identity is unverified."}
               </p>
               <p :if={@provider == "local"} id="memory-collection-status" class="fine-print">
-                {Eab.MemoryMonitor.configuration_label(@endpoint)}
+                {memory_label(@endpoint, @trusted_hosts)}
               </p>
+              <div
+                :if={@provider == "local" and untrusted_host(@endpoint, @trusted_hosts)}
+                id="host-key"
+                class="fine-print"
+              >
+                <p :if={@host_key && @host_key.host == untrusted_host(@endpoint, @trusted_hosts)}>
+                  {@host_key.host} presents the {@host_key.type} key <code>{@host_key.fingerprint}</code>.
+                  Trust it only if this matches the host's own key (on the host: <code>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code>).
+                </p>
+                <button
+                  :if={@host_key && @host_key.host == untrusted_host(@endpoint, @trusted_hosts)}
+                  id="trust-host-key"
+                  type="button"
+                  phx-click="trust_host_key"
+                >
+                  Trust this key
+                </button>
+                <button id="check-host-key" type="button" class="secondary" phx-click="check_host_key">
+                  Check SSH host key
+                </button>
+              </div>
               <p :if={@provider == "local"} id="server-thinking" class="fine-print">
                 Server thinking preset: {Eab.Thinking.reported(@endpoint) || "Not reported"}
               </p>

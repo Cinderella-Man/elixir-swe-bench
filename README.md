@@ -37,16 +37,21 @@ The website is available only from the computer running it. The model endpoint c
 
 The benchmark can sample the served model's VRAM and RAM throughout each run. This is independent of optional performance measurements. It reaches the model host over SSH (for example Tailscale SSH); it does not start, stop or switch the model.
 
-The [Elixir collector](tools/memory_collector/README.md) requires Linux cgroup v2, a dedicated model service, `ss` and NVIDIA's `nvidia-smi`. Its release includes Erlang/OTP, so the model host does not need Elixir installed. Build and install the release as described in its README, then set these values in the benchmark's ignored `.env` and rebuild/recreate the benchmark container:
+The [Elixir collector](tools/memory_collector/README.md) requires Linux cgroup v2, a dedicated model service, `ss` and NVIDIA's `nvidia-smi`. Its release includes Erlang/OTP, so the model host does not need Elixir installed. Build and install it on the model host as described in its README.
+
+The benchmark itself needs no configuration. For a llama.cpp or Strata endpoint it runs the collector as root on the endpoint's own host over SSH (for example Tailscale SSH, which needs no key), samples only that host, and passes the collector the model server's API key you connected with, over the SSH connection; the collector uses it only to query that server. The first time you connect to a model host, the connected-model card says RAM/VRAM will not be recorded until its SSH host key is trusted. **Check SSH host key** connects once, keeping the key the host presents in a scratch file rather than trusting it, runs only `exit` and sends no API key; the card then shows the key's fingerprint. Compare it with the host's own (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the host), then **Trust this key**: exactly that key is added to `/data/memory/known_hosts` in the benchmark volume (mode 600). Until then runs proceed without RAM/VRAM. SSH then checks the host strictly, so a changed key is refused; remove its line to trust a new one. Entries added by hand, plain or hashed (`ssh-keyscan -H`), count as trusted.
+
+Optional settings in the benchmark's ignored `.env` (recreate the container after changing them):
 
 ```dotenv
-EAB_MEMORY_SSH_TARGET=root@<model-host>.<tailnet>.ts.net
-EAB_MEMORY_HOSTS=<model-host>,<model-host>.<tailnet>.ts.net,<model-host-ip>
+EAB_MEMORY=off                                   # record no RAM/VRAM
+EAB_MEMORY_SSH_TARGET=root@<model-host>          # when SSH reaches the model host by another name, as over a cable
+EAB_MEMORY_HOSTS=<host>,<host>.<tailnet>.ts.net  # sample only these endpoint hostnames/IPs
+EAB_MEMORY_SSH_KEY=/data/memory/id_ed25519       # a key for a plain sshd
 EAB_MEMORY_REMOTE_COLLECTOR=/srv/elixir-agent-benchmark/memory-collector/bin/eab_memory_collector
-EAB_MEMORY_REMOTE_KEY_FILE=<path to the model server's API key file on the model host>
 ```
 
-Copy the model host's **already verified** SSH public host entry into `/data/memory/known_hosts` in the benchmark volume (mode 600). The SSH client uses strict host verification and no private key or agent; this configuration relies on Tailscale SSH authentication. Set `EAB_MEMORY_SSH_KEY` to use a key with a plain `sshd`, as on [a direct cable](docs/runbook.md#memory-collection-over-the-cable). The remote key-file path refers to the existing model API key **on that host**. Its contents never enter the benchmark or its evidence. `EAB_MEMORY_HOSTS` must list the exact hostnames/IPs used in the model endpoint URL, including the full Tailscale DNS name if you connect with it; listing a short hostname does not include its aliases. Other hosts and hosted APIs are not sampled. Empty `EAB_MEMORY_SSH_TARGET` disables collection. The connected-model card states whether collection is configured, disabled or skipped for an unlisted hostname.
+`EAB_MEMORY_HOSTS` must list the exact hostnames/IPs used in endpoint URLs, including the full Tailscale DNS name if you connect with it; a short hostname does not include its aliases. With `EAB_MEMORY_SSH_KEY` the client uses that key with a plain `sshd`, as on [a direct cable](docs/runbook.md#memory-collection-over-the-cable); otherwise it offers no key or agent. `EAB_MEMORY_REMOTE_KEY_FILE` (the model server's key file on the host) is only for collectors installed before 2026-11-09, which cannot take the key over SSH. Hosted APIs are never sampled. The connected-model card states whether collection is configured, off, waiting for a host key or skipped for an unlisted hostname.
 
 Sampling starts before benchmark work and takes a final reading on completion, failure or cancellation. It resolves the local model listener, checks the artifact and configured context, and follows all GPU processes in its dedicated service cgroup. GPU allocations are mapped by physical UUID; unrelated services are excluded. RAM is cgroup `memory.current`, including charged page cache and kernel memory. Process RSS and whole-host RAM are retained separately in the raw observations. Collection never uses the service-lifetime `memory.peak` as a run peak.
 

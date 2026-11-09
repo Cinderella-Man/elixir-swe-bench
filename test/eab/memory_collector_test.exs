@@ -130,6 +130,26 @@ defmodule Eab.MemoryCollectorTest do
     assert elem(Collector.sample(state), 0)["vram_bytes"] == 300 * 1_048_576
   end
 
+  test "the model server's key comes with the request; a key file on the host is the fallback",
+       ctx do
+    parent = self()
+    original = ctx.opts[:http]
+
+    http = fn endpoint, key, route ->
+      send(parent, {:key, key})
+      original.(endpoint, key, route)
+    end
+
+    opts = Keyword.put(ctx.opts, :http, http)
+    Collector.open(Map.put(ctx.request, "key", "server-key"), opts)
+    assert_received {:key, "server-key"}
+
+    file = Path.join(ctx.proc, "api-key")
+    File.write!(file, "file-key\n")
+    Collector.open(Map.put(ctx.request, "key_file", file), opts)
+    assert_received {:key, "file-key"}
+  end
+
   test "llama.cpp uses the same service and GPU counters", ctx do
     original = ctx.opts[:http]
 

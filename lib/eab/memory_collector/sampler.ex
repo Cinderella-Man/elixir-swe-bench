@@ -11,7 +11,7 @@ defmodule Eab.MemoryCollector do
 
     state = %{
       endpoint: "http://127.0.0.1:#{port}",
-      key: key(request["key_file"]),
+      key: request_key(request),
       proc: opts[:proc_root] || "/proc",
       groups: opts[:cgroup_root] || "/sys/fs/cgroup",
       command: opts[:command] || (&command/2),
@@ -153,7 +153,7 @@ defmodule Eab.MemoryCollector do
       proc: opts[:proc_root] || "/proc",
       groups: opts[:cgroup_root] || "/sys/fs/cgroup",
       endpoint: "http://127.0.0.1:#{port}",
-      key: key(request["key_file"]),
+      key: request_key(request),
       command: opts[:command] || (&command/2),
       http: opts[:http] || (&http/3)
     }
@@ -265,6 +265,11 @@ defmodule Eab.MemoryCollector do
   end
 
   defp get(state, route), do: state.http.(state.endpoint, state.key, route)
+  # The benchmark sends the model server's API key over SSH; older benchmarks name a key file
+  # on this host instead. The key only authenticates requests to that server.
+  defp request_key(%{"key" => key}) when is_binary(key) and key != "", do: key
+  defp request_key(request), do: key(request["key_file"])
+
   defp key(path) when path in [nil, ""], do: ""
   defp key(path), do: File.read!(path) |> String.trim()
 

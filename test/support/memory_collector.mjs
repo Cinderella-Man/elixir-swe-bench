@@ -11,9 +11,14 @@ process.stdin.setEncoding('utf8');
 process.stdin.on('data', text => {
   buffer += text;
   while (buffer.includes('\n')) {
+    const line = buffer.slice(0, buffer.indexOf('\n'));
     buffer = buffer.slice(buffer.indexOf('\n') + 1);
     if (!started) {
       started = true;
+      if (mode === 'needs_key' && JSON.parse(line).key !== 'model-key') {
+        emit({type: 'error', message: 'No model API key'});
+        process.exit(1);
+      }
       if (mode === 'ssh_error') {
         process.stdout.write('Host key verification failed.\r\n');
         process.exit(255);

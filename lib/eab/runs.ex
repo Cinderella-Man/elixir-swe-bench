@@ -531,7 +531,7 @@ defmodule Eab.Runs do
   end
 
   defp launch(run, key, state) do
-    case MemoryMonitor.start(run) do
+    case MemoryMonitor.start(run, key) do
       {:ok, monitor, memory} ->
         launch_monitored(Map.put(run, "memory", memory), key, state, monitor)
 

@@ -19,15 +19,17 @@ if config_env() != :test do
     docker_storage_path: System.get_env("EAB_DOCKER_STORAGE_PATH"),
     root: System.get_env("EAB_ROOT", File.cwd!())
 
-  if target = System.get_env("EAB_MEMORY_SSH_TARGET") |> then(&if(&1 not in [nil, ""], do: &1)) do
-    hosts =
-      System.fetch_env!("EAB_MEMORY_HOSTS")
-      |> String.split(",", trim: true)
-      |> Enum.map(&String.trim/1)
+  present = fn name -> System.get_env(name) |> then(&if(&1 not in [nil, ""], do: &1)) end
 
+  # Memory collection is on unless EAB_MEMORY=off. Without a target it reaches root on the
+  # model endpoint's own host; without a host list it samples only that host.
+  if System.get_env("EAB_MEMORY") not in ["off", "0", "false"] do
     config :eab, :memory_monitor,
-      target: target,
-      hosts: hosts,
+      target: present.("EAB_MEMORY_SSH_TARGET"),
+      hosts:
+        if(hosts = present.("EAB_MEMORY_HOSTS"),
+          do: hosts |> String.split(",", trim: true) |> Enum.map(&String.trim/1)
+        ),
       known_hosts:
         System.get_env("EAB_MEMORY_KNOWN_HOSTS", Path.join(data, "memory/known_hosts")),
       ssh_key: System.get_env("EAB_MEMORY_SSH_KEY") |> then(&if(&1 not in [nil, ""], do: &1)),

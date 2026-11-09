@@ -140,6 +140,73 @@ defmodule Eab.MemoryMonitorTest do
     assert MemoryMonitor.recover("memory-test")["status"] == "partial"
   end
 
+  test "the model server's API key reaches the collector over SSH" do
+    configure("needs_key")
+    assert {:error, "No model API key"} = MemoryMonitor.start(run("keyless"))
+    assert {:ok, pid, _} = MemoryMonitor.start(run("keyed"), "model-key")
+    assert MemoryMonitor.finish(pid, "keyed", "completed")["status"] == "complete"
+  end
+
+  test "without a target or host list, root on the endpoint's host once its key is trusted" do
+    root = Application.get_env(:eab, :data_dir)
+    known = Path.join(root, "memory/known_hosts")
+    blob = Base.encode64(:crypto.strong_rand_bytes(51))
+    ssh = Path.join(root, "fake-ssh")
+    File.mkdir_p!(root)
+
+    # Records the host key ssh would accept into the scratch known_hosts, then fails to log in.
+    File.write!(ssh, """
+    #!/bin/sh
+    for a in "$@"; do case "$a" in UserKnownHostsFile=*) f="${a#UserKnownHostsFile=}";; esac; done
+    echo "rig.example ssh-ed25519 #{blob}" > "$f"
+    exit 255
+    """)
+
+    File.chmod!(ssh, 0o755)
+
+    Application.put_env(:eab, :memory_monitor,
+      known_hosts: known,
+      collector: "/srv/collector",
+      executable: ssh
+    )
+
+    rig = %{"url" => "http://rig.example:8460", "backend" => "strata"}
+    assert MemoryMonitor.configuration(rig) == nil
+    assert MemoryMonitor.untrusted_host(rig) == "rig.example"
+    assert MemoryMonitor.configuration_label(rig) =~ "rig.example's SSH host key"
+
+    key = MemoryMonitor.host_key(rig)
+    digest = :crypto.hash(:sha256, Base.decode64!(blob))
+    assert key.fingerprint == "SHA256:" <> Base.encode64(digest, padding: false)
+    refute File.exists?(known)
+
+    assert :ok = MemoryMonitor.trust(rig, key)
+    assert MemoryMonitor.configuration(rig)[:target] == "root@rig.example"
+    assert MemoryMonitor.untrusted_host(rig) == nil
+    assert File.stat!(known).mode |> Bitwise.band(0o777) == 0o600
+
+    # A key read from one host cannot be trusted for another.
+    other = %{rig | "url" => "http://other.example:8460"}
+    assert MemoryMonitor.untrusted_host(other) == "other.example"
+    assert_raise RuntimeError, fn -> MemoryMonitor.trust(other, key) end
+
+    # Hashed entries, as ssh-keyscan -H writes them, count as trusted too.
+    salt = :crypto.strong_rand_bytes(20)
+    mac = :crypto.mac(:hmac, :sha, salt, "other.example")
+
+    File.write!(known, "|1|#{Base.encode64(salt)}|#{Base.encode64(mac)} ssh-ed25519 #{blob}\n", [
+      :append
+    ])
+
+    assert MemoryMonitor.configuration(other)[:target] == "root@other.example"
+
+    # A host list still limits which endpoints are sampled; EAB_MEMORY=off configures nothing.
+    Application.put_env(:eab, :memory_monitor, known_hosts: known, hosts: ["rig.example"])
+    assert MemoryMonitor.configuration_label(other) =~ "add other.example"
+    Application.delete_env(:eab, :memory_monitor)
+    assert MemoryMonitor.configuration_label(rig) =~ "EAB_MEMORY is off"
+  end
+
   test "API endpoints and other hosts are excluded, previously monitored resumes require configuration" do
     assert MemoryMonitor.configuration(%{"url" => "http://other:8414", "backend" => "strata"}) ==
              nil
