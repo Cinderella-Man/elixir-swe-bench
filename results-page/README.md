@@ -1,8 +1,8 @@
 # Elixir SWE Bench results page
 
-A static, shareable page for Elixir SWE Bench results, produced by this repository's benchmark runner. One dot represents a run series ([ADR 0011](../docs/adr/0011-publish-three-run-series.md)): up to three runs of one model through one harness on the current admitted cases. The dot sits at the mean score; a band shows ±1.96 standard errors of rerun noise once two runs exist. Hollow dots are provisional series that still miss runs. No server, database, npm packages or external assets are needed to serve it.
+A static, shareable page for Elixir SWE Bench results, produced by this repository's benchmark runner. One dot represents a run series ([ADR 0011](../docs/adr/0011-publish-three-run-series.md)): up to three runs of one model through one harness on the current admitted cases. The dot sits at the mean score, up the side, and at the run series' peak VRAM + RAM, along the bottom; a vertical band shows ±1.96 standard errors of rerun noise once two runs exist. Hollow dots are provisional series that still miss runs. No server, database, npm packages or external assets are needed to serve it.
 
-The page contains a title, required-memory slider and one shared chart, with each model's name just above its dot and its score beside it. Case outcomes and recorded settings open below the chart. There is no comparison selector or model search.
+The page contains a title, required-memory slider and one shared chart: cases passed against the peak VRAM + RAM the model server used in our runs, on a linear scale with a tick every 64 GB. Hosted APIs and series without a memory measurement sit in a strip of their own at the right, on the same score scale. A line steps through the series that pass more cases than every series using less memory. Pi dots are circles and Claude Code dots diamonds; a legend names both. Each name sits beside its dot where it has room, frontier series first; a dot whose name does not fit shows a number, named in a key below the chart. Hovering or focusing a dot shows its result, memory, harness and runs; a table view lists the same for every series. Case outcomes and recorded settings open below the chart. There is no comparison selector or model search.
 
 The benchmark run history and published results were cleared on 2026-10-20 because their thinking presets were not reliably recorded, and again on 2026-10-26 because the cases are being rebuilt ([ADR 0012](../docs/adr/0012-rebuild-release-and-validate-with-unpublished-opus-runs.md)). Every series starts on the rebuilt release. With no published records, the page shows “No benchmark results yet” and hides the slider and chart guidance.
 
@@ -10,7 +10,7 @@ Each point names its model, its quantization when it has one, and its thinking l
 
 Fresh runs on configured model-host endpoint hostnames collect model-service RAM and VRAM throughout the run. Their exported summaries include sampled peaks, the highest simultaneous RAM + VRAM total, per-GPU allocations, configured context, runtime and collection coverage. Model weight size remains a separate field. The dashboard shows collection configuration before starting a run; a local result's details say when no memory observations were saved.
 
-The slider, **Required memory (VRAM+RAM)**, filters by the measured simultaneous VRAM + RAM peak in decimal GB: `peak_combined_bytes` of the series run with the highest one. Only run samples count; a loaded-model snapshot does not. A numeric limit hides hosted APIs and series without a measurement; All restores them.
+The slider, **Required memory (VRAM+RAM)**, sets a limit on the measured simultaneous VRAM + RAM peak in decimal GB: `peak_combined_bytes` of the series run with the highest one. Only run samples count; a loaded-model snapshot does not. A numeric limit draws a line at that memory and fades the series beyond it, with hosted APIs and series without a measurement; All removes it.
 
 ## Preview
 

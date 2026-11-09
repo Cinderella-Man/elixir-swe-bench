@@ -170,79 +170,192 @@
     layout.append(outcomes, conditions); body.append(layout);
     return body;
   }
-  function plot(shown) {
-    const figure = node("div", "plot");
-    const area = node("div", "plot-area");
-    area.style.setProperty("--row-count", Math.max(shown.length, 1));
+  // Memory runs along the bottom in 64 GB steps, the sizes PCs and cards come in.
+  const memoryMax = Math.max(64, Math.ceil(largest / 64) * 64);
+  const casesText = r => `${fmt(Math.round(r.score_percent * r.total / 10) / 10)} of ${r.total} cases`;
+  const memoryText = r => required(r) != null ? `${gb(required(r))} peak VRAM + RAM` : hosted(r) ? "API: no local memory" : "Memory not measured";
+  // The series no cheaper series beats: each passes more cases than everything that used less memory.
+  function frontier(measured) {
+    const best = [];
+    for (const r of [...measured].sort((a, b) => required(a) - required(b) || b.score_percent - a.score_percent)) {
+      if (!best.length || r.score_percent > best.at(-1).score_percent) best.push(r);
+    }
+    return best;
+  }
+  function frontierLine(best) {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("class", "frontier");
+    svg.setAttribute("viewBox", "0 0 100 100");
+    svg.setAttribute("preserveAspectRatio", "none");
+    svg.setAttribute("aria-hidden", "true");
+    const x = r => required(r) / 1e9 / memoryMax * 100, y = r => 100 - r.score_percent;
+    let d = `M${x(best[0])},${y(best[0])}`;
+    for (const r of best.slice(1)) d += ` H${x(r)} V${y(r)}`;
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", d + " H100");
+    svg.append(path);
+    return svg;
+  }
+  function legend(shown, withFrontier) {
+    const list = node("div", "scatter-legend");
+    const item = (mark, text) => { const entry = node("span", "legend-item"); entry.append(node("span", `legend-mark ${mark}`), text); list.append(entry); };
+    if (shown.some(r => r.harness.name === "pi")) item("circle", "Pi");
+    if (shown.some(r => r.harness.name === "claude_code")) item("diamond", "Claude Code");
+    if (shown.some(r => !r.complete)) item("circle hollow", "Provisional (fewer than 3 runs)");
+    if (withFrontier) item("line", "Most cases passed for its memory");
+    return list;
+  }
+  function point(r, x, best, beyond, number) {
+    const point = node("button", "scatter-point" + (r.harness.name === "claude_code" ? " diamond" : "") + (r.complete ? "" : " provisional") +
+      (best ? " best" : "") + (beyond ? " beyond" : "") + (selected === r.series_id ? " selected" : ""));
+    point.id = `point-${r.series_id}`;
+    point.dataset.number = number;
+    point.style.left = `${x * 100}%`;
+    point.style.bottom = `${r.score_percent}%`;
+    point.setAttribute("aria-label", `${chartName(r)}, ${harness(r)}, ${casesText(r)} (${scoreText(r)}), ${memoryText(r)}, ${runsText(r)}. Show details`);
+    point.setAttribute("aria-expanded", String(selected === r.series_id));
+    if (selected === r.series_id) point.setAttribute("aria-controls", "run-detail");
+    if (r.interval_percent != null) {
+      const low = Math.max(0, r.score_percent - r.interval_percent), high = Math.min(100, r.score_percent + r.interval_percent);
+      const bar = node("span", "interval");
+      // One score point is 1cqh of the plot; the bar is measured from the dot's centre.
+      bar.style.bottom = `calc(50% + ${low - r.score_percent}cqh)`;
+      bar.style.height = `${high - low}cqh`;
+      point.append(bar);
+    }
+    const label = node("span", "point-label");
+    label.append(node("span", "model-name", chartName(r)));
+    if (records.filter(other => chartName(other) === chartName(r)).length > 1) {
+      label.append(node("span", "point-meta", `${harness(r)} · Series ${r.series_id.slice(0, 8)}`));
+    }
+    point.append(node("span", "result-dot"), label, node("span", "point-number", number));
+    point.addEventListener("click", () => {
+      selected = selected === r.series_id ? null : r.series_id;
+      render();
+      document.getElementById(point.id)?.focus();
+    });
+    for (const show of ["pointerenter", "focus"]) point.addEventListener(show, () => tip(r, point));
+    for (const hide of ["pointerleave", "blur"]) point.addEventListener(hide, () => tip(null));
+    return point;
+  }
+  // One tooltip for the chart: the result first, then what it is.
+  function tip(r, point) {
+    const box = document.querySelector(".chart-tip");
+    if (!box) return;
+    if (!r) { box.hidden = true; return; }
+    box.replaceChildren(node("strong", "", casesText(r) + (r.interval_percent == null ? "" : ` ± ${fmt(Math.round(r.interval_percent * r.total / 10) / 10)}`)),
+      node("span", "", chartName(r)), node("span", "tip-muted", memoryText(r)), node("span", "tip-muted", `${harness(r)} · ${runsText(r)}`));
+    box.hidden = false;
+    const figure = box.parentElement.getBoundingClientRect(), at = point.getBoundingClientRect(), size = box.getBoundingClientRect();
+    const left = Math.min(Math.max(at.left - figure.left + at.width / 2 - size.width / 2, 0), figure.width - size.width);
+    const above = at.top - figure.top - size.height - 8;
+    box.style.left = `${left}px`;
+    box.style.top = `${above >= 0 ? above : at.bottom - figure.top + 8}px`;
+  }
+  function table(shown) {
+    const view = node("details", "table-view");
+    view.append(node("summary", "", "Table view"));
+    const grid = node("table", "case-table"), head = node("thead"), row = node("tr");
+    for (const title of ["Model", "Harness", "Cases passed", "Peak VRAM + RAM", "Runs"]) row.append(node("th", "", title));
+    head.append(row); grid.append(head);
+    const body = node("tbody");
+    for (const r of shown) {
+      const line = node("tr");
+      line.append(node("td", "case-id", chartName(r)), node("td", "", harness(r)), node("td", "numeric", `${casesText(r)} (${scoreText(r)})`),
+        node("td", "numeric", required(r) != null ? gb(required(r)) : hosted(r) ? "API" : "Not measured"), node("td", "", runsText(r)));
+      body.append(line);
+    }
+    grid.append(body); view.append(grid);
+    return view;
+  }
+  function scatter(shown, cap, all) {
+    const figure = node("div", "scatter");
+    const measured = shown.filter(r => required(r) != null), other = shown.filter(r => required(r) == null);
+    const best = frontier(measured);
+    figure.append(legend(shown, best.length > 1), node("div", "y-caption", "Cases passed (mean of runs)"));
+    const body = node("div", "scatter-body");
+    const area = node("div", "scatter-plot");
     for (const value of ticks(data.benchmark.case_count)) {
-      const line = node("div", "plot-grid");
-      line.style.left = `${value / data.benchmark.case_count * 100}%`;
-      line.append(node("span", "plot-tick", value));
+      const line = node("div", "grid-row");
+      line.style.bottom = `${value / data.benchmark.case_count * 100}%`;
+      line.append(node("span", "y-tick", value));
       area.append(line);
     }
-    for (const [i, r] of shown.entries()) {
-      const position = r.score_percent / 100;
-      const point = node("button", "plot-point" + (selected === r.series_id ? " selected" : "") + (r.complete ? "" : " provisional"));
-      point.id = `point-${r.series_id}`;
-      point.style.left = `${position * 100}%`;
-      point.style.setProperty("--score-position", position);
-      point.style.setProperty("--row-index", i);
-      point.setAttribute("aria-label", `${r.model.name}${r.model.quantization ? ` ${r.model.quantization}` : ""}, ${harness(r)}, thinking ${thinking(r)}, ${scoreText(r)} of ${r.total} cases, ${runsText(r)}. Show details`);
-      point.setAttribute("aria-expanded", String(selected === r.series_id));
-      if (selected === r.series_id) point.setAttribute("aria-controls", "run-detail");
-      const label = node("span", "point-label");
-      label.append(node("span", "model-name", chartName(r)));
-      if (records.filter(other => chartName(other) === chartName(r)).length > 1) {
-        label.append(node("span", "point-meta", `${harness(r)} · Series ${r.series_id.slice(0, 8)}`));
-      }
-      const dot = node("span", "result-dot");
-      const score = node("span", "point-score", scoreText(r));
-      point.append(label, dot, score);
-      if (r.interval_percent != null) {
-        const low = Math.max(0, r.score_percent - r.interval_percent), high = Math.min(100, r.score_percent + r.interval_percent);
-        const bar = node("span", "interval");
-        // One score point is 1cqw of the plot; the bar starts from the dot's centre.
-        bar.style.left = `calc(50% + ${low - r.score_percent}cqw)`;
-        bar.style.width = `${high - low}cqw`;
-        point.append(bar);
-      }
-      point.addEventListener("click", () => {
-        selected = selected === r.series_id ? null : r.series_id;
-        render();
-        document.getElementById(point.id)?.focus();
-      });
-      area.append(point);
+    for (let size = 0; size <= memoryMax; size += 64) {
+      const line = node("div", "grid-col");
+      line.style.left = `${size / memoryMax * 100}%`;
+      line.append(node("span", "x-tick" + (size === memoryMax ? " end" : ""), size ? `${size} GB` : "0"));
+      area.append(line);
     }
-    figure.append(area, node("div", "axis-caption", "Cases passed (mean of runs)"));
+    if (best.length > 1) area.append(frontierLine(best));
+    if (!all) {
+      const limit = node("div", "limit-line");
+      limit.style.left = `${Math.min(cap / memoryMax, 1) * 100}%`;
+      area.append(limit);
+    }
+    // Numbers follow the score order, so the key below reads from the top of the chart down.
+    const number = r => shown.indexOf(r) + 1;
+    for (const r of measured) area.append(point(r, required(r) / 1e9 / memoryMax, best.includes(r), !all && required(r) / 1e9 > cap, number(r)));
+    body.append(area);
+    if (other.length) {
+      const strip = node("div", "api-strip");
+      strip.append(node("span", "strip-title", other.every(hosted) ? "API" : "API or not measured"));
+      // Spread across the strip: API models have no memory to place them by.
+      other.forEach((r, i) => strip.append(point(r, (i + 1) / (other.length + 1), false, !all, number(r))));
+      body.append(strip);
+    }
+    const tipBox = node("div", "chart-tip");
+    tipBox.hidden = true;
+    tipBox.setAttribute("role", "tooltip");
+    figure.append(body, node("div", "axis-caption", "Peak VRAM + RAM in our runs"), node("ol", "point-key"), tipBox, table(shown));
     return figure;
   }
-  // A name is centred above its dot unless that would cross the chart's edge; then it lines up with the dot.
-  function fitLabels() {
-    const area = document.querySelector(".plot-area");
-    if (!area) return;
-    const bounds = area.getBoundingClientRect();
-    for (const point of area.querySelectorAll(".plot-point")) {
-      point.classList.remove("near-start", "near-end");
-      const box = point.querySelector(".point-label").getBoundingClientRect();
-      if (box.right > bounds.right) point.classList.add("near-end");
-      else if (box.left < bounds.left) point.classList.add("near-start");
+  const overlaps = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+  // Names go right, left, above or below their dot, whichever is free and inside the chart; frontier and
+  // selected models are named first. A dot whose name has no room shows a number, named in the key below.
+  function placeLabels() {
+    const numbered = [];
+    for (const zone of document.querySelectorAll(".scatter-plot, .api-strip")) {
+      const bounds = (zone.classList.contains("api-strip") ? zone.parentElement : zone).getBoundingClientRect();
+      const points = [...zone.querySelectorAll(".scatter-point")];
+      const rank = p => (p.classList.contains("selected") ? 2 : 0) + (p.classList.contains("best") ? 1 : 0);
+      points.sort((a, b) => rank(b) - rank(a));
+      const taken = points.map(p => p.querySelector(".result-dot").getBoundingClientRect());
+      for (const p of points) {
+        const label = p.querySelector(".point-label");
+        let placed = false;
+        for (const side of ["right", "left", "above", "below"]) {
+          label.className = `point-label place-${side}`;
+          const box = label.getBoundingClientRect();
+          const inside = box.left >= bounds.left && box.right <= bounds.right && box.top >= bounds.top - 12 && box.bottom <= bounds.bottom + 12;
+          if (inside && !taken.some(t => overlaps(t, box))) { taken.push(box); placed = true; break; }
+        }
+        p.classList.toggle("numbered", !placed);
+        if (!placed) { label.className = "point-label unplaced"; numbered.push(p); }
+      }
     }
+    const key = document.querySelector(".point-key");
+    if (!key) return;
+    key.replaceChildren(...numbered.sort((a, b) => a.dataset.number - b.dataset.number).map(p => {
+      const item = node("li", "", p.querySelector(".model-name").textContent);
+      item.value = Number(p.dataset.number);
+      return item;
+    }));
+    key.hidden = numbered.length === 0;
   }
   function render() {
     const cap = Number($("memory-limit").value), all = cap === allValue;
-    const shown = records.filter(r => all || required(r) != null && required(r) / 1e9 <= cap)
-      .sort((a, b) => b.score_percent - a.score_percent || a.model.name.localeCompare(b.model.name) || b.run_count - a.run_count);
+    const shown = [...records].sort((a, b) => b.score_percent - a.score_percent || a.model.name.localeCompare(b.model.name) || b.run_count - a.run_count);
     $("memory-value").textContent = all ? "All" : `${cap} GB`;
     $("memory-limit").setAttribute("aria-valuetext", all ? "All models" : `Up to ${cap} GB of VRAM and RAM`);
-    $("chart").replaceChildren();
-    if (shown.length) { $("chart").append(plot(shown)); fitLabels(); }
-    else $("chart").append(node("p", "empty", "No models within this memory limit."));
+    $("chart").replaceChildren(scatter(shown, cap, all));
+    placeLabels();
     const active = shown.find(r => r.series_id === selected);
     if (active) $("chart").append(details(active)); else selected = null;
-    const unmeasured = records.some(r => required(r) == null);
-    $("result-status").textContent = `${shown.length} / ${records.length} run series` + (!all && unmeasured ? " · API / unmeasured models hidden" : "");
+    const within = records.filter(r => required(r) != null && required(r) / 1e9 <= cap).length;
+    $("result-status").textContent = all ? `${records.length} run series` : `${within} of ${records.length} run series within ${cap} GB`;
   }
   $("memory-limit").addEventListener("input", render);
-  window.addEventListener("resize", fitLabels);
+  window.addEventListener("resize", placeLabels);
   render();
 })();
