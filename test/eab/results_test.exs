@@ -305,6 +305,53 @@ defmodule Eab.ResultsTest do
     end
   end
 
+  test "the maker comes from the served file, or from the publisher when the file names none" do
+    artifact = "Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf"
+    weights = %{"size_bytes" => 1234, "files" => [%{"name" => artifact, "size_bytes" => 1234}]}
+
+    session = fn files ->
+      %{
+        "sample_count" => 1,
+        "identity" => %{
+          "model_artifact" => artifact,
+          "backend" => "llama_cpp",
+          "weight_files" => files
+        }
+      }
+    end
+
+    named =
+      Map.put(run(), "memory", %{
+        "sessions" => [session.(Map.put(weights, "quantized_by", "ukisai"))]
+      })
+
+    result = Results.export!(named, resources: nil)
+    assert result["model"]["quantized_by"] == "ukisai"
+    assert result["model"]["quantized_by_source"] == "artifact_files"
+    assert result["setup"]["model"]["quantized_by"] == "ukisai"
+
+    assert Results.export!(named, resources: nil, quantized_by: "ukisai")["model"][
+             "quantized_by_source"
+           ] ==
+             "artifact_files"
+
+    assert_raise ArgumentError, ~r/names its maker as ukisai/, fn ->
+      Results.export!(named, resources: nil, quantized_by: "bartowski")
+    end
+
+    # A file that names no one takes the publisher's word, shown but not part of the identity.
+    silent = Results.export!(run(), quantized_by: "ukisai")
+    assert silent["model"]["quantized_by"] == "ukisai"
+    assert silent["model"]["quantized_by_source"] == "owner_supplied"
+    refute Map.has_key?(silent["setup"]["model"], "quantized_by")
+    assert silent["series_id"] != result["series_id"]
+    assert Results.export!(run())["model"]["quantized_by_source"] == "not_reported"
+
+    assert_raise ArgumentError, ~r/unreported maker/, fn ->
+      Results.validate!(put_in(silent, ["model", "quantized_by_source"], "not_reported"))
+    end
+  end
+
   test "incomplete, partial, mismatched and duplicated runs cannot be published" do
     variants = [
       Map.put(run(), "status", "error"),

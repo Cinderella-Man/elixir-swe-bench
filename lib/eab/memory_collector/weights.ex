@@ -19,15 +19,105 @@ defmodule Eab.MemoryCollector.Weights do
         end)
 
       if observations do
-        %{
+        found = %{
           "size_bytes" => Enum.sum(Enum.map(observations, & &1["size_bytes"])),
           "files" => Enum.reverse(observations)
         }
+
+        # The first file (shard 1) holds the metadata.
+        case quantized_by(hd(files)) do
+          nil -> found
+          creator -> Map.put(found, "quantized_by", creator)
+        end
       end
     end
   end
 
   def read(_), do: nil
+
+  # Who made the quantization, as the GGUF names itself (general.quantized_by): "Unsloth",
+  # "ISTA DASLab". Makers often write it after the tokenizer's arrays, so the read covers the
+  # key/value section of a large vocabulary (about 12 MB for 248k tokens), not the weights.
+  # A file that names no one, or a header that does not parse, names no one.
+  @header_bytes 64 * 1024 * 1024
+  @fixed %{
+    0 => 1,
+    1 => 1,
+    2 => 2,
+    3 => 2,
+    4 => 4,
+    5 => 4,
+    6 => 4,
+    7 => 1,
+    10 => 8,
+    11 => 8,
+    12 => 8
+  }
+
+  def quantized_by(file) do
+    case File.open(file, [:read, :binary], &IO.binread(&1, @header_bytes)) do
+      {:ok, <<"GGUF", version::little-32, _tensors::little-64, count::little-64, rest::binary>>}
+      when version in 2..3 ->
+        entries(rest, min(count, 4096))
+
+      _ ->
+        nil
+    end
+  end
+
+  defp entries(<<size::little-64, key::binary-size(size), type::little-32, rest::binary>>, left)
+       when left > 0 do
+    case value(type, rest) do
+      {text, _} when key == "general.quantized_by" and is_binary(text) ->
+        text = String.trim(text)
+        if String.valid?(text) and byte_size(text) in 1..100, do: text
+
+      {_, rest} ->
+        entries(rest, left - 1)
+
+      nil ->
+        nil
+    end
+  end
+
+  defp entries(_, _), do: nil
+
+  defp value(8, <<size::little-64, text::binary-size(size), rest::binary>>), do: {text, rest}
+
+  defp value(9, <<type::little-32, count::little-64, rest::binary>>) when type != 9,
+    do: skip(type, count, rest)
+
+  defp value(type, rest) when is_map_key(@fixed, type) do
+    size = @fixed[type]
+
+    case rest do
+      <<_::binary-size(^size), rest::binary>> -> {nil, rest}
+      _ -> nil
+    end
+  end
+
+  defp value(_, _), do: nil
+
+  # Arrays are skipped: string arrays one length at a time, the rest by their element size.
+  defp skip(_, 0, rest), do: {nil, rest}
+
+  defp skip(8, count, rest) do
+    case value(8, rest) do
+      {_, rest} -> skip(8, count - 1, rest)
+      nil -> nil
+    end
+  end
+
+  defp skip(type, count, rest) when is_map_key(@fixed, type) do
+    size = @fixed[type] * count
+
+    case rest do
+      <<_::binary-size(^size), rest::binary>> -> {nil, rest}
+      _ -> nil
+    end
+  end
+
+  defp skip(_, _, _), do: nil
 
   defp paths(path) do
     case Regex.run(~r/\A(.*)-(\d{5})-of-(\d{5})\.gguf\z/, path) do

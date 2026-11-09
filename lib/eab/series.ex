@@ -34,12 +34,14 @@ defmodule Eab.Series do
       "case_fixtures" => Map.take(protocol["fixtures"] || %{}, cases),
       "harness" => harness(run),
       "server_type" => model["backend"],
-      "model" => %{
-        "name" => identity["name"],
-        "artifact" => artifact(identity["artifact"]),
-        "quantization" => identity["quantization"],
-        "api_model" => if(model["backend"] in @api_backends, do: model["model"])
-      },
+      "model" =>
+        %{
+          "name" => identity["name"],
+          "artifact" => artifact(identity["artifact"]),
+          "quantization" => identity["quantization"],
+          "api_model" => if(model["backend"] in @api_backends, do: model["model"])
+        }
+        |> put_creator(creator(run)),
       "chat_template_sha256" =>
         if(is_binary(profile["chat_template"]), do: Eab.Inventory.hash(profile["chat_template"])),
       "sampling_defaults" =>
@@ -49,6 +51,27 @@ defmodule Eab.Series do
   end
 
   def id(run), do: Cache.key(setup(run))
+
+  @doc """
+  Who made the served quantization, as its GGUF names itself; the memory collector reads it
+  on the model host. Identically named files from different makers stay separate series.
+  """
+  def creator(run) do
+    model = run["model"] || %{}
+
+    files =
+      Eab.Results.Resources.weight_files(
+        run["memory"],
+        ModelIdentity.served_artifact(model),
+        model["backend"]
+      )
+
+    files && files["quantized_by"]
+  end
+
+  # Only a known maker joins the identity, so series whose files name no one keep their IDs.
+  defp put_creator(model, nil), do: model
+  defp put_creator(model, creator), do: Map.put(model, "quantized_by", creator)
 
   @doc "An artifact's name without its shard number, as a series records it."
   def artifact(nil), do: nil
@@ -211,7 +234,17 @@ defmodule Eab.Series do
         "case_fixtures" => record["case_fixtures"]
       })
 
-    actual = setup(run)
+    # A run about to start has no memory yet, so its files' maker is still unread; export
+    # compares the whole setup again once the collector has named it.
+    actual =
+      case {expected["model"], setup(run)} do
+        {%{"quantized_by" => creator}, %{"model" => model} = actual}
+        when not is_map_key(model, "quantized_by") ->
+          put_in(actual, ["model", "quantized_by"], creator)
+
+        {_, actual} ->
+          actual
+      end
 
     differences =
       for field <- Enum.sort(Map.keys(expected)),

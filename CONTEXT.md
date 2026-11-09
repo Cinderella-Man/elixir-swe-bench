@@ -20,7 +20,7 @@ _Avoid_: enrichment, synthetic PR
 
 **Model profile**: The served model, quantization, context capacity and serving configuration reported by an endpoint. Missing metadata remains unknown; aliases do not establish exact artifact identity.
 
-**Model identity**: The artifact name and quantization recovered from reported model metadata, kept separately from the API routing alias used to send requests.
+**Model identity**: The artifact name and quantization recovered from reported model metadata, and the quantization's maker when the served file names one, kept separately from the API routing alias used to send requests. Two makers' identically named files are different models.
 
 **Model weight size**: The recorded size of the model's weight files in bytes, displayed in decimal GB. It excludes context and runtime memory and is not a total VRAM requirement.
 

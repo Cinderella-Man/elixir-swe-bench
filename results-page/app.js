@@ -9,7 +9,7 @@
     if (text !== undefined) e.textContent = text;
     return e;
   };
-  if (!data || data.schema_version !== 5) {
+  if (!data || data.schema_version !== 6) {
     $("chart").append(node("p", "empty", "Results could not be loaded. Please reload."));
     return;
   }
@@ -36,7 +36,9 @@
   // The chart names the model and its thinking level only; the rest is in the details.
   const effort = r => ({minimal: "Minimal", low: "Low", medium: "Medium", high: "High", xhigh: "Extra", max: "Max",
     on: "Thinking", off: "No thinking"})[r.settings.reasoning_effort];
-  const chartName = r => [r.model.name, r.model.quantization, effort(r)].filter(Boolean).join(" ");
+  // Who made the quantization comes before it, as in "Unsloth UD-Q5_K_XL": the same name can come from several makers.
+  const quant = r => [r.model.quantized_by, r.model.quantization].filter(Boolean).join(" ");
+  const chartName = r => [r.model.name, quant(r), effort(r)].filter(Boolean).join(" ");
   // Claude Code cannot enforce the declared generation budget, so going over it is flagged, not failed (ADR 0010).
   const overBudget = (r, c) => Number.isInteger(r.settings.max_tokens) && Number.isInteger(c?.generated_tokens) &&
     c.generated_tokens > r.settings.max_tokens;
@@ -82,7 +84,7 @@
     body.id = "run-detail";
     body.setAttribute("aria-label", `${r.model.name} details`);
     const heading = node("div", "detail-heading");
-    heading.append(node("h2", "", `${r.model.name}${r.model.quantization ? ` · ${r.model.quantization}` : ""} · ${harness(r)} · Thinking: ${thinking(r)}`));
+    heading.append(node("h2", "", `${r.model.name}${quant(r) ? ` · ${quant(r)}` : ""} · ${harness(r)} · Thinking: ${thinking(r)}`));
     const close = node("button", "close-detail", "Close ×");
     close.addEventListener("click", () => {
       selected = null;
@@ -134,7 +136,9 @@
     }
     const conditions = node("div");
     conditions.append(node("h3", "", "Memory & deployment"));
-    const memory = [["Model weights", gb(r.model.size_bytes)], ["Context limit", context(r)]];
+    const maker = {artifact_files: "named in the model file", owner_supplied: "given by the publisher"}[r.model.quantized_by_source];
+    const memory = [["Quantized by", r.model.quantized_by ? `${r.model.quantized_by} · ${maker}` : hosted(r) ? "Hosted API" : "Not recorded"],
+      ["Model weights", gb(r.model.size_bytes)], ["Context limit", context(r)]];
     if (r.resources) {
       const p = r.resources;
       if (p.kind === "run_samples") {
@@ -169,9 +173,10 @@
   const memoryMax = Math.max(64, Math.ceil(largest / 64) * 64);
   const casesText = r => `${fmt(Math.round(r.score_percent * r.total / 10) / 10)} of ${r.total} cases`;
   const memoryText = r => required(r) != null ? `${gb(required(r))} peak VRAM + RAM` : hosted(r) ? "API: no local memory" : "Memory not measured";
-  // Until series record their family, it is the model's name without a quantizer's suffix.
-  const family = r => r.model.family || r.model.name.replace(/-(GSQ-RCO(-Coder)?|Gyro-[A-Z]+)$/, "");
-  const memberName = r => [r.model.quantization, effort(r)].filter(Boolean).join(" ") || chartName(r);
+  // Until series record their family, it is the model's name without a quantizer's mark. A Coder variant is
+  // another model, so it keeps its own family: "...-GSQ-RCO-Coder" belongs to "...-Coder".
+  const family = r => r.model.family || r.model.name.replace(/-(GSQ-RCO|Gyro-[A-Z]+)(?=-|$)/, "");
+  const memberName = r => [quant(r), effort(r)].filter(Boolean).join(" ") || chartName(r);
   // These five hues pass every pairwise colour check on white (the dataviz validator with --pairs all). In this fixed
   // order they go to the families with more than one series, best family first; every other family is grey. Colours
   // are decided once from all results, so the filter below never repaints a family.
@@ -204,14 +209,20 @@
     return e;
   };
   const xOf = r => required(r) / 1e9 / memoryMax * 100, yOf = r => 100 - r.score_percent;
-  // Lines in the plot's own coordinates: each family's quants in memory order, then the frontier's steps.
+  // Lines in the plot's own coordinates: each maker's quants of a family in memory order, then the frontier's steps.
   function lines(measured, best) {
     const layer = svg("svg", {class: "plot-lines", viewBox: "0 0 100 100", preserveAspectRatio: "none", "aria-hidden": "true"});
     for (const f of families.values()) {
-      const members = measured.filter(r => family(r) === f.name).sort((a, b) => required(a) - required(b));
-      if (members.length < 2) continue;
-      layer.append(svg("polyline", {class: "family-line" + (faded(members[0]) ? " faded" : ""), stroke: f.color,
-        points: members.map(r => `${xOf(r)},${yOf(r)}`).join(" ")}));
+      const makers = new Map();
+      for (const r of measured.filter(r => family(r) === f.name)) {
+        makers.set(r.model.quantized_by, [...(makers.get(r.model.quantized_by) || []), r]);
+      }
+      for (const members of makers.values()) {
+        if (members.length < 2) continue;
+        members.sort((a, b) => required(a) - required(b));
+        layer.append(svg("polyline", {class: "family-line" + (faded(members[0]) ? " faded" : ""), stroke: f.color,
+          points: members.map(r => `${xOf(r)},${yOf(r)}`).join(" ")}));
+      }
     }
     if (best.length > 1) {
       let d = `M${xOf(best[0])},${yOf(best[0])}`;
@@ -248,7 +259,7 @@
     if (shown.some(r => r.harness.name === "pi")) item("circle", "Pi");
     if (shown.some(r => r.harness.name === "claude_code")) item("diamond", "Claude Code");
     if (shown.some(r => !r.complete)) item("circle hollow", "Provisional (fewer than 3 runs)");
-    if ([...families.values()].some(f => f.members.length > 1)) item("ladder", "One family's quants");
+    if ([...families.values()].some(f => f.members.length > 1)) item("ladder", "One maker's quants of a family");
     if (withFrontier) item("line", "Most cases passed for its memory");
     return list;
   }
@@ -309,6 +320,7 @@
   const columns = [
     ["model", "Model", r => chartName(r), r => chartName(r)],
     ["family", "Family", r => family(r), r => family(r)],
+    ["maker", "Quantized by", r => r.model.quantized_by || "", r => r.model.quantized_by || (hosted(r) ? "API" : "—")],
     ["harness", "Harness", r => harness(r), r => harness(r)],
     ["cases", "Cases passed", r => r.score_percent, r => `${casesText(r)} (${scoreText(r)})`],
     ["memory", "Peak VRAM + RAM", r => required(r) ?? Infinity, r => required(r) != null ? gb(required(r)) : hosted(r) ? "API" : "Not measured"],
@@ -333,7 +345,7 @@
     const body = node("tbody");
     for (const r of [...shown].sort(order)) {
       const line = node("tr", faded(r) ? "faded" : "");
-      for (const [key, , , text] of columns) line.append(node("td", ["model", "family"].includes(key) ? "case-id" : "numeric", text(r)));
+      for (const [key, , , text] of columns) line.append(node("td", ["model", "family", "maker"].includes(key) ? "case-id" : "numeric", text(r)));
       body.append(line);
     }
     grid.append(body); view.append(grid);

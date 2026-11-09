@@ -116,6 +116,13 @@ defmodule Eab.Results do
     files = if is_nil(identity["artifact"]), do: ModelIdentity.from_files(weights)
     file_quant = files["quantization"]
     quant = Keyword.get(opts, :quantization, identity["quantization"] || file_quant)
+    creator = Series.creator(run)
+
+    require!(
+      is_nil(opts[:quantized_by]) or is_nil(creator) or opts[:quantized_by] == creator,
+      "The served file names its maker as #{creator}"
+    )
+
     size = Keyword.get(opts, :size_bytes, identity["size_bytes"] || file_size)
 
     resources =
@@ -129,7 +136,7 @@ defmodule Eab.Results do
     profile = model["profile"] || %{}
 
     record = %{
-      "schema_version" => 5,
+      "schema_version" => 6,
       "series_id" => series,
       "benchmark" => selected["id"],
       "model" => %{
@@ -155,7 +162,14 @@ defmodule Eab.Results do
             file_size -> "artifact_files"
             true -> "not_reported"
           end,
-        "parameter_count" => identity["parameter_count"]
+        "parameter_count" => identity["parameter_count"],
+        "quantized_by" => opts[:quantized_by] || creator,
+        "quantized_by_source" =>
+          cond do
+            creator -> "artifact_files"
+            opts[:quantized_by] -> "owner_supplied"
+            true -> "not_reported"
+          end
       },
       "harness" => public_harness(run),
       "settings" => settings,
@@ -351,7 +365,7 @@ defmodule Eab.Results do
     require!(Enum.uniq(ids) == ids, "Duplicate series ID")
 
     payload = %{
-      "schema_version" => 5,
+      "schema_version" => 6,
       "benchmark" => %{"id" => inventory["id"], "case_count" => length(inventory["cases"])},
       "results" => Enum.map(records, &aggregate/1)
     }

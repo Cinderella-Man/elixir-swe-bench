@@ -229,6 +229,53 @@ defmodule Eab.SeriesTest do
     assert Results.aggregate(series)["complete"]
   end
 
+  # What the memory collector saw of the served file, with the maker its header names.
+  defp served(run, maker) do
+    files = %{
+      "size_bytes" => 15,
+      "files" => [%{"name" => "Swift-27B-Q4_K_M.gguf", "size_bytes" => 15}]
+    }
+
+    files = if maker, do: Map.put(files, "quantized_by", maker), else: files
+
+    identity = %{
+      "model_artifact" => "Swift-27B-Q4_K_M.gguf",
+      "backend" => "llama_cpp",
+      "weight_files" => files
+    }
+
+    Map.put(run, "memory", %{"sessions" => [%{"sample_count" => 1, "identity" => identity}]})
+  end
+
+  test "a maker named by the served file separates series and is checked again at export", %{
+    page: page
+  } do
+    unsloth = served(run("first", 101, [false]), "Unsloth")
+    assert Series.setup(unsloth)["model"]["quantized_by"] == "Unsloth"
+    refute Series.id(unsloth) == Series.id(served(run("first", 101, [false]), "bartowski"))
+    # A file that names no one leaves the identity as it was.
+    assert Series.id(run("plain", 101, [])) == Series.id(served(run("plain", 101, []), nil))
+
+    Results.publish!(unsloth, page_root: page, resources: nil)
+    id = Series.id(unsloth)
+    assert Results.series!(id)["model"]["quantized_by"] == "Unsloth"
+
+    # A run about to start has no memory yet, so the start check cannot read its maker...
+    assert :ok = Series.contribution!(run("next", 102, []), id)
+
+    # ...and export refuses it once its file names another one.
+    other = run("other", 102, []) |> Map.put("series", id) |> served("bartowski")
+
+    assert_raise ArgumentError, ~r/no longer matches/, fn ->
+      Results.publish!(other, page_root: page, resources: nil)
+    end
+
+    same =
+      run("same", 102, [], "2026-10-27T12:00:00Z") |> Map.put("series", id) |> served("Unsloth")
+
+    assert Results.publish!(same, page_root: page, resources: nil) == :added
+  end
+
   test "contributions must match the published setup and use a missing seed", %{page: page} do
     first = run("first", 101, [false])
     Results.publish!(first, page_root: page)

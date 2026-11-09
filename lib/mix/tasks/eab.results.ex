@@ -5,12 +5,13 @@ defmodule Mix.Tasks.Eab.Results do
   mix eab.results build
   mix eab.results check
   mix eab.results add /path/to/run.json [--model-label NAME] [--quantization QUANT]
-    [--size-gb SIZE] [--resources FILE] [--evidence-url URL] [--note TEXT]
+    [--quantized-by MAKER] [--size-gb SIZE] [--resources FILE] [--evidence-url URL] [--note TEXT]
   mix eab.results serve [--port 4173]
   """
   @switches [
     model_label: :string,
     quantization: :string,
+    quantized_by: :string,
     size_gb: :string,
     resources: :string,
     evidence_url: :string,

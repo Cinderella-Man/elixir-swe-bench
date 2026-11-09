@@ -180,6 +180,58 @@ defmodule Eab.MemoryCollectorTest do
     assert Collector.identity(Collector.open(ctx.request, ctx.opts))["weight_files"] == nil
   end
 
+  # A GGUF header: magic, version, no tensors, then key/value entries.
+  defp gguf(entries) do
+    encode = fn
+      8, text ->
+        <<byte_size(text)::little-64, text::binary>>
+
+      4, number ->
+        <<number::little-32>>
+
+      9, list ->
+        <<8::little-32, length(list)::little-64>> <>
+          Enum.map_join(list, &<<byte_size(&1)::little-64, &1::binary>>)
+    end
+
+    <<"GGUF", 3::little-32, 0::little-64, length(entries)::little-64>> <>
+      Enum.map_join(entries, fn {key, type, value} ->
+        <<byte_size(key)::little-64, key::binary, type::little-32>> <> encode.(type, value)
+      end)
+  end
+
+  test "names the maker a GGUF header gives, past other keys and arrays, and no one otherwise",
+       ctx do
+    alias Eab.MemoryCollector.Weights
+    dir = Path.join(ctx.proc, "makers")
+    File.mkdir_p!(dir)
+    first = Path.join(dir, "Model-Q8_0-00001-of-00002.gguf")
+
+    File.write!(
+      first,
+      gguf([
+        {"general.architecture", 8, "qwen4exp"},
+        {"general.file_type", 4, 7},
+        # Makers often write their name after the tokenizer's arrays, megabytes in.
+        {"tokenizer.ggml.tokens", 9, List.duplicate("token", 500_000)},
+        {"general.quantized_by", 8, " Unsloth "}
+      ])
+    )
+
+    File.write!(Path.join(dir, "Model-Q8_0-00002-of-00002.gguf"), "weights")
+    assert %{"quantized_by" => "Unsloth", "files" => [_, _]} = Weights.read(first)
+
+    silent = Path.join(dir, "Silent-Q8_0.gguf")
+    File.write!(silent, gguf([{"general.name", 8, "Swift 1.5"}]))
+    refute Map.has_key?(Weights.read(silent), "quantized_by")
+
+    # A header cut short still counts the file; it only names no one.
+    broken = Path.join(dir, "Broken-Q8_0.gguf")
+    File.write!(broken, <<"GGUF", 3::little-32, 0::little-64, 5::little-64, 99::little-64>>)
+    assert Weights.read(broken)["size_bytes"] > 0
+    refute Map.has_key?(Weights.read(broken), "quantized_by")
+  end
+
   test "counts the GGUF files a Strata pack lists, except a drafter-only file", ctx do
     weights = Path.join(ctx.proc, "weights")
     pack = Path.join(weights, "pack")

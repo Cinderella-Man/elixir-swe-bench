@@ -2,7 +2,7 @@ defmodule Eab.Results.Schema do
   @moduledoc false
   @fields ~w(schema_version series_id benchmark model harness settings setup case_fixtures seeds required_runs runs evidence_url note)
   @run_fields ~w(run_id created_at seed source_release_id code_version deployment cases resources)
-  @model_fields ~w(name backend quantization quantization_source size_bytes size_source parameter_count)
+  @model_fields ~w(name backend quantization quantization_source size_bytes size_source parameter_count quantized_by quantized_by_source)
   @nullable_int ~w(window_tokens response_tokens)
   @integer ~w(safety_tokens max_tokens)
   @text ~w(budget_policy context_policy reasoning_effort reasoning_effort_source thinking_policy)
@@ -13,8 +13,8 @@ defmodule Eab.Results.Schema do
   }
 
   def validate!(r) do
-    fields!(r, @fields, "Expected a public v5 run series; export the original run.json with add")
-    require!(r["schema_version"] === 5, "Unsupported result schema")
+    fields!(r, @fields, "Expected a public v6 run series; export the original run.json with add")
+    require!(r["schema_version"] === 6, "Unsupported result schema")
     hex!(r["series_id"], "A series ID is required")
     text!(r["benchmark"], "benchmark")
 
@@ -47,6 +47,21 @@ defmodule Eab.Results.Schema do
       is_nil(model["size_bytes"]) == (model["size_source"] == "not_reported"),
       "Size and its source must agree"
     )
+
+    # Who made the quantization: named by the served file's GGUF header, or by the owner.
+    require!(
+      model["quantized_by_source"] in ~w(artifact_files owner_supplied not_reported),
+      "Invalid quantized-by source"
+    )
+
+    if model["quantized_by_source"] == "not_reported",
+      do: require!(is_nil(model["quantized_by"]), "An unreported maker must be null"),
+      else:
+        require!(
+          is_binary(model["quantized_by"]) and String.trim(model["quantized_by"]) != "" and
+            String.length(model["quantized_by"]) <= 100,
+          "quantized_by must be nonempty text of at most 100 characters"
+        )
 
     harness!(r["harness"])
 

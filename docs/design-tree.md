@@ -263,6 +263,8 @@ Run memory collection is implemented as a run-owned SSH stream from the model ho
 
 On 2026-11-09 the user asked whether model tokens per second were collected. Every saved llama.cpp response already held the server's own timings, but nothing read them, and Strata streams carry none. Each Pi model call now records its model speed under the same condition as case time (ADR 0014): llama.cpp's reported prompt and generation timings with speculative draft acceptance, or for Strata the controller's times from request to first token and from first to last token, network included. Reports, the run view and case details show summed tokens per second; the public results page still publishes no timing. Earlier runs keep their sealed records unchanged: their llama.cpp speeds remain readable from the saved responses, and their Strata speeds cannot be recovered.
 
+On 2026-11-09, with about twenty more models planned, the user asked for each result to name who made its quantization, so same-sounding models from different makers are not confused. Public schema 6 adds `quantized_by` with its source. The memory collector reads it from the served file's GGUF header; that maker joins the series setup, so identically named files from different makers stay separate series, while a publisher-supplied maker for a file that names no one is shown only. The seven local series were re-keyed with makers read from their archived files, and the series labelled Qwen3.8-Flash-Next-GSQ-RCO now carries the Coder name its header and repository use.
+
 ## Selecting future new cases — 2026-10-18
 
 Status: closed at the user's request. No case-selection or combined-result feature is being pursued from this discussion.
