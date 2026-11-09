@@ -154,9 +154,15 @@ defmodule Eab.ResultsTest do
     source = put_in(run(), ["settings", "window_tokens"], 262_144)
     assert entry(Results.export!(source, resources: snapshot()))["resources"] == snapshot()
 
+    # An owner's label is a display name; the artifact still has to be the series'.
+    labelled = Results.export!(source, resources: snapshot(), model_label: "Swift 1.5 27B")
+    assert labelled["model"]["name"] == "Swift 1.5 27B"
+    assert entry(labelled)["resources"]["model_artifact"] == "Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf"
+
     for {key, value} <- [
           {"context_tokens", 65536},
           {"model_artifact", "Other-Q4_K_M.gguf"},
+          {"model_artifact", "Swift-1.5-Qwen3.8-27B-Q5_K_M.gguf"},
           {"backend", "strata"},
           {"kind", "benchmark_peak"},
           {"api_key", "private"}

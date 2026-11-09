@@ -50,9 +50,10 @@ defmodule Eab.Series do
 
   def id(run), do: Cache.key(setup(run))
 
-  defp artifact(nil), do: nil
+  @doc "An artifact's name without its shard number, as a series records it."
+  def artifact(nil), do: nil
 
-  defp artifact(name),
+  def artifact(name),
     do: name |> String.replace(~r/-\d{5}-of-\d{5}(?=\.gguf$)/i, "")
 
   defp harness(run) do

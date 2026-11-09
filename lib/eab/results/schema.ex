@@ -148,7 +148,7 @@ defmodule Eab.Results.Schema do
       end
 
       if not is_nil(run["resources"]),
-        do: Eab.Results.Resources.validate!(run["resources"], model, settings)
+        do: Eab.Results.Resources.validate!(run["resources"], model, settings, r["setup"])
     end
 
     run_ids = Enum.map(runs, & &1["run_id"])

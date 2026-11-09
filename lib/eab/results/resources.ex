@@ -102,7 +102,7 @@ defmodule Eab.Results.Resources do
     end
   end
 
-  def validate!(r, model, settings) do
+  def validate!(r, model, settings, setup \\ %{}) do
     require!(is_map(r), "Expected resource object")
     sampled = r["kind"] == "run_samples"
     fields!(r, if(sampled, do: @sampled, else: @snapshot), "Unexpected resource fields")
@@ -149,10 +149,17 @@ defmodule Eab.Results.Resources do
     artifact = text!(r["model_artifact"], "model_artifact")
     require!(Path.basename(artifact) == artifact, "Only the artifact filename is public")
     identity = Eab.ModelIdentity.details(%{"profile" => %{"model_path" => artifact}})
+    series_artifact = get_in(setup || %{}, ["model", "artifact"])
 
+    # The displayed name may be the owner's label, so a series that records its artifact is
+    # matched by that; a Strata pack series records none and is matched by the files' name.
     require!(
       Eab.ModelIdentity.folder?(artifact) or
-        (identity["name"] == model["name"] and identity["quantization"] == model["quantization"]),
+        (identity["quantization"] == model["quantization"] and
+           if(series_artifact,
+             do: Eab.Series.artifact(artifact) == series_artifact,
+             else: identity["name"] == model["name"]
+           )),
       "Resource observation is for a different model artifact"
     )
 
