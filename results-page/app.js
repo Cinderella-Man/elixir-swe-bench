@@ -24,6 +24,9 @@
   const number = new Intl.NumberFormat("en-US");
   const fmt = value => number.format(value);
   const gb = bytes => bytes == null ? "Not recorded" : `${(bytes / 1e9).toFixed(1)} GB`;
+  // Cards are sold by GiB, so a GPU's use is shown against its capacity in the same unit.
+  const card = gpu => `${(gpu.used_bytes / 2**30).toFixed(1)} / ${(gpu.capacity_bytes / 2**30).toFixed(0)} GiB` +
+    ` (${Math.round(100 * gpu.used_bytes / gpu.capacity_bytes)}%)`;
   const hosted = r => ["openai_subscription", "anthropic", "claude_code"].includes(r.model.backend);
   const harness = r => r.harness.name === "claude_code" ? `Claude Code ${r.harness.version}` : `Pi ${r.harness.version}`;
   const scoreText = r => `${r.score_percent.toFixed(1)}%` + (r.interval_percent == null ? "" : ` ± ${r.interval_percent.toFixed(1)}`);
@@ -144,14 +147,14 @@
           ["RAM + VRAM · simultaneous peak", gb(p.peak_combined_bytes)], ["Process RSS · run peak", gb(p.peak_rss_bytes)],
           ["Memory coverage", `${p.coverage} · ${fmt(p.sample_count)} samples · ${p.interval_ms / 1000}s interval · highest run`],
           ["KV cache", p.kv_cache || "Not recorded"], ["Runtime", p.backend_version], ["CPU", p.cpu]);
-        for (const [i, gpu] of p.gpus.entries()) memory.push([`GPU ${i + 1} · ${gpu.name} · peak`, `${gb(gpu.used_bytes)} / ${(gpu.capacity_bytes / 2**30).toFixed(0)} GiB`]);
+        for (const [i, gpu] of p.gpus.entries()) memory.push([`GPU ${i + 1} · ${gpu.name} · peak`, card(gpu)]);
         conditions.append(definitionList(memory), node("p", "detail-note", "From the series run with the highest simultaneous RAM + VRAM peak. Service RAM includes charged page cache. Configured context is capacity; actual occupancy varies with the tasks."));
       } else {
       memory.push(["GPU memory · sampled", gb(vram(r))], ["Engine RAM · sampled RSS", gb(p.ram_rss_bytes)],
         ["Engine RAM · lifetime peak RSS", gb(p.ram_lifetime_peak_bytes)],
         ["Service RAM · sampled", gb(p.service_ram_bytes)], ["Service RAM · lifetime peak", gb(p.service_ram_lifetime_peak_bytes)],
         ["KV cache", p.kv_cache || "Not recorded"], ["Runtime", p.backend_version], ["CPU", p.cpu]);
-      for (const [i, gpu] of p.gpus.entries()) memory.push([`GPU ${i + 1} · ${gpu.name}`, `${gb(gpu.used_bytes)} / ${(gpu.capacity_bytes / 2**30).toFixed(0)} GiB`]);
+      for (const [i, gpu] of p.gpus.entries()) memory.push([`GPU ${i + 1} · ${gpu.name}`, card(gpu)]);
       conditions.append(definitionList(memory), node("p", "detail-note", `Loaded-process observation: ${new Date(p.observed_at).toISOString().replace("T", " ")}. Lifetime peaks cover the process/service lifetime, not this run. The configured context limit does not establish a fully occupied context measurement.`));
       }
     } else {
