@@ -9,7 +9,7 @@ docker build -f tools/memory_collector/Dockerfile \
   --output type=local,dest=.local/memory-elixir .
 ```
 
-The resulting `.local/memory-elixir/memory-collector/` includes Erlang/OTP and the native SCTP library. It is built on Ubuntu 24.04 x86-64 and runs on rigaorusultra's Ubuntu 26.04. Copy the whole directory to `/srv/elixir-agent-benchmark/memory-collector` on the model host. Do not replace a release while a benchmark is collecting memory. No system Elixir installation or collector daemon is needed; the benchmark launches one process per collection session.
+The resulting `.local/memory-elixir/memory-collector/` includes Erlang/OTP and the native SCTP library. It is built on Ubuntu 24.04 x86-64 and runs on a model host with Ubuntu 26.04. Copy the whole directory to `/srv/elixir-agent-benchmark/memory-collector` on the model host. Do not replace a release while a benchmark is collecting memory. No system Elixir installation or collector daemon is needed; the benchmark launches one process per collection session.
 
 Configure `EAB_MEMORY_REMOTE_COLLECTOR` with the full path to `bin/eab_memory_collector`, following the [runner setup](../../README.md#run-memory-on-the-model-host). The host also needs `ss`, `nvidia-smi`, procfs and a dedicated cgroup v2 model service. The API key stays in its existing file on that host.
 

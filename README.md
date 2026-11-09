@@ -35,15 +35,15 @@ The website is available only from the computer running it. The model endpoint c
 
 ## Run memory on the model host
 
-The benchmark can sample the served model's VRAM and RAM throughout each run. This is independent of optional performance measurements. On this installation it is configured for **rigaorusultra** (formerly ratx570), using its existing Tailscale SSH access; it does not start, stop or switch the model.
+The benchmark can sample the served model's VRAM and RAM throughout each run. This is independent of optional performance measurements. It reaches the model host over SSH (for example Tailscale SSH); it does not start, stop or switch the model.
 
 The [Elixir collector](tools/memory_collector/README.md) requires Linux cgroup v2, a dedicated model service, `ss` and NVIDIA's `nvidia-smi`. Its release includes Erlang/OTP, so the model host does not need Elixir installed. Build and install the release as described in its README, then set these values in the benchmark's ignored `.env` and rebuild/recreate the benchmark container:
 
 ```dotenv
-EAB_MEMORY_SSH_TARGET=root@rigaorusultra.tail94b7b1.ts.net
-EAB_MEMORY_HOSTS=rigaorusultra,rigaorusultra.tail94b7b1.ts.net,100.119.148.116
+EAB_MEMORY_SSH_TARGET=root@<model-host>.<tailnet>.ts.net
+EAB_MEMORY_HOSTS=<model-host>,<model-host>.<tailnet>.ts.net,<model-host-ip>
 EAB_MEMORY_REMOTE_COLLECTOR=/srv/elixir-agent-benchmark/memory-collector/bin/eab_memory_collector
-EAB_MEMORY_REMOTE_KEY_FILE=/srv/model-rig-lab/.local/secrets/api-key
+EAB_MEMORY_REMOTE_KEY_FILE=<path to the model server's API key file on the model host>
 ```
 
 Copy the model host's **already verified** SSH public host entry into `/data/memory/known_hosts` in the benchmark volume (mode 600). The SSH client uses strict host verification and no private key or agent; this configuration relies on Tailscale SSH authentication. Set `EAB_MEMORY_SSH_KEY` to use a key with a plain `sshd`, as on [a direct cable](docs/runbook.md#memory-collection-over-the-cable). The remote key-file path refers to the existing model API key **on that host**. Its contents never enter the benchmark or its evidence. `EAB_MEMORY_HOSTS` must list the exact hostnames/IPs used in the model endpoint URL, including the full Tailscale DNS name if you connect with it; listing a short hostname does not include its aliases. Other hosts and hosted APIs are not sampled. Empty `EAB_MEMORY_SSH_TARGET` disables collection. The connected-model card states whether collection is configured, disabled or skipped for an unlisted hostname.
