@@ -279,7 +279,7 @@ defmodule Eab.ModelTest do
         else: {:ok, %{status: 200, body: "data: [DONE]\n\n"}}
     end)
 
-    assert Model.stream(endpoint("strata"), "", %{}) == "data: [DONE]\n\n"
+    assert Model.stream(endpoint("strata"), "", %{}) == {"data: [DONE]\n\n", nil}
     assert :counters.get(attempts, 1) == 2
     assert_receive {:retry_wait, 1000}
 
@@ -338,7 +338,7 @@ defmodule Eab.ModelTest do
     end)
 
     model = Map.put(endpoint("strata"), "url", "https://127.0.0.1:#{port}")
-    assert Model.stream(model, "", %{}) == "data: [DONE]\n\n"
+    assert Model.stream(model, "", %{}) == {"data: [DONE]\n\n", nil}
     assert_receive {:transport_result, {:error, %Req.TransportError{reason: :timeout}}}
     assert_receive {:retry_wait, 1000}
     assert :counters.get(attempts, 1) == 2

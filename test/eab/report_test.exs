@@ -21,7 +21,17 @@ defmodule Eab.ReportTest do
         "failed" => %{
           "status" => "completed",
           "grade" => %{"passed" => false},
-          "measurement" => %{"attempt_ms" => 2500}
+          "measurement" => %{
+            "attempt_ms" => 2500,
+            "model_speed" => %{
+              "source" => "server_reported",
+              "calls" => 3,
+              "prompt_tokens" => 900,
+              "prompt_ms" => 1500.0,
+              "generated_tokens" => 120,
+              "generation_ms" => 6000.0
+            }
+          }
         },
         "legacy" => %{"status" => "completed", "grade" => %{"passed" => false}}
       }
@@ -31,9 +41,16 @@ defmodule Eab.ReportTest do
     report = File.read!(Store.path("runs/#{id}/report.md"))
     assert report =~ "Thinking: xhigh"
     assert report =~ "Thinking source: operator_declared"
-    assert report =~ "| passed | Passed | 0 | 1.001 s |"
-    assert report =~ "| failed | Failed | 0 | 2.5 s |"
-    assert report =~ "| legacy | Failed | 0 | Not measured |"
+    assert report =~ "| passed | Passed | 0 | 1.001 s | Not measured |"
+
+    assert report =~
+             "| failed | Failed | 0 | 2.5 s | generation 20.0 tok/s · prompt 600.0 tok/s · " <>
+               "reported by llama.cpp over 3 model calls |"
+
+    assert report =~ "| legacy | Failed | 0 | Not measured | Not measured |"
+
+    assert report =~
+             "- Model speed: generation 20.0 tok/s · prompt 600.0 tok/s · reported by llama.cpp over 3 model calls\n"
   end
 
   test "a run's parallel attempts are reported, and parallel runs record no times" do

@@ -156,6 +156,7 @@ defmodule Eab.Pi do
       calls: 0,
       generated_tokens: 0,
       measurement: Eab.Measurement.start(measure?),
+      speed: nil,
       stop_reason: nil,
       error: nil,
       settled: false,
@@ -224,7 +225,9 @@ defmodule Eab.Pi do
   def handle(_, _), do: raise("Unexpected Pi transport record")
 
   def finish(%{"state" => state, "returncode" => code}) do
-    measurement = Eab.Measurement.finish(state.measurement)
+    measurement =
+      Eab.Measurement.finish(state.measurement) |> Eab.ModelSpeed.attach(state.speed)
+
     # Also preserve the final duration when Pi exits with a transport/tool error.
     PiGateway.persist(state, measurement)
 

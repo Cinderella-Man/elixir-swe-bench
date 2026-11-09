@@ -1477,6 +1477,9 @@ defmodule EabWeb.DashboardLive do
                 "reasoning_effort_source"
               ]) || "Source not recorded"}
             </p>
+            <p :if={Eab.ModelSpeed.of_run(@run)} id="run-speed" class="fine-print">
+              Model speed: {Eab.ModelSpeed.label(Eab.ModelSpeed.of_run(@run))}
+            </p>
             <p :if={@run["release_id"]} class="fine-print">
               Release <code>{String.slice(@run["release_id"], 0, 12)}</code>
               · Experiment <code>{String.slice(@run["experiment_id"], 0, 12)}</code>
@@ -1647,6 +1650,13 @@ defmodule EabWeb.DashboardLive do
                   <section id="case-verdict" aria-label="Case result explanation" tabindex="-1">
                     <p :if={Eab.Harness.name(@run) != "claude_code"} id="case-time" class="fine-print">
                       Case time: {Eab.Measurement.label((@case_attempt || %{})["measurement"])} · Pi startup through completion, excluding preparation and grading.
+                    </p>
+                    <p
+                      :if={get_in(@case_attempt || %{}, ["measurement", "model_speed"])}
+                      id="case-speed"
+                      class="fine-print"
+                    >
+                      Model speed: {Eab.ModelSpeed.label(@case_attempt["measurement"]["model_speed"])}
                     </p>
                     <h4>
                       {if is_nil(@case_attempt) and case_tone(@run, id) == "active",

@@ -261,6 +261,8 @@ On 2026-10-20 the user requested permanent case timing, with model inference ser
 
 Run memory collection is implemented as a run-owned SSH stream from the model host. A first sample and matching model/context are required before work starts; completion, error and cancellation finalize the stream. Dedicated service cgroup counters and process-attributed NVIDIA allocations exclude unrelated workloads. Raw samples and session summaries persist with each run; gaps, disconnects and interrupted/resumed segments retain partial coverage. Public export automatically carries hardware and sampled peaks without private host/service/GPU identifiers. RAM plus VRAM is a simultaneous sampled total, while each resource retains its own peak and per-GPU breakdown.
 
+On 2026-11-09 the user asked whether model tokens per second were collected. Every saved llama.cpp response already held the server's own timings, but nothing read them, and Strata streams carry none. Each Pi model call now records its model speed under the same condition as case time (ADR 0014): llama.cpp's reported prompt and generation timings with speculative draft acceptance, or for Strata the controller's times from request to first token and from first to last token, network included. Reports, the run view and case details show summed tokens per second; the public results page still publishes no timing. Earlier runs keep their sealed records unchanged: their llama.cpp speeds remain readable from the saved responses, and their Strata speeds cannot be recovered.
+
 ## Selecting future new cases — 2026-10-18
 
 Status: closed at the user's request. No case-selection or combined-result feature is being pursued from this discussion.

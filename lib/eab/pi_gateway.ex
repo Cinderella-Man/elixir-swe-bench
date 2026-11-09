@@ -1,6 +1,6 @@
 defmodule Eab.PiGateway do
   @moduledoc "Forwards Pi's native model requests and enforces attempt budgets; never executes tools."
-  alias Eab.{Activity, Model, Store}
+  alias Eab.{Activity, Model, ModelSpeed, Store}
 
   def request(frame, state) do
     route =
@@ -149,11 +149,20 @@ defmodule Eab.PiGateway do
             "Waiting for model response…"
         )
 
-        body = Model.stream(state.endpoint, state.key, payload)
+        {body, timing} = Model.stream(state.endpoint, state.key, payload)
         Store.write_text("#{state.prefix}/response-#{step}.sse", body, state.key)
         usage = Model.stream_usage(state.endpoint, body, count, allowance)
+        # Speed is recorded only while elapsed time is (ADR 0014).
+        speed = if is_map(state.measurement), do: ModelSpeed.call(state.endpoint, body, timing)
+        usage = if speed, do: Map.put(usage, "speed", speed), else: usage
         Store.write("#{state.prefix}/usage-#{step}.json", usage, state.key)
-        state = %{state | generated_tokens: state.generated_tokens + usage["output_tokens"]}
+
+        state = %{
+          state
+          | generated_tokens: state.generated_tokens + usage["output_tokens"],
+            speed: ModelSpeed.add(state.speed, speed)
+        }
+
         persist(state)
         state.emit.("Pi: call #{state.calls}, #{state.generated_tokens} generated tokens")
         {reply(frame, 200, "text/event-stream", body), state}
@@ -202,7 +211,9 @@ defmodule Eab.PiGateway do
         "generated_tokens" => state.generated_tokens,
         "stop_reason" => state.stop_reason,
         "error" => state.error,
-        "measurement" => measurement || Eab.Measurement.finish(state.measurement)
+        "measurement" =>
+          measurement ||
+            ModelSpeed.attach(Eab.Measurement.finish(state.measurement), state.speed)
       },
       state.key
     )

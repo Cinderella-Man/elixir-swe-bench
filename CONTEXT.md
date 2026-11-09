@@ -26,7 +26,7 @@ _Avoid_: enrichment, synthetic PR
 
 **Deployment memory observation**: A dated sample of an identified inference process's GPU allocation, RAM and serving configuration. Process/service lifetime peaks do not establish the peak during a particular benchmark run or the minimum hardware required.
 
-**Attempt measurement**: Opt-in elapsed attempt time and model-request time from a named, explicitly authorized performance environment. Generated-token accounting remains available without timing. Model-request throughput includes prompt processing and response transfer.
+**Attempt measurement**: A Pi attempt's elapsed time from startup through completion, with its **model speed**: the prompt tokens processed and tokens generated per second, summed over its model calls. llama.cpp reports its own timings; the controller times Strata's streamed tokens, network included. Both are recorded only when parallel attempts is 1, for a model served on another machine. Generated-token accounting remains available without timing.
 
 **Run**: An evaluation of one model profile through one harness across a frozen selection of cases, using fixed inputs and the budgets and seed that harness supports.
 

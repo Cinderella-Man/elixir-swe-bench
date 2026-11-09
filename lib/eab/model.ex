@@ -4,6 +4,7 @@ defmodule Eab.Model do
   @connect_errors [:econnrefused, :nxdomain, :enetunreach, :ehostunreach]
   @transient_errors @connect_errors ++ [:timeout, :closed, :econnreset]
   @request_phase {__MODULE__, :request_phase}
+  @stream_sent {__MODULE__, :stream_sent}
 
   @doc false
   def install_transport_observer do
@@ -148,37 +149,47 @@ defmodule Eab.Model do
     count
   end
 
+  @doc """
+  Returns the event stream and, for Strata, when its first and last token events arrived
+  in milliseconds after the request was sent (nil when none arrived).
+  """
   def stream(endpoint, key, payload) do
     route = if endpoint["backend"] == "strata", do: "/v1/messages", else: "/v1/chat/completions"
     http(endpoint["url"], key, :post, route, payload, 1_200_000, :stream)
   end
 
+  @doc false
+  def events(body) do
+    body
+    |> String.split(~r/\r?\n\r?\n/)
+    |> Enum.flat_map(fn block ->
+      data =
+        for "data:" <> line <- String.split(block, ~r/\r?\n/), do: String.trim_leading(line)
+
+      case Enum.join(data, "\n") do
+        value when value in ["", "[DONE]"] -> []
+        value -> [Jason.decode!(value)]
+      end
+    end)
+  end
+
+  @doc false
+  def strata_usage(events) do
+    Enum.reduce(events, %{}, fn event, acc ->
+      Map.merge(acc, get_in(event, ["message", "usage"]) || event["usage"] || %{})
+    end)
+  end
+
   # Parse the server's actual usage, independently of Pi's display estimates.
   def stream_usage(endpoint, body, expected_input, allowance) do
-    events =
-      body
-      |> String.split(~r/\r?\n\r?\n/)
-      |> Enum.flat_map(fn block ->
-        data =
-          for "data:" <> line <- String.split(block, ~r/\r?\n/), do: String.trim_leading(line)
-
-        case Enum.join(data, "\n") do
-          value when value in ["", "[DONE]"] -> []
-          value -> [Jason.decode!(value)]
-        end
-      end)
+    events = events(body)
 
     if Enum.any?(events, &(Map.has_key?(&1, "error") or &1["type"] == "error")),
       do: raise("Model stream reported an error")
 
     {usage, complete} =
       if endpoint["backend"] == "strata" do
-        usage =
-          Enum.reduce(events, %{}, fn event, acc ->
-            Map.merge(acc, get_in(event, ["message", "usage"]) || event["usage"] || %{})
-          end)
-
-        {usage, Enum.any?(events, &(&1["type"] == "message_stop"))}
+        {strata_usage(events), Enum.any?(events, &(&1["type"] == "message_stop"))}
       else
         usage =
           Enum.reduce(events, %{}, fn event, acc -> Map.merge(acc, event["usage"] || %{}) end)
@@ -265,6 +276,7 @@ defmodule Eab.Model do
 
     opts = if payload, do: Keyword.put(opts, :json, payload), else: opts
     request = Application.get_env(:eab, :http_request, &Req.request/1)
+    clock = Application.get_env(:eab, :measurement_clock, &monotonic_ms/0)
     activity = Eab.Activity.context()
     stream = make_ref()
 
@@ -273,11 +285,26 @@ defmodule Eab.Model do
         Eab.Activity.inherit(activity, fn -> Eab.Activity.model_chunk(stream, data) end)
       end
 
-      chunks = [data | Map.get(response.private, :eab_chunks, [])]
-      {:cont, {req, %{response | private: Map.put(response.private, :eab_chunks, chunks)}}}
+      private =
+        response.private
+        |> Map.update(:eab_chunks, [data], &[data | &1])
+        |> token_time(data, clock)
+
+      {:cont, {req, %{response | private: private}}}
     end
 
-    opts = if format == :stream, do: Keyword.put(opts, :into, into), else: opts
+    {request, opts} =
+      if format == :stream do
+        # Each connection attempt restarts the clock, so retry waits are excluded.
+        timed = fn opts ->
+          Process.put(@stream_sent, clock.())
+          request.(opts)
+        end
+
+        {timed, Keyword.put(opts, :into, into)}
+      else
+        {request, opts}
+      end
 
     result =
       try do
@@ -285,6 +312,8 @@ defmodule Eab.Model do
       after
         Eab.Activity.model_end(stream)
       end
+
+    sent = Process.delete(@stream_sent)
 
     result =
       case result do
@@ -296,9 +325,9 @@ defmodule Eab.Model do
       end
 
     case result do
-      {:ok, %{status: code, body: body}}
+      {:ok, %{status: code, body: body} = response}
       when code in 200..299 and (is_map(body) or (is_binary(body) and format == :stream)) ->
-        body
+        if format == :stream, do: {body, token_timing(response, sent)}, else: body
 
       {:ok, %{status: 401}} when key == "" ->
         raise "Endpoint #{route} requires an API key (HTTP 401). Enter the server's API key under Server credentials and reconnect."
@@ -361,6 +390,29 @@ defmodule Eab.Model do
         result
     end
   end
+
+  # Strata streams every generated token, including reasoning and tool input, as a
+  # content_block_delta event. llama.cpp reports its own timings instead.
+  defp token_time(private, data, clock) do
+    if String.contains?(data, "content_block_delta") do
+      now = clock.()
+      private |> Map.put_new(:eab_first_token, now) |> Map.put(:eab_last_token, now)
+    else
+      private
+    end
+  end
+
+  defp token_timing(response, sent) do
+    case Map.get(response, :private, %{}) do
+      %{eab_first_token: first, eab_last_token: last} when is_integer(sent) ->
+        %{"first_token_ms" => first - sent, "last_token_ms" => last - sent}
+
+      _ ->
+        nil
+    end
+  end
+
+  defp monotonic_ms, do: System.monotonic_time(:millisecond)
 
   defp request_once(request, opts) do
     previous = Process.put(@request_phase, :unobserved)

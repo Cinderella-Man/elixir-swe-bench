@@ -1,5 +1,5 @@
 defmodule Eab.Report do
-  alias Eab.{Evidence, Runner, Store}
+  alias Eab.{Evidence, ModelSpeed, Runner, Store}
 
   def write(run) do
     score = Runner.score(run)
@@ -25,7 +25,7 @@ defmodule Eab.Report do
             _ -> attempt["status"] || "Not attempted"
           end
 
-        "| #{id} | #{outcome} | #{attempt["calls"] || 0} | #{Eab.Measurement.label(attempt["measurement"])} | #{escape(Evidence.verdict(attempt))} |"
+        "| #{id} | #{outcome} | #{attempt["calls"] || 0} | #{Eab.Measurement.label(attempt["measurement"])} | #{ModelSpeed.label(get_in(attempt, ["measurement", "model_speed"]))} | #{escape(Evidence.verdict(attempt))} |"
       end)
 
     evidence =
@@ -53,6 +53,7 @@ defmodule Eab.Report do
     - Backend: #{model["backend"] || "Unknown"}
     - Harness: #{Eab.Harness.label(run)}#{if run["validation"], do: "\n- Purpose: case validation run; never published or scored", else: ""}
     - Parallel attempts: #{parallel(run)}
+    - Model speed: #{ModelSpeed.label(ModelSpeed.of_run(run))}
     - Thinking: #{escape(Eab.Thinking.label(run["settings"]))}
     - Thinking source: #{get_in(run, ["settings", "reasoning_effort_source"]) || if(model["backend"] in ["openai_subscription", "anthropic"], do: "provider request", else: "not recorded")}
     - Release: #{run["release_id"] || "Historical protocol only"}
@@ -75,10 +76,10 @@ defmodule Eab.Report do
     #{Jason.encode!(run["settings"] || %{}, pretty: true)}
     ```
 
-    Case time covers Pi startup, model calls and tools through completion, excluding fixture preparation and independent grading. Claude Code attempts and runs with more than one parallel attempt store no timing. Missing timings are not reconstructed from logs.
+    Case time covers Pi startup, model calls and tools through completion, excluding fixture preparation and independent grading. Model speed is tokens per second while the server processed prompts and generated output, summed over a case's model calls: llama.cpp reports its own timings, and the controller times Strata's streamed tokens, network included. Claude Code attempts and runs with more than one parallel attempt store no timing. Missing timings are not reconstructed from logs.
 
-    | Case | Result | Model calls | Case time | Explanation |
-    | --- | --- | ---: | ---: | --- |
+    | Case | Result | Model calls | Case time | Model speed | Explanation |
+    | --- | --- | ---: | ---: | --- | --- |
     #{rows}
 
     | Group | Value | Passed | Failed | Incomplete/error |

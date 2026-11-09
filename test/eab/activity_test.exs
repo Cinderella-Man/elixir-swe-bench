@@ -133,7 +133,7 @@ defmodule Eab.ActivityTest do
     assert_receive {:stream_waiting, pid}, 3000
     assert File.read!(path) =~ "Investigating the source"
     send(pid, :continue)
-    assert Task.await(task) == first <> second
+    assert Task.await(task) == {first <> second, nil}
   end
 
   test "log reads cannot escape artifact paths", %{id: id} do
@@ -167,7 +167,7 @@ defmodule Eab.ActivityTest do
       end)
 
     try do
-      response =
+      {response, _timing} =
         Activity.with_case(id, "case", "", fn ->
           Model.stream(%{"url" => "http://127.0.0.1:#{port}", "backend" => "strata"}, "", %{})
         end)
