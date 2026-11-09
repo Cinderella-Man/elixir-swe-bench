@@ -1,8 +1,8 @@
 defmodule Eab.MemoryCollector.Weights do
   @moduledoc false
 
-  # Only count the exact GGUF file or its complete, numbered shard set.
-  # Optional metadata must not prevent memory collection when files are unavailable.
+  # Count the exact GGUF file or its complete, numbered shard set, or the files a Strata
+  # pack lists. Optional metadata must not prevent memory collection when files are unavailable.
   def read(path) when is_binary(path) do
     files = if File.dir?(path), do: pack(path), else: paths(path)
 
@@ -47,44 +47,45 @@ defmodule Eab.MemoryCollector.Weights do
     end
   end
 
-  # Strata serves from a pack folder. Its tensors.txt opens with the GGUF files the engine
-  # reads ("file <n> <name>") and ds4.txt names the folder holding them. A drafter listed
-  # beside the model's one numbered shard set is not the model; any other mix is unknown.
+  # Strata serves from a pack folder. Its tensors.txt lists the GGUF files the engine reads
+  # ("file <n> <name>") and the file holding each tensor ("t <name> <type> <n> ..."); ds4.txt
+  # names the folder holding the files. A pack may mix shards of one release with a file
+  # from another, so count what it lists, except a file holding only the speculative
+  # drafter's (mtp.*) tensors, which is not the model.
   defp pack(dir) do
     listing = Path.join(dir, "tensors.txt")
 
-    names =
+    {files, drafter} =
       if File.regular?(listing) do
         listing
         |> File.stream!()
-        |> Stream.map(&String.trim_trailing/1)
-        |> Stream.take_while(&String.starts_with?(&1, "file "))
-        |> Stream.take(1025)
-        |> Enum.flat_map(fn line ->
-          case String.split(line, " ", parts: 3) do
-            ["file", _, name] -> if name =~ ~r/\A[^\/]+\.gguf\z/, do: [name], else: [nil]
-            _ -> [nil]
+        |> Enum.reduce({[], %{}}, fn line, {files, drafter} ->
+          case String.split(String.trim_trailing(line), " ", parts: 3) do
+            ["file", index, name] ->
+              {[{index, name} | files], drafter}
+
+            ["t", tensor, placement] ->
+              index = placement |> String.split(" ", parts: 3) |> Enum.at(1)
+              only = String.starts_with?(tensor, "mtp.")
+              {files, Map.update(drafter, index, only, &(&1 and only))}
+
+            _ ->
+              {files, drafter}
           end
         end)
       else
-        []
+        {[], %{}}
       end
 
+    names = for {index, name} <- Enum.reverse(files), drafter[index] != true, do: name
     folder = model_dir(dir)
-    sets = Enum.filter(names, &(&1 && &1 =~ ~r/-\d{5}-of-\d{5}\.gguf\z/))
 
-    cond do
-      nil in names or length(names) > 1024 -> []
-      sets != [] -> if one_set?(sets), do: paths(Path.join(folder, hd(sets))), else: []
-      length(names) == 1 -> [Path.join(folder, hd(names))]
-      true -> []
-    end
+    if names != [] and length(names) <= 1024 and Enum.all?(names, &(&1 =~ ~r/\A[^\/]+\.gguf\z/)),
+      do: Enum.map(names, &Path.join(folder, &1)),
+      else: []
   rescue
     File.Error -> []
   end
-
-  defp one_set?(names),
-    do: names |> Enum.uniq_by(&String.replace(&1, ~r/-\d{5}-of-/, "-of-")) |> length() == 1
 
   defp model_dir(dir) do
     config = Path.join(dir, "ds4.txt")

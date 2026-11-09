@@ -180,24 +180,30 @@ defmodule Eab.MemoryCollectorTest do
     assert Collector.identity(Collector.open(ctx.request, ctx.opts))["weight_files"] == nil
   end
 
-  test "follows a Strata pack folder to its model's GGUF shards, not its drafter", ctx do
+  test "counts the GGUF files a Strata pack lists, except a drafter-only file", ctx do
     weights = Path.join(ctx.proc, "weights")
     pack = Path.join(weights, "pack")
     File.mkdir_p!(pack)
-    first = "Model-UD-IQ1_M-00001-of-00002.gguf"
-    second = "Model-UD-IQ1_M-00002-of-00002.gguf"
+    # Shards 1-2 of 3 plus an Engram table from another release, as on the rig.
+    first = "Model-IQ2_XXS-00001-of-00003.gguf"
+    second = "Model-IQ2_XXS-00002-of-00003.gguf"
+    engram = "Model-Engram-IQ4_NL.gguf"
     drafter = "dspark-Model-Q8_0.gguf"
 
-    for {name, body} <- [{first, "12"}, {second, "345"}, {drafter, "6"}],
+    for {name, body} <- [{first, "1"}, {second, "23"}, {engram, "456"}, {drafter, "7890"}],
         do: File.write!(Path.join(weights, name), body)
 
-    listing = fn names ->
-      lines = names |> Enum.with_index() |> Enum.map(fn {name, i} -> "file #{i} #{name}\n" end)
-      File.write!(Path.join(pack, "tensors.txt"), [lines, "t head.weight Q6_K 1 224 5 1 1\n"])
+    # Shard 1 holds metadata only; the drafter file holds only mtp.* tensors.
+    listing = fn files, tensors ->
+      lines = files |> Enum.with_index() |> Enum.map(fn {name, i} -> "file #{i} #{name}\n" end)
+      placed = Enum.map(tensors, fn {name, i} -> "t #{name} Q6_K #{i} 224 5 1 1\n" end)
+      File.write!(Path.join(pack, "tensors.txt"), [lines, placed])
     end
 
     File.write!(Path.join(pack, "ds4.txt"), "format gguf\nmodel_dir #{weights}\n")
-    listing.([first, second, drafter])
+
+    model = [{"head.weight", 1}, {"layers.1.engram.embed.weight", 2}, {"mtp.0.ffn.weight", 3}]
+    listing.([first, second, engram, drafter], model)
     original = ctx.opts[:http]
 
     http = fn endpoint, key, route ->
@@ -209,20 +215,17 @@ defmodule Eab.MemoryCollectorTest do
       Collector.open(Map.put(ctx.request, "artifact", "pack"), Keyword.put(ctx.opts, :http, http))
 
     weights_files = Collector.identity(state)["weight_files"]
-    assert weights_files["size_bytes"] == 5
-    assert Enum.map(weights_files["files"], & &1["name"]) == [first, second]
+    assert weights_files["size_bytes"] == 6
+    assert Enum.map(weights_files["files"], & &1["name"]) == [first, second, engram]
     refute JSON.encode!(weights_files) =~ ctx.proc
 
-    # A lone listed file stands for itself; anything ambiguous or unsafe stays unknown.
-    listing.([drafter])
-    assert Collector.identity(state)["weight_files"]["size_bytes"] == 1
+    # A file shared by drafter and model tensors is the model's.
+    listing.([first, second, drafter], [{"head.weight", 1}, {"mtp.0.w", 2}, {"norm.weight", 2}])
+    assert Collector.identity(state)["weight_files"]["size_bytes"] == 7
 
-    for names <- [
-          [first, drafter, "other-Q4_K-00001-of-00002.gguf"],
-          [drafter, "b.gguf"],
-          ["../x.gguf"]
-        ] do
-      listing.(names)
+    # A missing listed file, an unsafe name or no listing leaves the size unknown.
+    for files <- [[first, "absent.gguf"], ["../x.gguf"], []] do
+      listing.(files, [])
       assert Collector.identity(state)["weight_files"] == nil
     end
 
