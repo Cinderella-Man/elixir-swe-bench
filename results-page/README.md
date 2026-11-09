@@ -2,7 +2,7 @@
 
 A static, shareable page for Elixir SWE Bench results, produced by this repository's benchmark runner. One dot represents a run series ([ADR 0011](../docs/adr/0011-publish-three-run-series.md)): up to three runs of one model through one harness on the current admitted cases. The dot sits at the mean score; a band shows ±1.96 standard errors of rerun noise once two runs exist. Hollow dots are provisional series that still miss runs. No server, database, npm packages or external assets are needed to serve it.
 
-The page contains a title, maximum model-size slider and one shared chart, with each model's name just above its dot and its score beside it. Case outcomes and recorded settings open below the chart. There is no comparison selector or model search.
+The page contains a title, required-memory slider and one shared chart, with each model's name just above its dot and its score beside it. Case outcomes and recorded settings open below the chart. There is no comparison selector or model search.
 
 The benchmark run history and published results were cleared on 2026-10-20 because their thinking presets were not reliably recorded, and again on 2026-10-26 because the cases are being rebuilt ([ADR 0012](../docs/adr/0012-rebuild-release-and-validate-with-unpublished-opus-runs.md)). Every series starts on the rebuilt release. With no published records, the page shows “No benchmark results yet” and hides the slider and chart guidance.
 
@@ -10,7 +10,7 @@ Each point names its model, its quantization when it has one, and its thinking l
 
 Fresh runs on configured model-host endpoint hostnames collect model-service RAM and VRAM throughout the run. Their exported summaries include sampled peaks, the highest simultaneous RAM + VRAM total, per-GPU allocations, configured context, runtime and collection coverage. Model weight size remains a separate field. The dashboard shows collection configuration before starting a run; a local result's details say when no memory observations were saved.
 
-The slider still filters model weight-file size in decimal GB when results exist. Changing it to “Max VRAM+RAM used” is deferred until fresh runs provide the required memory data. Observed VRAM/RAM does not yet determine eligibility for this filter. A numeric limit hides unknown-size/API models; All restores them.
+The slider, **Required memory (VRAM+RAM)**, filters by the measured simultaneous VRAM + RAM peak in decimal GB: `peak_combined_bytes` of the series run with the highest one. Only run samples count; a loaded-model snapshot does not. A numeric limit hides hosted APIs and series without a measurement; All restores them.
 
 ## Preview
 
@@ -125,6 +125,6 @@ The workflow runs the publication checks, builds `results-page/dist/`, uploads o
 
 The benchmark now streams model-service memory from a configured model host during each ordinary run; see [runner setup](../README.md#run-memory-on-the-model-host). `mix eab.results add path/to/run.json` automatically includes its saved `memory` summary. No separate `--resources` option is needed for these runs.
 
-`resources.kind = "run_samples"` records sampled run peaks for VRAM, service RAM, RSS and simultaneous RAM + VRAM, plus per-GPU peaks, configured context, runtime, KV cache, interval, sample count and complete/partial coverage. The exporter strips private host/service identifiers and GPU UUIDs. It refuses to combine resumed sessions from different deployments or physical GPUs. The page distinguishes run samples from the earlier `loaded_snapshot`; the old results are not backfilled with new measurements. Model weight size remains a separate field and slider.
+`resources.kind = "run_samples"` records sampled run peaks for VRAM, service RAM, RSS and simultaneous RAM + VRAM, plus per-GPU peaks, configured context, runtime, KV cache, interval, sample count and complete/partial coverage. The exporter strips private host/service identifiers and GPU UUIDs. It refuses to combine resumed sessions from different deployments or physical GPUs. The page distinguishes run samples from the earlier `loaded_snapshot`; the old results are not backfilled with new measurements. Model weight size remains a separate field in the details; the slider uses the run peak.
 
 Case additions and source migrations follow [prepared fork sources](../docs/prepared-fork-sources.md). Published results retain their frozen release identities; changing a case to a prepared fork does not relabel historical attempts. Single-case curation runs are not a full-inventory score. See the [source audit](../verification/prepared-forks-2026-10-20/README.md).

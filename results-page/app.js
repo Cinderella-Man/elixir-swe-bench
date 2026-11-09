@@ -11,12 +11,12 @@
   };
   if (!data || data.schema_version !== 5) {
     $("chart").append(node("p", "empty", "Results could not be loaded. Please reload."));
-    $("size-limit").disabled = true;
+    $("memory-limit").disabled = true;
     return;
   }
   const records = data.results;
   if (records.length === 0) {
-    document.querySelector(".size-control").remove();
+    document.querySelector(".memory-control").remove();
     document.querySelector("footer").remove();
     $("chart").append(node("p", "empty", "No benchmark results yet."));
     return;
@@ -49,10 +49,12 @@
   const sum = (run, key) => run.cases.every(c => Number.isInteger(c[key])) ? run.cases.reduce((n, c) => n + c[key], 0) : null;
   const readable = value => value == null ? "Not recorded" : typeof value === "boolean" ? (value ? "Enabled" : "Disabled") :
     typeof value === "number" ? fmt(value) : value.replaceAll("_", " ");
-  const largest = records.reduce((max, r) => Math.max(max, (r.model.size_bytes || 0) / 1e9), 0);
+  // Only a run's sampled peak is a measurement; a loaded-model snapshot is not a run's requirement.
+  const required = r => r.resources?.kind === "run_samples" ? r.resources.peak_combined_bytes : null;
+  const largest = records.reduce((max, r) => Math.max(max, (required(r) || 0) / 1e9), 0);
   const allValue = Math.max(100, Math.ceil(largest / 10) * 10) + 1;
-  $("size-limit").max = allValue;
-  $("size-limit").value = allValue;
+  $("memory-limit").max = allValue;
+  $("memory-limit").value = allValue;
   const settings = {
     max_tokens: "Generation budget / case", budget_policy: "Budget policy", context_policy: "Context policy",
     window_tokens: "Context limit", response_tokens: "Tokens / response", safety_tokens: "Safety tokens",
@@ -224,20 +226,20 @@
     }
   }
   function render() {
-    const cap = Number($("size-limit").value), all = cap === allValue;
-    const shown = records.filter(r => all || r.model.size_bytes !== null && r.model.size_bytes / 1e9 <= cap)
+    const cap = Number($("memory-limit").value), all = cap === allValue;
+    const shown = records.filter(r => all || required(r) != null && required(r) / 1e9 <= cap)
       .sort((a, b) => b.score_percent - a.score_percent || a.model.name.localeCompare(b.model.name) || b.run_count - a.run_count);
-    $("size-value").textContent = all ? "All" : `${cap} GB`;
-    $("size-limit").setAttribute("aria-valuetext", all ? "All models" : `Up to ${cap} GB of model weights`);
+    $("memory-value").textContent = all ? "All" : `${cap} GB`;
+    $("memory-limit").setAttribute("aria-valuetext", all ? "All models" : `Up to ${cap} GB of VRAM and RAM`);
     $("chart").replaceChildren();
     if (shown.length) { $("chart").append(plot(shown)); fitLabels(); }
-    else $("chart").append(node("p", "empty", "No models within this size limit."));
+    else $("chart").append(node("p", "empty", "No models within this memory limit."));
     const active = shown.find(r => r.series_id === selected);
     if (active) $("chart").append(details(active)); else selected = null;
-    const unknownSizes = records.some(r => r.model.size_bytes === null);
-    $("result-status").textContent = `${shown.length} / ${records.length} run series` + (!all && unknownSizes ? " · API / unknown sizes hidden" : "");
+    const unmeasured = records.some(r => required(r) == null);
+    $("result-status").textContent = `${shown.length} / ${records.length} run series` + (!all && unmeasured ? " · API / unmeasured models hidden" : "");
   }
-  $("size-limit").addEventListener("input", render);
+  $("memory-limit").addEventListener("input", render);
   window.addEventListener("resize", fitLabels);
   render();
 })();
