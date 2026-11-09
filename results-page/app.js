@@ -169,6 +169,27 @@
   const memoryMax = Math.max(64, Math.ceil(largest / 64) * 64);
   const casesText = r => `${fmt(Math.round(r.score_percent * r.total / 10) / 10)} of ${r.total} cases`;
   const memoryText = r => required(r) != null ? `${gb(required(r))} peak VRAM + RAM` : hosted(r) ? "API: no local memory" : "Memory not measured";
+  // Until series record their family, it is the model's name without a quantizer's suffix.
+  const family = r => r.model.family || r.model.name.replace(/-(GSQ-RCO(-Coder)?|Gyro-[A-Z]+)$/, "");
+  const memberName = r => [r.model.quantization, effort(r)].filter(Boolean).join(" ") || chartName(r);
+  // These five hues pass every pairwise colour check on white (the dataviz validator with --pairs all). In this fixed
+  // order they go to the families with more than one series, best family first; every other family is grey. Colours
+  // are decided once from all results, so the filter below never repaints a family.
+  const HUES = ["#2a78d6", "#1baf7a", "#eda100", "#008300", "#e34948"], GREY = "#8a8494";
+  const families = (() => {
+    const groups = new Map();
+    for (const r of records) groups.set(family(r), [...(groups.get(family(r)) || []), r]);
+    const top = members => Math.max(...members.map(r => r.score_percent));
+    let slot = 0;
+    return new Map([...groups].sort(([an, a], [bn, b]) => top(b) - top(a) || an.localeCompare(bn))
+      .map(([name, members]) => [name, {name, members, color: members.length > 1 && slot < HUES.length ? HUES[slot++] : GREY}]));
+  })();
+  // A family's best series carries its name on the chart: most cases passed, then least memory.
+  const anchors = new Set([...families.values()].map(f => [...f.members].sort((a, b) =>
+    b.score_percent - a.score_percent || (required(a) ?? Infinity) - (required(b) ?? Infinity))[0]));
+  const chosen = new Set();
+  let tableOpen = false, sortBy = "cases", sortDown = true;
+  const faded = r => chosen.size > 0 && !chosen.has(family(r));
   // The series no cheaper series beats: each passes more cases than everything that used less memory.
   function frontier(measured) {
     const best = [];
@@ -177,19 +198,49 @@
     }
     return best;
   }
-  function frontierLine(best) {
-    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    svg.setAttribute("class", "frontier");
-    svg.setAttribute("viewBox", "0 0 100 100");
-    svg.setAttribute("preserveAspectRatio", "none");
-    svg.setAttribute("aria-hidden", "true");
-    const x = r => required(r) / 1e9 / memoryMax * 100, y = r => 100 - r.score_percent;
-    let d = `M${x(best[0])},${y(best[0])}`;
-    for (const r of best.slice(1)) d += ` H${x(r)} V${y(r)}`;
-    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    path.setAttribute("d", d + " H100");
-    svg.append(path);
-    return svg;
+  const svg = (tag, attributes) => {
+    const e = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (const [key, value] of Object.entries(attributes)) e.setAttribute(key, value);
+    return e;
+  };
+  const xOf = r => required(r) / 1e9 / memoryMax * 100, yOf = r => 100 - r.score_percent;
+  // Lines in the plot's own coordinates: each family's quants in memory order, then the frontier's steps.
+  function lines(measured, best) {
+    const layer = svg("svg", {class: "plot-lines", viewBox: "0 0 100 100", preserveAspectRatio: "none", "aria-hidden": "true"});
+    for (const f of families.values()) {
+      const members = measured.filter(r => family(r) === f.name).sort((a, b) => required(a) - required(b));
+      if (members.length < 2) continue;
+      layer.append(svg("polyline", {class: "family-line" + (faded(members[0]) ? " faded" : ""), stroke: f.color,
+        points: members.map(r => `${xOf(r)},${yOf(r)}`).join(" ")}));
+    }
+    if (best.length > 1) {
+      let d = `M${xOf(best[0])},${yOf(best[0])}`;
+      for (const r of best.slice(1)) d += ` H${xOf(r)} V${yOf(r)}`;
+      layer.append(svg("path", {class: "frontier", d: d + " H100"}));
+    }
+    return layer;
+  }
+  // The family buttons are the colour legend and the filter: pick families to bring them forward.
+  function chips() {
+    const row = node("div", "family-chips");
+    row.setAttribute("role", "group");
+    row.setAttribute("aria-label", "Families: choose to highlight");
+    const all = [...families.values()];
+    for (const f of [...all.filter(f => f.color !== GREY), ...all.filter(f => f.color === GREY)]) {
+      const chip = node("button", "chip" + (chosen.has(f.name) ? " on" : ""));
+      chip.setAttribute("aria-pressed", String(chosen.has(f.name)));
+      const swatch = node("span", "chip-swatch");
+      swatch.style.background = f.color;
+      chip.append(swatch, node("span", "", f.name), node("span", "chip-count", f.members.length));
+      chip.addEventListener("click", () => { chosen.has(f.name) ? chosen.delete(f.name) : chosen.add(f.name); render(); });
+      row.append(chip);
+    }
+    if (chosen.size) {
+      const clear = node("button", "chip clear", "Show all");
+      clear.addEventListener("click", () => { chosen.clear(); render(); });
+      row.append(clear);
+    }
+    return row;
   }
   function legend(shown, withFrontier) {
     const list = node("div", "scatter-legend");
@@ -197,16 +248,20 @@
     if (shown.some(r => r.harness.name === "pi")) item("circle", "Pi");
     if (shown.some(r => r.harness.name === "claude_code")) item("diamond", "Claude Code");
     if (shown.some(r => !r.complete)) item("circle hollow", "Provisional (fewer than 3 runs)");
+    if ([...families.values()].some(f => f.members.length > 1)) item("ladder", "One family's quants");
     if (withFrontier) item("line", "Most cases passed for its memory");
     return list;
   }
-  function point(r, x, best, number) {
+  function point(r, x, best, number, nudge) {
+    const lead = anchors.has(r), alone = families.get(family(r)).members.length === 1;
     const point = node("button", "scatter-point" + (r.harness.name === "claude_code" ? " diamond" : "") + (r.complete ? "" : " provisional") +
-      (best ? " best" : "") + (selected === r.series_id ? " selected" : ""));
+      (best ? " best" : "") + (lead ? " anchor" : "") + (faded(r) ? " faded" : "") + (selected === r.series_id ? " selected" : ""));
     point.id = `point-${r.series_id}`;
     point.dataset.number = number;
     point.style.left = `${x * 100}%`;
     point.style.bottom = `${r.score_percent}%`;
+    point.style.setProperty("--dot", families.get(family(r)).color);
+    if (nudge) point.style.setProperty("--nudge", `${nudge}px`);
     point.setAttribute("aria-label", `${chartName(r)}, ${harness(r)}, ${casesText(r)} (${scoreText(r)}), ${memoryText(r)}, ${runsText(r)}. Show details`);
     point.setAttribute("aria-expanded", String(selected === r.series_id));
     if (selected === r.series_id) point.setAttribute("aria-controls", "run-detail");
@@ -218,12 +273,16 @@
       bar.style.height = `${high - low}cqh`;
       point.append(bar);
     }
+    // A family's best series names the family; its other quants name only their quantization and thinking.
     const label = node("span", "point-label");
-    label.append(node("span", "model-name", chartName(r)));
+    if (alone) label.append(node("span", "model-name", chartName(r)));
+    else if (lead) label.append(node("span", "model-name", family(r)), node("span", "point-meta", memberName(r)));
+    else label.append(node("span", "member-name", memberName(r)));
     if (records.filter(other => chartName(other) === chartName(r)).length > 1) {
       label.append(node("span", "point-meta", `${harness(r)} · Series ${r.series_id.slice(0, 8)}`));
     }
-    point.append(node("span", "result-dot"), label, node("span", "point-number", number));
+    label.append(node("span", "label-number", number));
+    point.append(node("span", "result-dot"), label);
     point.addEventListener("click", () => {
       selected = selected === r.series_id ? null : r.series_id;
       render();
@@ -247,17 +306,34 @@
     box.style.left = `${left}px`;
     box.style.top = `${above >= 0 ? above : at.bottom - figure.top + 8}px`;
   }
+  const columns = [
+    ["model", "Model", r => chartName(r), r => chartName(r)],
+    ["family", "Family", r => family(r), r => family(r)],
+    ["harness", "Harness", r => harness(r), r => harness(r)],
+    ["cases", "Cases passed", r => r.score_percent, r => `${casesText(r)} (${scoreText(r)})`],
+    ["memory", "Peak VRAM + RAM", r => required(r) ?? Infinity, r => required(r) != null ? gb(required(r)) : hosted(r) ? "API" : "Not measured"],
+    ["runs", "Runs", r => r.run_count, r => runsText(r)],
+  ];
   function table(shown) {
     const view = node("details", "table-view");
+    view.open = tableOpen;
+    view.addEventListener("toggle", () => { tableOpen = view.open; });
     view.append(node("summary", "", "Table view"));
-    const grid = node("table", "case-table"), head = node("thead"), row = node("tr");
-    for (const title of ["Model", "Harness", "Cases passed", "Peak VRAM + RAM", "Runs"]) row.append(node("th", "", title));
+    const grid = node("table", "case-table sortable"), head = node("thead"), row = node("tr");
+    for (const [key, title] of columns) {
+      const th = node("th");
+      th.setAttribute("aria-sort", sortBy === key ? (sortDown ? "descending" : "ascending") : "none");
+      const button = node("button", "sort", title + (sortBy === key ? (sortDown ? " ↓" : " ↑") : ""));
+      button.addEventListener("click", () => { sortDown = sortBy === key ? !sortDown : key === "cases"; sortBy = key; render(); });
+      th.append(button); row.append(th);
+    }
     head.append(row); grid.append(head);
+    const [, , value] = columns.find(([key]) => key === sortBy);
+    const order = (a, b) => (value(a) < value(b) ? -1 : value(a) > value(b) ? 1 : 0) * (sortDown ? -1 : 1);
     const body = node("tbody");
-    for (const r of shown) {
-      const line = node("tr");
-      line.append(node("td", "case-id", chartName(r)), node("td", "", harness(r)), node("td", "numeric", `${casesText(r)} (${scoreText(r)})`),
-        node("td", "numeric", required(r) != null ? gb(required(r)) : hosted(r) ? "API" : "Not measured"), node("td", "", runsText(r)));
+    for (const r of [...shown].sort(order)) {
+      const line = node("tr", faded(r) ? "faded" : "");
+      for (const [key, , , text] of columns) line.append(node("td", ["model", "family"].includes(key) ? "case-id" : "numeric", text(r)));
       body.append(line);
     }
     grid.append(body); view.append(grid);
@@ -267,7 +343,7 @@
     const figure = node("div", "scatter");
     const measured = shown.filter(r => required(r) != null), other = shown.filter(r => required(r) == null);
     const best = frontier(measured);
-    figure.append(legend(shown, best.length > 1), node("div", "y-caption", "Cases passed (mean of runs)"));
+    figure.append(chips(), legend(shown, best.length > 1), node("div", "y-caption", "Cases passed (mean of runs)"));
     const body = node("div", "scatter-body");
     const area = node("div", "scatter-plot");
     for (const value of ticks(data.benchmark.case_count)) {
@@ -282,16 +358,25 @@
       line.append(node("span", "x-tick" + (size === memoryMax ? " end" : ""), size ? `${size} GB` : "0"));
       area.append(line);
     }
-    if (best.length > 1) area.append(frontierLine(best));
+    area.append(lines(measured, best));
     // Numbers follow the score order, so the key below reads from the top of the chart down.
     const number = r => shown.indexOf(r) + 1;
-    for (const r of measured) area.append(point(r, required(r) / 1e9 / memoryMax, best.includes(r), number(r)));
+    // Series at the same score and nearly the same memory are spread sideways so none hides another.
+    const spots = new Map();
+    for (const r of measured) {
+      const spot = `${Math.round(xOf(r))}:${r.score_percent}`;
+      spots.set(spot, [...(spots.get(spot) || []), r]);
+    }
+    for (const r of measured) {
+      const twins = spots.get(`${Math.round(xOf(r))}:${r.score_percent}`);
+      area.append(point(r, required(r) / 1e9 / memoryMax, best.includes(r), number(r), (twins.indexOf(r) - (twins.length - 1) / 2) * 9));
+    }
     body.append(area);
     if (other.length) {
       const strip = node("div", "api-strip");
       strip.append(node("span", "strip-title", other.every(hosted) ? "API" : "API or not measured"));
       // Spread across the strip: API models have no memory to place them by.
-      other.forEach((r, i) => strip.append(point(r, (i + 1) / (other.length + 1), false, number(r))));
+      other.forEach((r, i) => strip.append(point(r, (i + 1) / (other.length + 1), false, number(r), 0)));
       body.append(strip);
     }
     const tipBox = node("div", "chart-tip");
@@ -301,33 +386,44 @@
     return figure;
   }
   const overlaps = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
-  // Names go right, left, above or below their dot, whichever is free and inside the chart; frontier and
-  // selected models are named first. A dot whose name has no room shows a number, named in the key below.
+  // Names go right, left, above or below their dot, whichever is free and inside the chart. The selected series and
+  // each family's best are placed first, then the frontier, then the other quants. A family name with no room is
+  // shown as its number, named in the key below; another quant with no room is left to the tooltip and the table.
+  // Faded families give up their room.
   function placeLabels() {
     const numbered = [];
     for (const zone of document.querySelectorAll(".scatter-plot, .api-strip")) {
       const bounds = (zone.classList.contains("api-strip") ? zone.parentElement : zone).getBoundingClientRect();
       const points = [...zone.querySelectorAll(".scatter-point")];
-      const rank = p => (p.classList.contains("selected") ? 2 : 0) + (p.classList.contains("best") ? 1 : 0);
+      const rank = p => (p.classList.contains("faded") ? -9 : 0) + (p.classList.contains("selected") ? 4 : 0) +
+        (p.classList.contains("anchor") ? 2 : 0) + (p.classList.contains("best") ? 1 : 0);
       points.sort((a, b) => rank(b) - rank(a));
-      const taken = points.map(p => p.querySelector(".result-dot").getBoundingClientRect());
-      for (const p of points) {
-        const label = p.querySelector(".point-label");
-        let placed = false;
+      const taken = points.filter(p => !p.classList.contains("faded")).map(p => p.querySelector(".result-dot").getBoundingClientRect());
+      const fit = (label, form) => {
         for (const side of ["right", "left", "above", "below"]) {
-          label.className = `point-label place-${side}`;
+          label.className = `point-label${form} place-${side}`;
           const box = label.getBoundingClientRect();
           const inside = box.left >= bounds.left && box.right <= bounds.right && box.top >= bounds.top - 12 && box.bottom <= bounds.bottom + 12;
-          if (inside && !taken.some(t => overlaps(t, box))) { taken.push(box); placed = true; break; }
+          if (inside && !taken.some(t => overlaps(t, box))) { taken.push(box); return true; }
         }
-        p.classList.toggle("numbered", !placed);
-        if (!placed) { label.className = "point-label unplaced"; numbered.push(p); }
+        return false;
+      };
+      for (const p of points) {
+        const label = p.querySelector(".point-label");
+        if (p.classList.contains("faded")) { label.className = "point-label unplaced"; continue; }
+        if (fit(label, "")) continue;
+        // A family keeps its number even where it overlaps: it is the family's only name on the chart.
+        if (p.classList.contains("anchor")) {
+          if (!fit(label, " as-number")) label.className = "point-label as-number place-right";
+          numbered.push(p);
+        } else label.className = "point-label unplaced";
       }
     }
     const key = document.querySelector(".point-key");
     if (!key) return;
     key.replaceChildren(...numbered.sort((a, b) => a.dataset.number - b.dataset.number).map(p => {
-      const item = node("li", "", p.querySelector(".model-name").textContent);
+      const names = [...p.querySelector(".point-label").children].filter(e => !e.classList.contains("label-number"));
+      const item = node("li", "", names.map(e => e.textContent).join(" · "));
       item.value = Number(p.dataset.number);
       return item;
     }));
@@ -339,7 +435,8 @@
     placeLabels();
     const active = shown.find(r => r.series_id === selected);
     if (active) $("chart").append(details(active)); else selected = null;
-    $("result-status").textContent = `${records.length} run series`;
+    $("result-status").textContent = `${records.length} run series in ${families.size} families` +
+      (chosen.size ? ` · showing ${[...chosen].join(", ")}` : "");
   }
   window.addEventListener("resize", placeLabels);
   render();
