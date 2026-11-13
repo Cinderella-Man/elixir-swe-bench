@@ -306,6 +306,118 @@ defmodule Eab.RunsTest do
     await_cleanup()
   end
 
+  test "a case of a published series runs again without the run in this history" do
+    parent = self()
+    Runs.subscribe()
+    page = Path.join(System.tmp_dir!(), "eab-rerun-page-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(page)
+
+    for file <- ~w(index.html styles.css app.js),
+        do: File.cp!(Path.join(Eab.Results.root(), file), Path.join(page, file))
+
+    previous = Application.get_env(:eab, :results_page_root)
+    Application.put_env(:eab, :results_page_root, page)
+
+    on_exit(fn ->
+      if previous,
+        do: Application.put_env(:eab, :results_page_root, previous),
+        else: Application.delete_env(:eab, :results_page_root)
+
+      File.rm_rf!(page)
+    end)
+
+    model = %{
+      "model" => "alias",
+      "backend" => "llama_cpp",
+      "url" => "http://model-host:8080",
+      "context" => 262_144,
+      "profile" => %{
+        "model_path" => "/srv/Swift-27B-Q4_K_M.gguf",
+        "build_info" => "b1",
+        "total_slots" => 1,
+        "chat_template" => "{{ messages }}",
+        "default_generation_settings" => %{
+          "n_ctx" => 262_144,
+          "params" => %{"temperature" => 0.6, "seed" => 4_294_967_295}
+        }
+      }
+    }
+
+    inventory = Eab.Inventory.definition()
+    [cut | _] = cases = inventory["cases"]
+    settings = model |> Eab.Model.settings(%{"seed" => 101}) |> Map.put("response_tokens", 8192)
+
+    published = %{
+      "id" => "published-elsewhere",
+      "created_at" => "2026-11-11T23:27:01Z",
+      "status" => "completed",
+      "release_id" => String.duplicate("a", 64),
+      "model" => model,
+      "cases" => cases,
+      "protocol" => %{
+        "inventory" => inventory,
+        "agent" => Eab.Pi.identity(),
+        "implementation" => String.duplicate("b", 64),
+        "fixtures" => Map.new(cases, &{&1, Eab.Results.fixture_hashes(&1)})
+      },
+      "settings" => settings,
+      "attempts" =>
+        Map.new(cases, fn id ->
+          {id,
+           %{
+             "status" => "completed",
+             "grade" => %{"passed" => id != cut},
+             "stop_reason" => if(id == cut, do: "response_budget", else: "agent_completed")
+           }}
+        end)
+    }
+
+    assert Eab.Results.publish!(published, page_root: page) == :added
+    series = Eab.Series.id(published)
+    assert is_nil(Store.run("published-elsewhere"))
+
+    Application.put_env(:eab, :runner, fn run, _, _ ->
+      send(parent, {:rerun, run})
+
+      receive do
+        :finish -> :ok
+      end
+    end)
+
+    source = {:series, series, "published-elsewhere"}
+
+    assert {:error, message} = Runs.rerun_case({:series, series, "other"}, cut, model, "")
+    assert message =~ "is not in series"
+
+    other = put_in(model, ["profile", "chat_template"], "{{ other }}")
+    assert {:error, message} = Runs.rerun_case(source, cut, other, "")
+    assert message =~ "connected model differs"
+
+    # Another server build may serve the same model, as within a series.
+    connected = put_in(model, ["profile", "build_info"], "b2")
+    assert {:ok, id} = Runs.rerun_case(source, cut, connected, "")
+    assert_receive {:rerun, run}, 3000
+    assert run["id"] == id and run["cases"] == [cut]
+    assert run["settings"]["seed"] == 101 and is_nil(run["settings"]["response_tokens"])
+
+    assert run["selection"] == %{
+             "kind" => "case_rerun",
+             "source_series" => series,
+             "source_run" => "published-elsewhere",
+             "source_release" => String.duplicate("a", 64),
+             "cases" => [cut]
+           }
+
+    assert :ok = Eab.Checkpoints.validate_run!(run, connected, run["settings"])
+    Eab.Report.write(run)
+
+    assert File.read!(Store.path("runs/#{id}/report.md")) =~
+             "from published run published-elsewhere"
+
+    Runs.stop()
+    await_cleanup()
+  end
+
   test "explicit repeats run only selected completed cases from scratch and retain every prior outcome" do
     parent = self()
     Runs.subscribe()

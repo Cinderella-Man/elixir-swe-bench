@@ -99,6 +99,18 @@ defmodule Eab.Report do
     do: "Selected-case repeat of " <> id
 
   defp scope(%{
+         "selection" => %{
+           "kind" => "case_rerun",
+           "source_series" => series,
+           "source_run" => id,
+           "cases" => [case_id]
+         }
+       }),
+       do:
+         "Rerun of #{case_id} from published run #{id} (series #{String.slice(series, 0, 12)}), " <>
+           "without a per-reply cap"
+
+  defp scope(%{
          "selection" => %{"kind" => "case_rerun", "source_run" => id, "cases" => [case_id]}
        }),
        do: "Rerun of #{case_id} from #{id}, without a per-reply cap"

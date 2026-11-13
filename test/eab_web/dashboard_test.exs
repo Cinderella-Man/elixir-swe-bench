@@ -416,6 +416,30 @@ defmodule EabWeb.DashboardTest do
     assert has_element?(view, "#case-rerun [role=alert]", "Connect the model this run used")
   end
 
+  test "a published series offers its cut-off cases to run again first" do
+    run = publication_run()
+    [first, cut | _] = run["cases"]
+    run = put_in(run, ["attempts", cut, "stop_reason"], "response_budget")
+    page = publication_page(run)
+    assert Eab.Results.publish!(run, page_root: page) == :added
+    series = Eab.Series.id(run)
+    {:ok, view, _} = live(build_conn(), "/")
+    view |> element("button[phx-click='series']") |> render_click()
+    assert has_element?(view, "#series-#{series} option:first-child", "#{cut} · run")
+    assert has_element?(view, "#series-#{series} option", "#{first} · run")
+    assert has_element?(view, "#series-#{series} option:first-child", "reply cut off")
+
+    view
+    |> form("#series-#{series} form", %{"pick" => "#{run["id"]}/#{cut}"})
+    |> render_submit()
+
+    assert has_element?(
+             view,
+             "#series-#{series} [role=alert]",
+             "Connect the model this series used"
+           )
+  end
+
   test "concurrent case stages and selected background messages remain visible" do
     id = "concurrent-progress-test"
     [a, b, c | _] = Eab.Inventory.all()

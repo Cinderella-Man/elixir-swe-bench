@@ -38,13 +38,14 @@ defmodule Eab.Runs do
     do: GenServer.call(__MODULE__, {:partial, id, {:selected, cases}, key}, 30_000)
 
   @doc """
-  Runs one case of a stopped run again, from scratch, on the connected endpoint. The model,
-  harness and settings must match that run's, except that the new attempt has no per-reply
-  cap (ADR 0015). The result is a separate, unpublishable partial run, so its outcome can be
-  compared with or merged into the original by hand.
+  Runs one case again, from scratch, on the connected endpoint. The source is a stopped run
+  in this installation's history, or `{:series, series_id, run_id}`: a run of a published
+  series, which any checkout has. The model, harness, case files and settings must match the
+  source's, and its seed is reused, but the new attempt has no per-reply cap (ADR 0015). The
+  result is a separate, unpublishable partial run, so its outcome is merged by hand.
   """
-  def rerun_case(id, case_id, endpoint, key),
-    do: GenServer.call(__MODULE__, {:rerun_case, id, case_id, endpoint, key}, 30_000)
+  def rerun_case(source, case_id, endpoint, key),
+    do: GenServer.call(__MODULE__, {:rerun_case, source, case_id, endpoint, key}, 30_000)
 
   def stop, do: GenServer.call(__MODULE__, :stop, 10_000)
   def retry_cleanup, do: GenServer.call(__MODULE__, :retry_cleanup)
@@ -270,49 +271,34 @@ defmodule Eab.Runs do
              not is_nil(state.cleanup_error),
       do: {:reply, {:error, "Wait for the active run and container cleanup to finish"}, state}
 
-  def handle_call({:rerun_case, id, case_id, endpoint, key}, _from, state) do
-    source = Store.run(id) || raise "Run not found"
-
-    unless source["status"] in ~w(completed error interrupted cancelled) and
-             source["cleanup_pending"] == false,
-           do: raise("The source run must be stopped and cleaned up")
-
-    unless case_id in (source["cases"] || []), do: raise("Choose a case from that run")
+  def handle_call({:rerun_case, source, case_id, endpoint, key}, _from, state) do
+    origin = rerun_origin(source, case_id)
     release = Release.freeze()
 
-    unless source["protocol"]["agent"] == release["protocol"]["agent"] and
-             get_in(source, ["protocol", "fixtures", case_id]) ==
-               release["protocol"]["fixtures"][case_id],
-           do:
-             raise(
-               "#{case_id} or the agent changed since that run; it cannot be run again for it"
-             )
+    unless origin.benchmark == release["protocol"]["inventory"]["id"],
+      do: raise("That run belongs to another benchmark")
+
+    unless origin.fixtures == release["protocol"]["fixtures"][case_id],
+      do: raise("#{case_id} changed since that run; it cannot be run again for it")
 
     # New attempts never cap a reply (ADR 0015); everything else matches the source run.
-    settings = Model.settings(endpoint, Map.delete(source["settings"], "response_tokens"))
+    settings = Model.settings(endpoint, Map.delete(origin.settings, "response_tokens"))
 
     unless Map.delete(settings, "response_tokens") ==
-             Map.delete(source["settings"], "response_tokens"),
+             Map.delete(origin.settings, "response_tokens"),
            do: raise("This endpoint's settings differ from that run's; connect the same model")
 
     run = new_run(release, endpoint, settings)
-    same_model!(run, source)
-
-    selection = %{
-      "kind" => "case_rerun",
-      "source_run" => id,
-      "source_release" => source["release_id"],
-      "source_run_hash" => Inventory.hash_file(Store.path("runs/#{id}/run.json")),
-      "cases" => [case_id]
-    }
+    same_model!(run, origin.setup)
+    selection = Map.merge(origin.selection, %{"kind" => "case_rerun", "cases" => [case_id]})
 
     run =
       Map.merge(run, %{
         "cases" => [case_id],
         "selection" => selection,
-        "validation" => source["validation"] == true,
+        "validation" => origin.validation,
         "parallel_attempts" => 1,
-        "message" => "Running #{case_id} again from run #{id}",
+        "message" => "Running #{case_id} again from run #{selection["source_run"]}",
         "experiment_id" => Release.experiment(release["id"], endpoint, settings, selection)
       })
 
@@ -555,20 +541,65 @@ defmodule Eab.Runs do
     {"case_repeat", Enum.filter(source["cases"], &(&1 in cases))}
   end
 
-  # A case run again must use the model the source run used. Server build, slots and hardware
+  # What a case run again must match, from a run in this history or a published series run.
+  defp rerun_origin({:series, series_id, run_id}, case_id) do
+    record = Eab.Results.series!(series_id)
+
+    run =
+      Enum.find(record["runs"], &(&1["run_id"] == run_id)) ||
+        raise "Run #{run_id} is not in series #{String.slice(series_id, 0, 12)}"
+
+    unless Enum.any?(run["cases"], &(&1["id"] == case_id)),
+      do: raise("Choose a case from that run")
+
+    %{
+      benchmark: record["benchmark"],
+      fixtures: record["case_fixtures"][case_id],
+      settings: Map.put(record["settings"], "seed", run["seed"]),
+      setup: record["setup"],
+      validation: false,
+      selection: %{
+        "source_series" => series_id,
+        "source_run" => run_id,
+        "source_release" => run["source_release_id"]
+      }
+    }
+  end
+
+  defp rerun_origin(id, case_id) do
+    source = Store.run(id) || raise "Run not found"
+
+    unless source["status"] in ~w(completed error interrupted cancelled) and
+             source["cleanup_pending"] == false,
+           do: raise("The source run must be stopped and cleaned up")
+
+    unless case_id in (source["cases"] || []), do: raise("Choose a case from that run")
+
+    %{
+      benchmark: get_in(source, ["protocol", "inventory", "id"]),
+      fixtures: get_in(source, ["protocol", "fixtures", case_id]),
+      settings: source["settings"],
+      setup: Eab.Series.setup(source),
+      validation: source["validation"] == true,
+      selection: %{
+        "source_run" => id,
+        "source_release" => source["release_id"],
+        "source_run_hash" => Inventory.hash_file(Store.path("runs/#{id}/run.json"))
+      }
+    }
+  end
+
+  # A case run again must use the source's model and harness. Server build, slots and hardware
   # may differ, as within a run series (ADR 0011); the maker is read from the files only later.
-  defp same_model!(run, source) do
+  defp same_model!(run, expected) do
     fields = ~w(harness server_type model chat_template_sha256 sampling_defaults)
 
-    setup = fn run ->
-      run
-      |> Eab.Series.setup()
-      |> Map.take(fields)
-      |> update_in(["model"], &Map.delete(&1, "quantized_by"))
+    comparable = fn setup ->
+      setup |> Map.take(fields) |> update_in(["model"], &Map.delete(&1 || %{}, "quantized_by"))
     end
 
-    expected = setup.(source)
-    actual = setup.(run)
+    expected = comparable.(expected)
+    actual = comparable.(Eab.Series.setup(run))
     differences = for field <- fields, expected[field] != actual[field], do: field
 
     if differences != [],

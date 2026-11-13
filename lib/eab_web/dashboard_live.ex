@@ -520,6 +520,29 @@ defmodule EabWeb.DashboardLive do
     end
   end
 
+  def handle_event("rerun_published", %{"series" => id}, %{assigns: %{endpoint: nil}} = socket),
+    do:
+      {:noreply,
+       assign(socket,
+         rerun_error: {id, "Connect the model this series used before running a case again."}
+       )}
+
+  def handle_event("rerun_published", %{"series" => id, "pick" => pick}, socket) do
+    assigns = socket.assigns
+    [run_id, case_id] = String.split(pick, "/", parts: 2)
+
+    case Runs.rerun_case({:series, id, run_id}, case_id, assigns.endpoint, assigns.key) do
+      {:ok, run} ->
+        {:noreply,
+         refresh(
+           assign(socket, selected: run, selected_case: nil, case_offset: 0, rerun_error: nil)
+         )}
+
+      {:error, message} ->
+        {:noreply, assign(socket, rerun_error: {id, message})}
+    end
+  end
+
   def handle_event("history_page", %{"direction" => direction}, socket) do
     offset = max(socket.assigns.history_offset + if(direction == "next", do: 20, else: -20), 0)
     {:noreply, refresh(assign(socket, history_offset: offset))}
@@ -700,6 +723,28 @@ defmodule EabWeb.DashboardLive do
 
   defp preparing?(snapshot), do: (snapshot.preparation || %{})["status"] == "running"
   defp busy?(snapshot), do: not is_nil(snapshot.active) or preparing?(snapshot)
+
+  defp rerun_error_for({key, message}, key), do: message
+  defp rerun_error_for(_, _), do: nil
+
+  # Every case of every published run of a series, as "run_id/case_id": replies cut at the old
+  # per-reply cap first (ADR 0015), then other cutoffs, then the rest.
+  defp rerun_choices(series) do
+    cutoffs = %{
+      "response_budget" => "reply cut off",
+      "generation_budget" => "generation budget used up",
+      "context_budget" => "context full"
+    }
+
+    for run <- series["runs"], c <- run["cases"] do
+      outcome = cutoffs[c["cutoff"]] || if(c["passed"], do: "passed", else: "failed")
+      seed = if run["seed"], do: "seed #{run["seed"]}", else: "run #{run["run_id"]}"
+      rank = %{"response_budget" => 0, nil => 2}[c["cutoff"]] || 1
+      {rank, {"#{run["run_id"]}/#{c["id"]}", "#{c["id"]} · #{seed} · #{outcome}"}}
+    end
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.map(&elem(&1, 1))
+  end
 
   # Each model source keeps its own unsaved settings while the user switches between them.
   defp switch_provider(%{assigns: %{provider: provider}} = socket, provider), do: socket
@@ -2184,11 +2229,15 @@ defmodule EabWeb.DashboardLive do
           </tbody>
         </table>
         <p :if={@series == []} class="muted">No local runs with final scores yet.</p>
-        <div :for={series <- Enum.reject(@published_series, & &1["complete"])} class="model-card">
+        <div
+          :for={series <- @published_series}
+          id={"series-#{series["series_id"]}"}
+          class="model-card"
+        >
           <h3>
-            Provisional: {series["model"]["name"]} · {series["harness"]["name"]} · {series[
-              "run_count"
-            ]}/{series["required_runs"]} runs
+            {if series["complete"], do: "Complete", else: "Provisional"}: {series["model"]["name"]} · {series[
+              "harness"
+            ]["name"]} · {series["run_count"]}/{series["required_runs"]} runs
           </h3>
           <p :if={series["missing_seeds"] != []}>
             Missing seeds: {Enum.join(series["missing_seeds"], ", ")}
@@ -2197,17 +2246,37 @@ defmodule EabWeb.DashboardLive do
             <summary>Required setup</summary>
             <pre>{Jason.encode!(series["setup"], pretty: true)}</pre>
           </details>
-          <p :if={Series.closed_reason(series)} class="muted">
+          <p :if={not series["complete"] and Series.closed_reason(series)} class="muted">
             Takes no more runs. {Series.closed_reason(series)}
           </p>
           <button
-            :if={is_nil(Series.closed_reason(series))}
+            :if={not series["complete"] and is_nil(Series.closed_reason(series))}
             class="secondary"
             phx-click="contribute"
             phx-value-id={series["series_id"]}
           >
             Contribute a run
           </button>
+          <form phx-submit="rerun_published" class="series-rerun">
+            <input type="hidden" name="series" value={series["series_id"]} />
+            <label for={"rerun-pick-#{series["series_id"]}"}>Run one of its cases again</label>
+            <select id={"rerun-pick-#{series["series_id"]}"} name="pick">
+              <option :for={{value, label} <- rerun_choices(series)} value={value}>{label}</option>
+            </select>
+            <button type="submit" class="secondary" disabled={busy?(@snapshot)}>
+              Run this case again
+            </button>
+            <p class="fine-print">
+              A one-case run on the connected model with this series' settings and that run's seed, but no per-reply cap (ADR 0015). Cut-off cases are listed first. It is never published; merge its result by hand.
+            </p>
+            <p
+              :if={rerun_error_for(@rerun_error, series["series_id"])}
+              class="notice error"
+              role="alert"
+            >
+              {rerun_error_for(@rerun_error, series["series_id"])}
+            </p>
+          </form>
         </div>
       </details>
       <details
