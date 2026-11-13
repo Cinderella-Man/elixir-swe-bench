@@ -147,6 +147,9 @@ defmodule Eab.ClaudeCodeTest do
     assert settings["env"]["CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK"] == "1"
     assert settings["disableClaudeAiConnectors"] == true
     assert settings["enabledMcpjsonServers"] == ["eab_workspace"]
+    # Claude Code's built-in chart plugin serves its tool as an MCP server named easel, whose
+    # instructions would otherwise reach every solver.
+    assert %{"serverName" => "easel"} in settings["deniedMcpServers"]
     assert settings["env"]["CLAUDE_CODE_FORK_SUBAGENT"] == "0"
     refute Enum.any?(Map.values(kit), &String.contains?(&1, "__EAB_CONTROLLER_URL__"))
     assert Map.has_key?(kit, ".claude/commands/solve-run.md")
