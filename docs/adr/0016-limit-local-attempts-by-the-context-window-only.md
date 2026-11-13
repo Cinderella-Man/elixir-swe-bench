@@ -21,7 +21,7 @@ A local attempt therefore has no generation budget. It ends when the agent finis
 ## Consequences
 
 - **Series.** The generation budget is a run setting, so local runs made with it and without it belong to different series ([ADR 0011](0011-publish-three-run-series.md)). Local series made with a budget take no more runs. Every one of them already had the reply cap, so ADR 0015 had closed them.
-- **Release.** This change ships with the case corrections of 2026-11-13 as benchmark `elixir-agent-benchmark-v6`. The v5 series are kept under `results-page/archive/v5/` and leave the results page.
+- **Release.** This change ships with the case corrections of 2026-11-13 as benchmark `elixir-agent-benchmark-v6`. The v5 series move to `results-page/releases/v5/`, where they stay on the results page as an earlier release, and as its primary one until v6 has enough series to take over.
 - **Older runs.** A run made with a budget keeps it when it is resumed, and keeps its old instruction sentence.
 - **Long attempts.** Nothing bounds an attempt's generated tokens or duration except the context window. History is never compacted, so every call adds to the prompt and an attempt always ends, but a model that loops through small tool calls can run for hours. **Stop run** remains the remedy.
 - **Chat templates that drop earlier reasoning.** Their prompts grow more slowly than their output, so such a model may generate more than the window holds before the conversation fills it. That is allowed: the window bounds the conversation, not the output.

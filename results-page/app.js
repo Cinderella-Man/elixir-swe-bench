@@ -9,11 +9,29 @@
     if (text !== undefined) e.textContent = text;
     return e;
   };
-  if (!data || data.schema_version !== 7) {
+  if (!data || data.schema_version !== 7 || !Array.isArray(data.releases) || data.releases.length === 0) {
     $("chart").append(node("p", "empty", "Results could not be loaded. Please reload."));
     return;
   }
-  const records = data.results;
+  // One benchmark release is shown at a time: the primary one, or the one named in ?release=.
+  const wanted = new URLSearchParams(location.search).get("release");
+  const primary = data.releases.find(r => r.benchmark.id === data.primary) || data.releases.at(-1);
+  const release = data.releases.find(r => wanted && (r.label === wanted || r.benchmark.id === wanted)) || primary;
+  if (data.releases.length > 1) {
+    const bar = $("releases");
+    bar.append(node("span", "release-title", "Release"));
+    for (const r of data.releases) {
+      const link = node("a", "chip" + (r === release ? " on" : ""), r.label);
+      link.href = r === primary ? location.pathname : `?release=${encodeURIComponent(r.label)}`;
+      if (r === release) link.setAttribute("aria-current", "page");
+      const role = r === primary ? "main results" : r.current ? "new runs" : "earlier";
+      link.append(node("span", "chip-count", role));
+      link.title = `${r.benchmark.id}: ${r.results.length} run series`;
+      bar.append(link);
+    }
+    if (release.note) bar.append(node("span", "release-note", release.note));
+  }
+  const records = release.results;
   if (records.length === 0) {
     document.querySelector("footer").remove();
     $("chart").append(node("p", "empty", "No benchmark results yet."));
@@ -410,9 +428,9 @@
     figure.append(chips(), legend(shown, best.length > 1), node("div", "y-caption", "Cases passed (mean of runs)"));
     const body = node("div", "scatter-body");
     const area = node("div", "scatter-plot");
-    for (const value of ticks(data.benchmark.case_count)) {
+    for (const value of ticks(release.benchmark.case_count)) {
       const line = node("div", "grid-row");
-      line.style.bottom = `${value / data.benchmark.case_count * 100}%`;
+      line.style.bottom = `${value / release.benchmark.case_count * 100}%`;
       line.append(node("span", "y-tick", value));
       area.append(line);
     }

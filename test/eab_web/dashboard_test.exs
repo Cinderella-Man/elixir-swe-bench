@@ -296,7 +296,8 @@ defmodule EabWeb.DashboardTest do
 
     [public] = Eab.Results.load!(Path.join(page, "results"))
     assert public == Eab.Results.export!(run, inventory: run["protocol"]["inventory"])
-    [built] = Eab.Results.read!(Path.join(page, "dist/results.json"))["results"]
+    current = fn payload -> Enum.find(payload["releases"], & &1["current"])["results"] end
+    [built] = current.(Eab.Results.read!(Path.join(page, "dist/results.json")))
     assert built["score_percent"] == 100.0 and built["run_count"] == 1
     assert built["total"] == length(run["cases"])
     assert Enum.map(hd(built["runs"])["cases"], & &1["id"]) == run["cases"]
@@ -313,7 +314,7 @@ defmodule EabWeb.DashboardTest do
     assert redirected_to(get(build_conn(), "/results")) == "/results/"
     assert html_response(get(build_conn(), "/results/"), 200) =~ "Elixir SWE Bench"
     response = get(build_conn(), "/results/results.json")
-    assert json_response(response, 200)["results"] == [built]
+    assert current.(json_response(response, 200)) == [built]
 
     for script <- ~w(app.js results.js) do
       conn = build_conn() |> Plug.Conn.put_private(:plug_skip_csrf_protection, false)

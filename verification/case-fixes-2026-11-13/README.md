@@ -45,5 +45,5 @@ The [curation workflow](../../docs/case-curation-loop.md) asks for two reviewed 
 
 - **Release:** benchmark `elixir-agent-benchmark-v6`, twenty cases. The controller's inventory matches the checkout and every admission verifies. The eighteen cases this batch did not touch are byte-identical to before.
 - **Whole inventory under the new grader:** after the restore, the controller prepared and qualified all twenty cases under grader `cfb152063f1a…`. In each, the reference passes and the unchanged source, the partial fix and the bypass are rejected.
-- **Published results:** the twelve v5 series moved to `results-page/archive/v5/`.
+- **Published results:** the twelve v5 series moved to `results-page/releases/v5/` and stay the results page's primary release; new runs are published to v6 in `results-page/results/`.
 - **Forks:** unchanged. No source, reference or preparation changed.

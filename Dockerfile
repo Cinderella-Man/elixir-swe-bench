@@ -30,6 +30,7 @@ ENV LANG=C.UTF-8 EAB_ROOT=/app EAB_DATA_DIR=/data ERL_FLAGS="+S 2:2"
 WORKDIR /app
 COPY --from=build /app/.local/docker-build/prod/rel/eab ./
 COPY cases cases
+COPY docs/cases docs/cases
 COPY config/benchmark.json config/benchmark.json
 COPY lib lib
 COPY mix.lock mix.lock

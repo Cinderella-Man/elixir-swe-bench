@@ -275,7 +275,7 @@ On 2026-11-13, before running about fifty more models, the user asked for an aud
 - **Edit paths:** a submission that touched a path outside the case's edit area was rejected whole, which cost Sonnet 5.5 guardian-pr-748 in both its runs for a README edit. Such changes are now discarded and the rest is graded ([ADR 0017](adr/0017-discard-changes-outside-the-edit-area.md)).
 - **Cases:** livebook-pr-2800 and ash-pr-3031 had required checks whose trigger the solver's text never named. Their texts now state it; see the [case-fix record](../verification/case-fixes-2026-11-13/README.md).
 
-The changed cases and limits make benchmark `elixir-agent-benchmark-v6`. The twelve v5 series moved to `results-page/archive/v5/`.
+The changed cases and limits make benchmark `elixir-agent-benchmark-v6`. The user asked to keep v5 as the page's primary results for the time being and to collect new runs in v6. The results page therefore holds releases side by side: the twelve v5 series moved to `results-page/releases/v5/` and are kept as published, `results-page/results/` takes the v6 series, and `results-page/releases.json` names v5 as the release the page opens on. A switch under the title shows the other release; the two never share a chart.
 
 ## Selecting future new cases — 2026-10-18
 

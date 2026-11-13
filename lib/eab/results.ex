@@ -2,6 +2,8 @@ defmodule Eab.Results do
   @moduledoc """
   Exports completed runs into public run series (ADR 0011) through a strict schema and
   builds the static results page. One public file holds one series of up to three runs.
+  `results/` holds the current benchmark release's series; `releases/<name>/` holds an
+  earlier release's, kept as published. `releases.json` says which release the page shows first.
   """
   alias Eab.{ModelIdentity, Results.Schema, Series}
 
@@ -303,6 +305,55 @@ defmodule Eab.Results do
     records
   end
 
+  @doc """
+  Earlier benchmark releases whose series stay on the page as they were published. Each
+  folder under `releases/` holds one release's series files. Their cases have changed
+  since, so they are checked against each other, never against the current cases, and
+  they take no more runs.
+  """
+  def frozen!(page \\ root()) do
+    Path.wildcard(Path.join([page, "releases", "*"]))
+    |> Enum.filter(&File.dir?/1)
+    |> Enum.sort()
+    |> Enum.map(fn directory ->
+      name = Path.basename(directory)
+      records = load!(directory)
+      require!(records != [], "releases/#{name}: an earlier release needs at least one series")
+      [first | _] = records
+      cases = Enum.map(hd(first["runs"])["cases"], & &1["id"])
+
+      require!(
+        Enum.all?(records, fn record ->
+          record["benchmark"] == first["benchmark"] and
+            Enum.map(hd(record["runs"])["cases"], & &1["id"]) == cases and
+            record["case_fixtures"] == first["case_fixtures"]
+        end),
+        "releases/#{name}: the series of one release must share its benchmark, cases and case files"
+      )
+
+      %{"id" => first["benchmark"], "case_count" => length(cases), "records" => records}
+    end)
+  end
+
+  @doc """
+  The page's own settings, from `releases.json`: which release it shows first (`primary`,
+  a benchmark ID) and a note per release. Without the file the current release is primary.
+  """
+  def page_settings(page \\ root()) do
+    path = Path.join(page, "releases.json")
+    settings = if File.regular?(path), do: read!(path), else: %{}
+
+    require!(
+      is_map(settings) and Map.keys(settings) -- ~w(primary notes) == [] and
+        (is_nil(settings["primary"]) or is_binary(settings["primary"])) and
+        (is_nil(settings["notes"]) or
+           (is_map(settings["notes"]) and Enum.all?(Map.values(settings["notes"]), &is_binary/1))),
+      "releases.json holds a primary benchmark ID and a note per benchmark ID"
+    )
+
+    settings
+  end
+
   def series!(id, opts \\ []) do
     require!(is_binary(id) and Regex.match?(~r/^[a-f0-9]{64}$/, id), "Invalid series ID")
     path = Path.join([opts[:page_root] || root(), "results", id <> ".json"])
@@ -313,7 +364,8 @@ defmodule Eab.Results do
   def added?(id, opts \\ []) do
     is_binary(id) and Regex.match?(~r/^[A-Za-z0-9_-]+$/, id) and
       Enum.any?(
-        Path.wildcard(Path.join([opts[:page_root] || root(), "results", "*.json"])),
+        Path.wildcard(Path.join([opts[:page_root] || root(), "results", "*.json"])) ++
+          Path.wildcard(Path.join([opts[:page_root] || root(), "releases", "*", "*.json"])),
         fn path ->
           case Jason.decode(File.read!(path)) do
             {:ok, %{"runs" => runs}} when is_list(runs) -> Enum.any?(runs, &(&1["run_id"] == id))
@@ -405,11 +457,37 @@ defmodule Eab.Results do
     ids = Enum.map(records, & &1["series_id"])
     require!(Enum.uniq(ids) == ids, "Duplicate series ID")
 
-    payload = %{
-      "schema_version" => 7,
-      "benchmark" => %{"id" => inventory["id"], "case_count" => length(inventory["cases"])},
-      "results" => Enum.map(records, &aggregate/1)
-    }
+    # Earlier releases stay on the page beside the current one, which takes the new runs.
+    frozen = frozen!(page)
+    settings = page_settings(page)
+    notes = settings["notes"] || %{}
+
+    releases =
+      Enum.map(frozen, &release(&1["id"], &1["case_count"], &1["records"], false, notes)) ++
+        [release(inventory["id"], length(inventory["cases"]), records, true, notes)]
+
+    release_ids = Enum.map(releases, & &1["benchmark"]["id"])
+
+    require!(
+      Enum.uniq(release_ids) == release_ids,
+      "An earlier release has the current benchmark's ID; its series belong in results/"
+    )
+
+    runs =
+      for release <- releases,
+          series <- release["results"],
+          run <- series["runs"],
+          do: run["run_id"]
+
+    require!(Enum.uniq(runs) == runs, "A run appears in more than one release")
+    primary = settings["primary"] || inventory["id"]
+
+    require!(
+      primary in release_ids,
+      "releases.json names #{primary} as primary, which is not a release on this page"
+    )
+
+    payload = %{"schema_version" => 7, "primary" => primary, "releases" => releases}
 
     repository =
       opts[:repository] ||
@@ -444,6 +522,17 @@ defmodule Eab.Results do
 
     File.touch!(Path.join(destination, ".nojekyll"))
     destination
+  end
+
+  # One release as the page shows it. Its label is the ID's last part, such as "v6".
+  defp release(id, case_count, records, current?, notes) do
+    %{
+      "benchmark" => %{"id" => id, "case_count" => case_count},
+      "label" => id |> String.split("-") |> List.last(),
+      "current" => current?,
+      "note" => notes[id],
+      "results" => Enum.map(records, &aggregate/1)
+    }
   end
 
   @doc "A series with its mean score, interval, per-case passes, missing seeds and peak memory."

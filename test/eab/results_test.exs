@@ -83,6 +83,12 @@ defmodule Eab.ResultsTest do
 
   defp entry(record), do: hd(record["runs"])
 
+  # The series of the current benchmark release on a built page.
+  defp built(path) do
+    payload = Results.read!(path)
+    Enum.find(payload["releases"], & &1["current"])["results"]
+  end
+
   test "public export uses exact artifact identity, outcomes and weight size, and omits private data" do
     result = Results.export!(run())
     assert Enum.map(entry(result)["cases"], & &1["passed"]) == [true, false]
@@ -537,7 +543,7 @@ defmodule Eab.ResultsTest do
     File.rm!(Path.join(dir, other["series_id"] <> ".json"))
     output = Path.join(dir, "dist")
     Results.build!(Results.load!(dir), output)
-    [built] = Results.read!(Path.join(output, "results.json"))["results"]
+    [built] = built(Path.join(output, "results.json"))
     assert built["score_percent"] == 100.0 and built["run_count"] == 1
     assert built["total"] == length(source["cases"])
     assert built["interval_percent"] == nil and built["missing_seeds"] == [102, 103]
@@ -558,7 +564,7 @@ defmodule Eab.ResultsTest do
 
     assert_raise ArgumentError, ~r/does not match/, fn -> Results.build!([altered], output) end
     Results.build!([], output)
-    assert Results.read!(Path.join(output, "results.json"))["results"] == []
+    assert built(Path.join(output, "results.json")) == []
   end
 
   test "publication builds the page, keeps overrides on repeat clicks and leaves private data out",
@@ -573,7 +579,7 @@ defmodule Eab.ResultsTest do
     Results.write!(dest, Map.put(record, "note", "Reviewed note"))
     assert Results.publish!(source, opts) == :already_added
     assert Results.added?(source["id"], page_root: page)
-    [built] = Results.read!(Path.join(page, "dist/results.json"))["results"]
+    [built] = built(Path.join(page, "dist/results.json"))
     assert built["note"] == "Reviewed note"
     assert built["score_percent"] == 100.0
     assert built["total"] == length(source["cases"])
@@ -602,7 +608,7 @@ defmodule Eab.ResultsTest do
       Enum.map(runs, fn run -> Task.async(fn -> Results.publish!(run, page_root: page) end) end)
 
     assert Enum.sort(Enum.map(tasks, &Task.await/1)) == [:added, :added, :already_added]
-    [series] = Results.read!(Path.join(page, "dist/results.json"))["results"]
+    [series] = built(Path.join(page, "dist/results.json"))
     assert Enum.map(series["runs"], & &1["run_id"]) == ["test-run", "second-run"]
     assert series["run_count"] == 2 and series["missing_seeds"] == [103]
     assert length(Path.wildcard(Path.join(page, "results/*.json"))) == 1
@@ -620,6 +626,101 @@ defmodule Eab.ResultsTest do
     assert_raise File.Error, fn -> Results.publish!(source, page_root: page) end
     assert Path.wildcard(Path.join(page, "results/*.json")) == []
     assert Path.wildcard(Path.join(page, ".publish-*")) == []
+  end
+
+  test "an earlier release stays on the page beside the current one, which takes new runs",
+       %{dir: dir} do
+    page = page(dir)
+    source = current()
+    inventory = source["protocol"]["inventory"]
+    opts = [page_root: page, inventory: inventory]
+
+    # A series published on an earlier release: another benchmark ID and other case files.
+    earlier =
+      source
+      |> Map.put("id", "earlier-run")
+      |> Results.export!()
+      |> Map.put("benchmark", "example-benchmark-v1")
+      |> update_in(["case_fixtures"], fn fixtures ->
+        Map.new(fixtures, fn {id, files} ->
+          {id, Map.put(files, "ticket.md", String.duplicate("e", 64))}
+        end)
+      end)
+
+    folder = Path.join(page, "releases/v1")
+    File.mkdir_p!(folder)
+    Results.write!(Path.join(folder, earlier["series_id"] <> ".json"), earlier)
+
+    # It is checked against its own series, not the current cases, and does not take runs.
+    assert [%{"id" => "example-benchmark-v1", "records" => [_]}] = Results.frozen!(page)
+    assert Results.load!(Path.join(page, "results")) == []
+    assert Results.added?("earlier-run", page_root: page)
+
+    # Without settings the current release is the one the page shows first.
+    assert Results.publish!(source, opts) == :added
+    payload = Results.read!(Path.join(page, "dist/results.json"))
+    assert payload["primary"] == inventory["id"]
+
+    assert [
+             %{"label" => "v1", "current" => false, "results" => [old]},
+             %{"current" => true, "results" => [new]}
+           ] = payload["releases"]
+
+    assert hd(payload["releases"])["benchmark"] == %{
+             "id" => "example-benchmark-v1",
+             "case_count" => length(inventory["cases"])
+           }
+
+    assert entry(old)["run_id"] == "earlier-run" and entry(new)["run_id"] == source["id"]
+    assert old["score_percent"] == 100.0
+
+    # releases.json names the release shown first and a note for each.
+    Results.write!(Path.join(page, "releases.json"), %{
+      "primary" => "example-benchmark-v1",
+      "notes" => %{"example-benchmark-v1" => "Earlier limits."}
+    })
+
+    Results.build!(Results.load!(Path.join(page, "results")), Path.join(page, "dist"), opts)
+    payload = Results.read!(Path.join(page, "dist/results.json"))
+    assert payload["primary"] == "example-benchmark-v1"
+    assert hd(payload["releases"])["note"] == "Earlier limits."
+    assert List.last(payload["releases"])["note"] == nil
+
+    Results.write!(Path.join(page, "releases.json"), %{"primary" => "no-such-benchmark"})
+
+    assert_raise ArgumentError, ~r/not a release on this page/, fn ->
+      Results.build!([], Path.join(page, "dist"), opts)
+    end
+
+    Results.write!(Path.join(page, "releases.json"), %{"main" => "example-benchmark-v1"})
+    assert_raise ArgumentError, ~r/releases.json holds/, fn -> Results.page_settings(page) end
+    File.rm!(Path.join(page, "releases.json"))
+
+    # Series of one earlier release must agree with each other.
+    stray =
+      earlier
+      |> Map.put("series_id", String.duplicate("d", 64))
+      |> Map.put("benchmark", "example-benchmark-v0")
+      |> put_in(["runs", Access.at(0), "run_id"], "stray-run")
+
+    Results.write!(Path.join(folder, stray["series_id"] <> ".json"), stray)
+    assert_raise ArgumentError, ~r/must share its benchmark/, fn -> Results.frozen!(page) end
+    File.rm!(Path.join(folder, stray["series_id"] <> ".json"))
+
+    # An earlier release cannot carry the current benchmark's ID.
+    same = Map.put(earlier, "benchmark", inventory["id"])
+    Results.write!(Path.join(folder, earlier["series_id"] <> ".json"), same)
+
+    assert_raise ArgumentError, ~r/belong in results/, fn ->
+      Results.build!([], Path.join(page, "dist"), opts)
+    end
+  end
+
+  test "the repository's own page settings name a release it holds" do
+    releases = Enum.map(Results.frozen!(), & &1["id"]) ++ [Eab.Inventory.definition()["id"]]
+    settings = Results.page_settings()
+    assert (settings["primary"] || List.last(releases)) in releases
+    assert Map.keys(settings["notes"] || %{}) -- releases == []
   end
 
   test "preview serves only public generated files", %{dir: dir} do

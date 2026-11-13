@@ -49,7 +49,13 @@ defmodule Mix.Tasks.Eab.Results do
         )
 
       ["check"] ->
-        Mix.shell().info("Validated #{length(Eab.Results.load!())} run series")
+        earlier = Eab.Results.frozen!() |> Enum.map(&length(&1["records"])) |> Enum.sum()
+        Eab.Results.page_settings()
+
+        Mix.shell().info(
+          "Validated #{length(Eab.Results.load!())} run series of the current release and " <>
+            "#{earlier} of earlier releases"
+        )
 
       ["build"] ->
         build()
@@ -80,7 +86,13 @@ defmodule Mix.Tasks.Eab.Results do
   defp build do
     records = Eab.Results.load!()
     directory = Eab.Results.build!(records)
-    Mix.shell().info("Built #{directory}/index.html (#{length(records)} run series)")
+    earlier = Eab.Results.frozen!() |> Enum.map(&length(&1["records"])) |> Enum.sum()
+
+    Mix.shell().info(
+      "Built #{directory}/index.html (#{length(records)} run series of the current release, " <>
+        "#{earlier} of earlier releases)"
+    )
+
     directory
   end
 
