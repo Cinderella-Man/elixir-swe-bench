@@ -115,14 +115,13 @@ defmodule Eab.Model do
         endpoint["context"]
       )
 
+    # No reply has a cap of its own (ADR 0015). Runs made with one keep it, so their retries
+    # and resumes reproduce it; Runs.start never passes one. The benchmark definition's old
+    # response_tokens default stays unread, because changing that file blocks earlier retries.
     response =
-      integer(
-        input,
-        "response_tokens",
-        min(defaults["response_tokens"], window - 9),
-        1,
-        window - 9
-      )
+      if input["response_tokens"] in [nil, ""],
+        do: nil,
+        else: integer(input, "response_tokens", nil, 1, window - 9)
 
     %{
       "window_tokens" => window,

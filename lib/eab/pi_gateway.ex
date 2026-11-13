@@ -102,11 +102,8 @@ defmodule Eab.PiGateway do
   end
 
   defp exchange(frame, state) do
-    allowance =
-      min(
-        state.settings["response_tokens"],
-        state.settings["max_tokens"] - state.generated_tokens
-      )
+    remaining = state.settings["max_tokens"] - state.generated_tokens
+    cap = state.settings["response_tokens"]
 
     # Preserve Pi's complete messages/tools. Freeze only declared generation settings.
     payload =
@@ -120,7 +117,7 @@ defmodule Eab.PiGateway do
       |> Map.merge(%{
         "model" => state.endpoint["model"],
         "stream" => true,
-        "max_tokens" => allowance,
+        "max_tokens" => if(cap, do: min(cap, remaining), else: remaining),
         "seed" => state.settings["seed"]
       })
       |> Eab.Thinking.payload(state.settings)
@@ -134,11 +131,21 @@ defmodule Eab.PiGateway do
     Store.write("#{state.prefix}/request-#{step}.json", payload, state.key)
     Activity.note("Counting prompt tokens for model call #{state.calls + 1}")
     count = Model.count(state.endpoint, state.key, payload)
+    {allowance, bound} = reply_limit(state.settings, remaining, count)
 
-    if count + allowance + state.settings["safety_tokens"] > state.settings["window_tokens"] do
+    payload =
+      if allowance > 0 and allowance != payload["max_tokens"] do
+        payload = %{payload | "max_tokens" => allowance}
+        Store.write("#{state.prefix}/request-#{step}.json", payload, state.key)
+        payload
+      else
+        payload
+      end
+
+    if allowance < 1 do
       stopped(frame, state, "context_budget")
     else
-      state = %{state | calls: state.calls + 1}
+      state = %{state | calls: state.calls + 1, reply_bound: bound}
       persist(state)
 
       try do
@@ -170,6 +177,26 @@ defmodule Eab.PiGateway do
         error -> error_reply(frame, state, Store.redact(Exception.message(error), state.key))
       end
     end
+  end
+
+  # A reply may use whatever is left of the generation budget and of the context window after
+  # the prompt (ADR 0015); the model is stopped only when the prompt leaves no room. Runs made
+  # with a per-reply cap keep it and still reserve room for a full capped reply before a call.
+  # The bound names the limit that ends the reply if it stops for length.
+  defp reply_limit(%{"response_tokens" => cap} = settings, remaining, count)
+       when is_integer(cap) do
+    allowance = min(cap, remaining)
+
+    cond do
+      count + allowance + settings["safety_tokens"] > settings["window_tokens"] -> {0, "context"}
+      remaining <= cap -> {allowance, "generation"}
+      true -> {allowance, "response"}
+    end
+  end
+
+  defp reply_limit(settings, remaining, count) do
+    room = settings["window_tokens"] - count - settings["safety_tokens"]
+    if room < remaining, do: {room, "context"}, else: {remaining, "generation"}
   end
 
   defp stopped(frame, state, reason) do

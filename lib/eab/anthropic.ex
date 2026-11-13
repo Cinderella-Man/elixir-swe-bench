@@ -92,7 +92,8 @@ defmodule Eab.Anthropic do
 
     %{
       "max_tokens" => Model.integer(input, "max_tokens", 262_144, 1, 10_000_000),
-      "response_tokens" => Model.integer(input, "response_tokens", min(64_000, cap), 1, cap),
+      # The API needs a per-reply value; new runs ask for the model's maximum (ADR 0015).
+      "response_tokens" => Model.integer(input, "response_tokens", cap, 1, cap),
       "window_tokens" => endpoint["context"],
       "budget_policy" => "response_boundary_soft_limit",
       "context_policy" => "provider_enforced",

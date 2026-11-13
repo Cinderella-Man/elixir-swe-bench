@@ -59,9 +59,9 @@ _Avoid_: repeats, trial set, epochs
 
 **Generation budget**: The cumulative tokens generated during an attempt, including reasoning and tool syntax.
 
-**Response budget**: The most tokens one model reply may generate.
+**Response budget**: The most tokens one model reply may generate. Only local series made before 2026-11-13 have one; since then a reply is limited only by the generation and context budgets.
 
-**Cutoff**: The budget that ended an attempt before the agent finished: generation, context or response. The patch at that point is graded, so a cut-off attempt may still pass.
+**Cutoff**: The budget that ended an attempt before the agent finished: generation, context or, in older local series, response. The patch at that point is graded, so a cut-off attempt may still pass.
 
 **Harness**: The coding-agent program, tool set and fixed instructions through which a model makes attempts. Pi and Claude Code are harnesses. Each run uses one harness; comparing runs across harnesses confounds the model with the harness.
 

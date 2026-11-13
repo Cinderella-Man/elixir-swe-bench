@@ -263,11 +263,12 @@ defmodule Eab.PiTest do
     model = endpoint("llama_cpp")
     settings = Model.settings(model, %{"max_tokens" => 100})
 
-    finish = fn last_stop, generated ->
+    finish = fn last_stop, generated, bound ->
       start = %{
         Pi.state(model, "", settings, prefix, fn _ -> :ok end, false)
         | calls: 3,
-          generated_tokens: generated
+          generated_tokens: generated,
+          reply_bound: bound
       }
 
       state =
@@ -290,9 +291,88 @@ defmodule Eab.PiTest do
       Pi.finish(%{"state" => state, "returncode" => 0})["stop_reason"]
     end
 
-    assert finish.("stop", 60) == "agent_completed"
-    assert finish.("length", 60) == "response_budget"
-    assert finish.("length", 100) == "token_budget"
+    assert finish.("stop", 60, "generation") == "agent_completed"
+    assert finish.("length", 60, "generation") == "token_budget"
+    assert finish.("length", 60, "context") == "context_budget"
+    assert finish.("length", 60, "response") == "response_budget"
+    # Attempts recorded before the gateway named the bound fall back to the budget used.
+    assert finish.("length", 60, nil) == "response_budget"
+    assert finish.("length", 100, nil) == "token_budget"
+  end
+
+  test "without a per-reply cap a reply may use the budget and context room left", %{
+    prefix: prefix
+  } do
+    parent = self()
+    model = endpoint("llama_cpp")
+    settings = Model.settings(model, %{"max_tokens" => 1000})
+    assert is_nil(settings["response_tokens"])
+    window = settings["window_tokens"]
+
+    assert Pi.config(model, settings, "", "")["models"]["providers"]["benchmark"]["models"]
+           |> hd()
+           |> Map.fetch!("maxTokens") == 1000
+
+    frame = %{
+      "type" => "request",
+      "id" => "1",
+      "method" => "POST",
+      "path" => "/v1/chat/completions",
+      "body" => %{"messages" => [%{"role" => "user", "content" => "ticket"}], "tools" => []}
+    }
+
+    # The server counts the prompt, then streams a reply cut at its allowance.
+    serve = fn count ->
+      Application.put_env(:eab, :http_request, fn opts ->
+        if String.ends_with?(opts[:url], "tokens") do
+          {:ok, %{status: 200, body: %{"input_tokens" => count}}}
+        else
+          allowance = opts[:json]["max_tokens"]
+          send(parent, {:allowance, allowance})
+
+          body =
+            sse([
+              %{
+                "id" => "synthetic",
+                "choices" => [
+                  %{
+                    "index" => 0,
+                    "delta" => %{"role" => "assistant", "reasoning_content" => "Still thinking"},
+                    "finish_reason" => "length"
+                  }
+                ],
+                "usage" => %{"prompt_tokens" => count, "completion_tokens" => min(allowance, 10)}
+              }
+            ]) <> "data: [DONE]\n\n"
+
+          {:ok, %{status: 200, body: body}}
+        end
+      end)
+    end
+
+    state = Pi.state(model, "", settings, prefix, fn _ -> :ok end, false)
+
+    serve.(42)
+    {reply, state} = PiGateway.request(frame, state)
+    assert reply["status"] == 200
+    assert_receive {:allowance, 1000}
+    assert state.reply_bound == "generation"
+
+    # A long prompt leaves less room in the window than the generation budget left.
+    serve.(window - 508)
+    {reply, state} = PiGateway.request(frame, state)
+    assert reply["status"] == 200
+    assert_receive {:allowance, 500}
+    assert state.reply_bound == "context"
+    assert Store.read("#{prefix}/request-0001.json")["max_tokens"] == 500
+
+    # The model is stopped before a call only when the prompt leaves no room at all.
+    serve.(window - 8)
+    {reply, stopped} = PiGateway.request(frame, state)
+    assert reply["status"] == 429
+    assert stopped.stop_reason == "context_budget"
+    assert stopped.calls == 2
+    refute_receive {:allowance, _}
   end
 
   test "the bash watchdog kills a command that never exits and Pi continues", %{prefix: prefix} do

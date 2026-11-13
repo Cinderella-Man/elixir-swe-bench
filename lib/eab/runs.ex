@@ -158,7 +158,9 @@ defmodule Eab.Runs do
 
   def handle_call({:start, endpoint, key, settings, opts}, _from, state) do
     release = Release.freeze()
-    settings = Model.settings(endpoint, settings)
+
+    # A new run never caps a single reply (ADR 0015); a server that needs a value gets its maximum.
+    settings = Model.settings(endpoint, Map.delete(settings, "response_tokens"))
 
     run =
       release
@@ -266,6 +268,8 @@ defmodule Eab.Runs do
       do: raise("This run cannot be resumed")
 
     if run["cleanup_pending"] == true, do: raise("Container cleanup must finish before resume")
+    # The per-reply cap is no longer a choice (ADR 0015); a resumed run keeps its own.
+    settings = Map.put(settings, "response_tokens", run["settings"]["response_tokens"])
     Checkpoints.validate_run!(run, endpoint, Model.settings(endpoint, settings))
     plan = Checkpoints.plan(run)
 

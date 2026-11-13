@@ -223,9 +223,26 @@ defmodule Eab.Series do
     vram + (resource["service_ram_bytes"] || resource["ram_rss_bytes"] || 0)
   end
 
+  @doc """
+  Why a published series can take no more runs although it lacks seeds, or nil. New local
+  runs no longer cap a single reply (ADR 0015), so no new run can match a series that did.
+  """
+  def closed_reason(%{
+        "setup" => %{"server_type" => type, "settings" => %{"response_tokens" => cap}}
+      })
+      when type in ~w(llama_cpp strata) and is_integer(cap),
+      do:
+        "It was made with a #{cap}-token cap on each reply, which new runs no longer have " <>
+          "(ADR 0015). A run of this model starts a new series."
+
+  def closed_reason(_), do: nil
+
   @doc "Checks a run about to start as a contribution to a published series."
   def contribution!(run, series_id) do
     record = Eab.Results.series!(series_id)
+
+    if reason = closed_reason(record),
+      do: raise("Run series #{String.slice(series_id, 0, 12)} takes no more runs. " <> reason)
 
     expected =
       Map.merge(record["setup"], %{

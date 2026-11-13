@@ -276,6 +276,23 @@ defmodule Eab.SeriesTest do
     assert Results.publish!(same, page_root: page, resources: nil) == :added
   end
 
+  test "a local series made with a per-reply cap takes no more runs", %{page: page} do
+    capped = put_in(run("first", 101, [false]), ["settings", "response_tokens"], 8192)
+    Results.publish!(capped, page_root: page)
+    id = Series.id(capped)
+    assert Series.closed_reason(Results.series!(id)) =~ "8192-token cap on each reply"
+
+    next = capped |> Map.put("id", "next") |> put_in(["settings", "seed"], 102)
+
+    assert_raise RuntimeError, ~r/takes no more runs/, fn ->
+      Series.contribution!(next, id)
+    end
+
+    plain = run("plain", 101, [])
+    Results.publish!(plain, page_root: page)
+    assert is_nil(Series.closed_reason(Results.series!(Series.id(plain))))
+  end
+
   test "contributions must match the published setup and use a missing seed", %{page: page} do
     first = run("first", 101, [false])
     Results.publish!(first, page_root: page)

@@ -56,9 +56,11 @@
     },
     context_budget: {
       label: () => "context full",
-      text: r => r.settings.window_tokens ?
-        `the next prompt would not fit the ${fmt(r.settings.window_tokens)}-token context limit with ${fmt(r.settings.response_tokens)} tokens kept for the reply` :
-        "the conversation reached the model's context limit",
+      // Series without a per-reply cap let a reply use the room left in the window (ADR 0015).
+      text: r => !r.settings.window_tokens ? "the conversation reached the model's context limit" :
+        r.settings.response_tokens ?
+          `the next prompt would not fit the ${fmt(r.settings.window_tokens)}-token context limit with ${fmt(r.settings.response_tokens)} tokens kept for the reply` :
+          `the conversation filled the ${fmt(r.settings.window_tokens)}-token context limit`,
     },
     response_budget: {
       label: r => r.settings.response_tokens ? `reply cut at ${thousands(r.settings.response_tokens)}` : "reply cut off",
@@ -74,6 +76,9 @@
   const vram = r => r.resources ? (r.resources.peak_vram_bytes ?? r.resources.gpus.reduce((sum, gpu) => sum + gpu.used_bytes, 0)) : null;
   const context = r => r.settings.window_tokens ? `${fmt(r.settings.window_tokens)} context` : "API";
   const sum = (run, key) => run.cases.every(c => Number.isInteger(c[key])) ? run.cases.reduce((n, c) => n + c[key], 0) : null;
+  // A local run without a per-reply cap records none (ADR 0015); API runs leave it to the provider.
+  const settingValue = (r, key, value) =>
+    key === "response_tokens" && value == null && r.settings.window_tokens ? "No cap" : readable(value);
   const readable = value => value == null ? "Not recorded" : typeof value === "boolean" ? (value ? "Enabled" : "Disabled") :
     typeof value === "number" ? fmt(value) : value.replaceAll("_", " ");
   // Only a run's sampled peak is a measurement; a loaded-model snapshot is not a run's requirement.
@@ -196,7 +201,7 @@
       conditions.append(definitionList(memory));
     }
     conditions.append(node("h3", "settings-heading", "Run settings"), definitionList(
-      Object.entries(r.settings).map(([key, value]) => [settings[key] || readable(key), readable(value)])));
+      Object.entries(r.settings).map(([key, value]) => [settings[key] || readable(key), settingValue(r, key, value)])));
     conditions.append(node("p", "record-id", `Series: ${r.series_id}`));
     if (r.evidence_url) {
       const link = node("a", "", "Recorded evidence ↗"); link.href = r.evidence_url; conditions.append(link);

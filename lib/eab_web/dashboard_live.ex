@@ -22,7 +22,6 @@ defmodule EabWeb.DashboardLive do
 
   @defaults %{
     "window_tokens" => "",
-    "response_tokens" => "",
     "max_tokens" => "65536",
     "seed" => "101",
     "reasoning_effort" => ""
@@ -53,7 +52,7 @@ defmodule EabWeb.DashboardLive do
         saved_settings: %{
           "local" => @defaults,
           "chatgpt" => subscription_defaults(),
-          "claude" => claude_defaults(),
+          "claude" => subscription_defaults(),
           "claude_code" => %{}
         },
         validation: false,
@@ -120,7 +119,20 @@ defmodule EabWeb.DashboardLive do
   defp subscription_defaults,
     do: Map.merge(@defaults, %{"max_tokens" => "262144", "reasoning_effort" => "high"})
 
-  defp claude_defaults, do: Map.put(subscription_defaults(), "response_tokens", "")
+  defp prefill_contribution(socket, series) do
+    settings =
+      series["settings"]
+      |> Map.take(~w(window_tokens max_tokens reasoning_effort))
+      |> Map.reject(fn {_, value} -> is_nil(value) end)
+      |> Map.new(fn {key, value} -> {key, to_string(value)} end)
+      |> Map.put("seed", to_string(List.first(series["missing_seeds"]) || ""))
+
+    assign(socket,
+      contribution: series,
+      settings: Map.merge(socket.assigns.settings, settings),
+      validation: false
+    )
+  end
 
   def handle_event("provider", %{"provider" => "chatgpt"}, socket) do
     Eab.ChatGPTAuth.retry_requests(socket.assigns.account)
@@ -303,19 +315,9 @@ defmodule EabWeb.DashboardLive do
         {:noreply, socket}
 
       series ->
-        settings =
-          series["settings"]
-          |> Map.take(~w(window_tokens response_tokens max_tokens reasoning_effort))
-          |> Map.reject(fn {_, value} -> is_nil(value) end)
-          |> Map.new(fn {key, value} -> {key, to_string(value)} end)
-          |> Map.put("seed", to_string(List.first(series["missing_seeds"]) || ""))
-
-        {:noreply,
-         assign(socket,
-           contribution: series,
-           settings: Map.merge(socket.assigns.settings, settings),
-           validation: false
-         )}
+        if reason = Series.closed_reason(series),
+          do: {:noreply, assign(socket, error: "This series takes no more runs. " <> reason)},
+          else: {:noreply, prefill_contribution(socket, series)}
     end
   end
 
@@ -1397,19 +1399,12 @@ defmodule EabWeb.DashboardLive do
                   <label :for={
                     {key, title} <-
                       case @provider do
-                        "chatgpt" ->
+                        provider when provider in ["chatgpt", "claude"] ->
                           [{"max_tokens", "Generated-token threshold per case"}]
-
-                        "claude" ->
-                          [
-                            {"max_tokens", "Generated-token threshold per case"},
-                            {"response_tokens", "Tokens per response (blank = up to 64,000)"}
-                          ]
 
                         _ ->
                           [
                             {"window_tokens", "Context tokens (blank = automatic)"},
-                            {"response_tokens", "Tokens per response (blank = up to 8,192)"},
                             {"max_tokens", "Generated tokens per case"},
                             {"seed", "Seed"}
                           ]
@@ -2156,7 +2151,15 @@ defmodule EabWeb.DashboardLive do
             <summary>Required setup</summary>
             <pre>{Jason.encode!(series["setup"], pretty: true)}</pre>
           </details>
-          <button class="secondary" phx-click="contribute" phx-value-id={series["series_id"]}>
+          <p :if={Series.closed_reason(series)} class="muted">
+            Takes no more runs. {Series.closed_reason(series)}
+          </p>
+          <button
+            :if={is_nil(Series.closed_reason(series))}
+            class="secondary"
+            phx-click="contribute"
+            phx-value-id={series["series_id"]}
+          >
             Contribute a run
           </button>
         </div>

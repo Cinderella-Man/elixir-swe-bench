@@ -84,8 +84,11 @@ defmodule Eab.Pi do
                 "input" => ["text"],
                 # Pi requires numeric bookkeeping values. Subscription requests remove its
                 # output cap; compaction is off and these are not provider capacity claims.
+                # A local reply without a per-reply cap may use the whole generation budget.
                 "contextWindow" => settings["window_tokens"] || 262_144,
-                "maxTokens" => settings["response_tokens"] || 8192,
+                "maxTokens" =>
+                  settings["response_tokens"] ||
+                    if(subscription, do: 8192, else: settings["max_tokens"]),
                 "cost" => %{"input" => 0, "output" => 0, "cacheRead" => 0, "cacheWrite" => 0}
               }
             ]
@@ -158,6 +161,7 @@ defmodule Eab.Pi do
       measurement: Eab.Measurement.start(measure?),
       speed: nil,
       stop_reason: nil,
+      reply_bound: nil,
       error: nil,
       settled: false,
       assistant: false,
@@ -251,7 +255,16 @@ defmodule Eab.Pi do
   end
 
   # Pi settles after a reply cut off at its token allowance, as if the agent had finished.
-  # The allowance is the remaining generation budget once that is below one response's limit.
+  # A local server's allowance is bounded by the generation budget or the context window left,
+  # or by an older run's per-reply cap; the gateway records which (ADR 0015).
+  defp settled_reason(%{last_stop: "length", reply_bound: bound}) when is_binary(bound) do
+    case bound do
+      "generation" -> "token_budget"
+      "context" -> "context_budget"
+      "response" -> "response_budget"
+    end
+  end
+
   defp settled_reason(%{last_stop: "length", settings: settings} = state) do
     max = settings["max_tokens"]
 

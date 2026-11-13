@@ -78,10 +78,11 @@ defmodule Eab.AnthropicTest do
     refute_receive {:request, _}
   end
 
-  test "settings default to a soft threshold, a capped response and a supported effort", f do
+  test "settings default to a soft threshold, the model's longest reply and a supported effort",
+       f do
     settings = Model.settings(f.endpoint)
     assert settings["max_tokens"] == 262_144
-    assert settings["response_tokens"] == 64_000
+    assert settings["response_tokens"] == 128_000
     assert settings["window_tokens"] == 1_000_000
     assert settings["reasoning_effort"] == "high"
     assert settings["budget_policy"] == "response_boundary_soft_limit"
@@ -164,7 +165,7 @@ defmodule Eab.AnthropicTest do
     assert File.read!(Path.join(workspace, "repaired.txt")) == "fixed"
     assert_receive {:generation, first}
     assert first["model"] == "claude-haiku-5-5" and first["stream"] == true
-    assert first["max_tokens"] == 64_000
+    assert first["max_tokens"] == 128_000
     assert first["thinking"] == %{"type" => "adaptive", "display" => "summarized"}
     assert first["output_config"]["effort"] == "xhigh"
     assert Enum.any?(first["tools"], &(&1["name"] == "write"))

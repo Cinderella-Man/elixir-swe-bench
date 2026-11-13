@@ -135,7 +135,12 @@ defmodule Eab.Agent do
     "Model and tool calls are unlimited. Stop after #{settings["max_tokens"]} generated tokens total, checked between complete responses. A response can exceed the remaining threshold. Context and per-response limits are enforced by the provider."
   end
 
+  # Runs made with a per-reply cap keep their sentence; later runs have none (ADR 0015).
+  defp budget_instructions(%{"response_tokens" => cap} = settings) when is_integer(cap) do
+    "Model and tool calls are unlimited. Limits: #{settings["max_tokens"]} generated tokens total, #{settings["window_tokens"]} context tokens including up to #{cap} response tokens."
+  end
+
   defp budget_instructions(settings) do
-    "Model and tool calls are unlimited. Limits: #{settings["max_tokens"]} generated tokens total, #{settings["window_tokens"]} context tokens including up to #{settings["response_tokens"]} response tokens."
+    "Model and tool calls are unlimited. Limits: #{settings["max_tokens"]} generated tokens total and #{settings["window_tokens"]} context tokens."
   end
 end
