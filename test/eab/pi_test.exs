@@ -257,6 +257,44 @@ defmodule Eab.PiTest do
     assert File.read!(Path.join(workspace, "repaired.txt")) == "fixed"
   end
 
+  test "a final reply cut at its allowance records which budget ended the attempt", %{
+    prefix: prefix
+  } do
+    model = endpoint("llama_cpp")
+    settings = Model.settings(model, %{"max_tokens" => 100})
+
+    finish = fn last_stop, generated ->
+      start = %{
+        Pi.state(model, "", settings, prefix, fn _ -> :ok end, false)
+        | calls: 3,
+          generated_tokens: generated
+      }
+
+      state =
+        Enum.reduce(
+          [
+            %{
+              "type" => "event",
+              "event" => %{
+                "type" => "message_end",
+                "message" => %{"role" => "assistant", "stopReason" => last_stop}
+              }
+            },
+            %{"type" => "event", "event" => %{"type" => "agent_settled", "aborted" => false}},
+            %{"type" => "exit", "code" => 0}
+          ],
+          start,
+          fn frame, state -> elem(Pi.handle(frame, state), 1) end
+        )
+
+      Pi.finish(%{"state" => state, "returncode" => 0})["stop_reason"]
+    end
+
+    assert finish.("stop", 60) == "agent_completed"
+    assert finish.("length", 60) == "response_budget"
+    assert finish.("length", 100) == "token_budget"
+  end
+
   test "the bash watchdog kills a command that never exits and Pi continues", %{prefix: prefix} do
     parent = self()
     model = endpoint("llama_cpp")

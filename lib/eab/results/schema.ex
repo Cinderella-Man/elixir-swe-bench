@@ -6,6 +6,7 @@ defmodule Eab.Results.Schema do
   @nullable_int ~w(window_tokens response_tokens)
   @integer ~w(safety_tokens max_tokens)
   @text ~w(budget_policy context_policy reasoning_effort reasoning_effort_source thinking_policy)
+  @cutoffs ~w(generation_budget context_budget response_budget)
   @thinking %{
     "server_preset" => ~w(server_reported operator_declared not_reported),
     "provider_request" => ~w(provider_request),
@@ -13,8 +14,8 @@ defmodule Eab.Results.Schema do
   }
 
   def validate!(r) do
-    fields!(r, @fields, "Expected a public v6 run series; export the original run.json with add")
-    require!(r["schema_version"] === 6, "Unsupported result schema")
+    fields!(r, @fields, "Expected a public v7 run series; export the original run.json with add")
+    require!(r["schema_version"] === 7, "Unsupported result schema")
     hex!(r["series_id"], "A series ID is required")
     text!(r["benchmark"], "benchmark")
 
@@ -151,8 +152,19 @@ defmodule Eab.Results.Schema do
       require!(Enum.map(run["cases"], & &1["id"]) == ids, "Every run must list the same cases")
 
       for c <- run["cases"] do
-        fields!(c, ~w(id passed generated_tokens model_calls), "Unexpected case fields")
+        fields!(c, ~w(id passed generated_tokens model_calls cutoff), "Unexpected case fields")
         require!(is_boolean(c["passed"]), "Every case needs a final pass/fail outcome")
+
+        require!(
+          c["cutoff"] in [nil | @cutoffs],
+          "cutoff must be generation_budget, context_budget, response_budget or null"
+        )
+
+        # Claude Code cannot enforce the generation budget; going over it is flagged instead.
+        require!(
+          c["cutoff"] != "generation_budget" or r["harness"]["name"] == "pi",
+          "Only Pi enforces the generation budget"
+        )
 
         for key <- ~w(generated_tokens model_calls),
             do:

@@ -114,6 +114,66 @@ defmodule Eab.ResultsTest do
     refute Jason.encode!(Results.export!(source)) =~ "attempt_ms"
   end
 
+  test "each case says which budget cut its attempt off, including older Pi runs" do
+    cut = fn stop, tokens, backend ->
+      Results.cutoff(%{"stop_reason" => stop, "generated_tokens" => tokens}, 65_536, backend)
+    end
+
+    assert cut.("token_budget", 65_536, "llama_cpp") == "generation_budget"
+    assert cut.("context_budget", 43_807, "llama_cpp") == "context_budget"
+    assert cut.("response_budget", 46_267, "strata") == "response_budget"
+    assert cut.("agent_completed", 40_000, "llama_cpp") == nil
+    # Older Pi runs recorded a final reply cut at the remaining budget as agent_completed.
+    assert cut.("agent_completed", 65_536, "llama_cpp") == "generation_budget"
+    # Subscriptions treat the budget as a soft threshold; Claude Code cannot enforce it.
+    assert cut.("agent_completed", 70_000, "anthropic") == nil
+    assert cut.("agent_completed", 300_000, "claude_code") == nil
+    assert cut.("context_limit", 90_000, "claude_code") == "context_budget"
+    assert cut.("response_limit", 90_000, "claude_code") == "response_budget"
+
+    source =
+      run()
+      |> put_in(["attempts", "case-a", "stop_reason"], "response_budget")
+      |> put_in(["attempts", "case-b", "generated_tokens"], 65_536)
+
+    record = Results.export!(source)
+
+    assert Enum.map(entry(record)["cases"], & &1["cutoff"]) == [
+             "response_budget",
+             "generation_budget"
+           ]
+
+    bad = fn cutoff, harness ->
+      record
+      |> update_in(["runs"], fn [run] ->
+        [
+          update_in(run["cases"], fn [a, b] ->
+            [%{a | "cutoff" => cutoff}, %{b | "cutoff" => nil}]
+          end)
+        ]
+      end)
+      |> Map.put("harness", harness)
+    end
+
+    assert_raise ArgumentError, ~r/cutoff must be/, fn ->
+      Results.validate!(bad.("tired", record["harness"]))
+    end
+
+    claude_code = %{
+      "name" => "claude_code",
+      "version" => "2.3.0",
+      "agent" => "solver",
+      "kit_sha256" => String.duplicate("c", 64),
+      "preamble_sha256" => String.duplicate("d", 64)
+    }
+
+    assert Results.validate!(bad.("context_budget", claude_code))
+
+    assert_raise ArgumentError, ~r/Only Pi enforces/, fn ->
+      Results.validate!(bad.("generation_budget", claude_code))
+    end
+  end
+
   test "each published run states its parallel attempts; older records without it still validate" do
     assert entry(Results.export!(run()))["deployment"]["parallel_attempts"] == 1
     record = Results.export!(Map.put(run(), "parallel_attempts", 4))

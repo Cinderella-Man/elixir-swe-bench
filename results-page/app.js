@@ -9,7 +9,7 @@
     if (text !== undefined) e.textContent = text;
     return e;
   };
-  if (!data || data.schema_version !== 6) {
+  if (!data || data.schema_version !== 7) {
     $("chart").append(node("p", "empty", "Results could not be loaded. Please reload."));
     return;
   }
@@ -45,6 +45,30 @@
   const budgetTag = (r, n, of) => {
     const tag = node("span", "budget-tag", `over ${Math.round(r.settings.max_tokens / 1000)}k` + (n > 1 ? ` ×${n}` : ""));
     tag.title = `Generated more than the declared ${fmt(r.settings.max_tokens)}-token budget ${of}. It is flagged, not failed.`;
+    return tag;
+  };
+  // A budget can end an attempt before the agent finishes. The patch at that point is graded, and may still pass.
+  const thousands = tokens => `${Math.floor(tokens / 1000)}k`;
+  const cutoffs = {
+    generation_budget: {
+      label: r => `stopped at ${thousands(r.settings.max_tokens)}`,
+      text: r => `the attempt used its whole ${fmt(r.settings.max_tokens)}-token generation budget`,
+    },
+    context_budget: {
+      label: () => "context full",
+      text: r => r.settings.window_tokens ?
+        `the next prompt would not fit the ${fmt(r.settings.window_tokens)}-token context limit with ${fmt(r.settings.response_tokens)} tokens kept for the reply` :
+        "the conversation reached the model's context limit",
+    },
+    response_budget: {
+      label: r => r.settings.response_tokens ? `reply cut at ${thousands(r.settings.response_tokens)}` : "reply cut off",
+      text: r => `one reply reached the ${r.settings.response_tokens ? `${fmt(r.settings.response_tokens)}-token ` : ""}` +
+        "response limit before the agent had finished, which ended the attempt",
+    },
+  };
+  const cutoffTag = (r, kind, n, where) => {
+    const tag = node("span", "cutoff-tag", cutoffs[kind].label(r) + (n > 1 ? ` ×${n}` : ""));
+    tag.title = `${where}, ${cutoffs[kind].text(r)}. The patch at that point was graded.`;
     return tag;
   };
   const vram = r => r.resources ? (r.resources.peak_vram_bytes ?? r.resources.gpus.reduce((sum, gpu) => sum + gpu.used_bytes, 0)) : null;
@@ -98,6 +122,9 @@
     const layout = node("div", "detail-layout");
     const outcomes = node("div");
     outcomes.append(node("h3", "", "Case outcomes"));
+    const attempts = r.runs.flatMap(run => run.cases), cut = attempts.filter(c => c.cutoff).length;
+    if (cut) outcomes.append(node("p", "detail-note", `${cut} of ${attempts.length} attempts ran out of a budget before the agent had finished. ` +
+      "Their patches at that point were graded; the tags say which limit."));
     const table = node("table", "case-table");
     const head = node("thead"), hr = node("tr");
     for (const title of ["Case", "Runs passed"]) hr.append(node("th", "", title));
@@ -105,8 +132,13 @@
     const tbody = node("tbody");
     for (const c of r.runs[0].cases) {
       const row = node("tr"), count = r.case_passes[c.id], name = node("td", "case-id", c.id);
-      const over = r.runs.filter(run => overBudget(r, run.cases.find(other => other.id === c.id))).length;
+      const tries = r.runs.map(run => run.cases.find(other => other.id === c.id));
+      const over = tries.filter(t => overBudget(r, t)).length;
       if (over) name.append(budgetTag(r, over, `in ${over} of ${r.run_count} runs`));
+      for (const kind of Object.keys(cutoffs)) {
+        const n = tries.filter(t => t.cutoff === kind).length;
+        if (n) name.append(cutoffTag(r, kind, n, r.run_count === 1 ? "In this run" : `In ${n} of ${r.run_count} runs`));
+      }
       row.append(name,
         node("td", count === r.run_count ? "passed" : count === 0 ? "failed" : "numeric", `${count}/${r.run_count}`));
       tbody.append(row);
@@ -115,17 +147,20 @@
     outcomes.append(node("h3", "settings-heading", "Runs"));
     const runs = node("table", "case-table");
     const runHead = node("thead"), runRow = node("tr");
-    for (const title of ["Run", "Seed", "Parallel attempts", "Passed", "Output tokens", "Model calls"]) runRow.append(node("th", "", title));
+    for (const title of ["Run", "Seed", "Parallel attempts", "Passed", "Cut off", "Output tokens", "Model calls"]) runRow.append(node("th", "", title));
     runHead.append(runRow); runs.append(runHead);
     const runBody = node("tbody");
     for (const run of r.runs) {
       const row = node("tr"), tokens = sum(run, "generated_tokens"), calls = sum(run, "model_calls");
       const over = run.cases.filter(c => overBudget(r, c)).length, tokenCell = node("td", "numeric", tokens == null ? "—" : fmt(tokens));
       if (over) tokenCell.append(budgetTag(r, over, `in ${over} of this run's ${run.cases.length} cases`));
+      const kinds = Object.keys(cutoffs).map(kind => [kind, run.cases.filter(c => c.cutoff === kind).length]).filter(([, n]) => n);
+      const cutCell = node("td", "numeric", `${run.cases.filter(c => c.cutoff).length}/${run.cases.length}`);
+      if (kinds.length) cutCell.title = kinds.map(([kind, n]) => `${cutoffs[kind].label(r)}: ${n}`).join(" · ");
       row.append(node("td", "case-id", `${run.created_at.slice(0, 10)} · ${run.run_id}`), node("td", "numeric", run.seed ?? "—"),
         node("td", "numeric", run.deployment?.parallel_attempts ?? 1),
         node("td", "numeric", `${run.cases.filter(c => c.passed).length}/${run.cases.length}`),
-        tokenCell, node("td", "numeric", calls == null ? "—" : fmt(calls)));
+        cutCell, tokenCell, node("td", "numeric", calls == null ? "—" : fmt(calls)));
       runBody.append(row);
     }
     runs.append(runBody); outcomes.append(runs);

@@ -136,7 +136,7 @@ defmodule Eab.Results do
     profile = model["profile"] || %{}
 
     record = %{
-      "schema_version" => 6,
+      "schema_version" => 7,
       "series_id" => series,
       "benchmark" => selected["id"],
       "model" => %{
@@ -198,7 +198,8 @@ defmodule Eab.Results do
                 "id" => id,
                 "passed" => attempt["grade"]["passed"],
                 "generated_tokens" => attempt["generated_tokens"],
-                "model_calls" => attempt["calls"]
+                "model_calls" => attempt["calls"],
+                "cutoff" => cutoff(attempt, settings["max_tokens"], model["backend"])
               }
             end),
           "resources" => resources
@@ -209,6 +210,33 @@ defmodule Eab.Results do
     }
 
     validate!(record)
+  end
+
+  @doc """
+  The budget that ended an attempt before the agent finished, or nil; the patch at that point
+  was graded. Claude Code cannot enforce the generation budget, so it is never cut off by it.
+  """
+  def cutoff(attempt, max_tokens, backend) do
+    case attempt["stop_reason"] do
+      "token_budget" ->
+        "generation_budget"
+
+      reason when reason in ~w(context_budget context_limit) ->
+        "context_budget"
+
+      reason when reason in ~w(response_budget response_limit) ->
+        "response_budget"
+
+      # Pi runs recorded before 2026-11-13 saved a final reply cut at the remaining generation
+      # budget as agent_completed. Local servers' replies are capped at that remainder, so
+      # reaching the budget exactly means the last one was cut; elsewhere it is a soft threshold.
+      _ ->
+        tokens = attempt["generated_tokens"]
+
+        if backend in ~w(llama_cpp strata) and is_integer(max_tokens) and is_integer(tokens) and
+             tokens >= max_tokens,
+           do: "generation_budget"
+    end
   end
 
   defp public_harness(%{"harness" => %{"name" => "claude_code"} = harness}) do
@@ -365,7 +393,7 @@ defmodule Eab.Results do
     require!(Enum.uniq(ids) == ids, "Duplicate series ID")
 
     payload = %{
-      "schema_version" => 6,
+      "schema_version" => 7,
       "benchmark" => %{"id" => inventory["id"], "case_count" => length(inventory["cases"])},
       "results" => Enum.map(records, &aggregate/1)
     }

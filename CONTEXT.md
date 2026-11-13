@@ -59,6 +59,10 @@ _Avoid_: repeats, trial set, epochs
 
 **Generation budget**: The cumulative tokens generated during an attempt, including reasoning and tool syntax.
 
+**Response budget**: The most tokens one model reply may generate.
+
+**Cutoff**: The budget that ended an attempt before the agent finished: generation, context or response. The patch at that point is graded, so a cut-off attempt may still pass.
+
 **Harness**: The coding-agent program, tool set and fixed instructions through which a model makes attempts. Pi and Claude Code are harnesses. Each run uses one harness; comparing runs across harnesses confounds the model with the harness.
 
 **Agent**: The pinned harness instance working on one attempt. A Pi agent runs inside the case workspace; a Claude Code agent works from outside it through tools confined to that workspace. The agent owns the model conversation; Elixir provides the workspace and grades its changes.

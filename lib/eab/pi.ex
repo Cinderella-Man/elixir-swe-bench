@@ -161,6 +161,7 @@ defmodule Eab.Pi do
       error: nil,
       settled: false,
       assistant: false,
+      last_stop: nil,
       exit_code: nil,
       snapshot: fn -> :ok end
     }
@@ -187,8 +188,8 @@ defmodule Eab.Pi do
             do: state,
             else: %{state | error: message["errorMessage"] || "Pi model response #{reason}"}
 
-        %{"type" => "message_end", "message" => %{"role" => "assistant"}} ->
-          %{state | assistant: true}
+        %{"type" => "message_end", "message" => %{"role" => "assistant"} = message} ->
+          %{state | assistant: true, last_stop: message["stopReason"]}
 
         %{"type" => "agent_settled", "aborted" => false} ->
           %{state | settled: true}
@@ -245,9 +246,21 @@ defmodule Eab.Pi do
         raise "Pi exited without completing an attempt; see pi-events.jsonl"
 
       true ->
-        summary(state, "agent_completed", measurement)
+        summary(state, settled_reason(state), measurement)
     end
   end
+
+  # Pi settles after a reply cut off at its token allowance, as if the agent had finished.
+  # The allowance is the remaining generation budget once that is below one response's limit.
+  defp settled_reason(%{last_stop: "length", settings: settings} = state) do
+    max = settings["max_tokens"]
+
+    if is_integer(max) and state.generated_tokens >= max,
+      do: "token_budget",
+      else: "response_budget"
+  end
+
+  defp settled_reason(_), do: "agent_completed"
 
   defp summary(state, reason, measurement) do
     %{
