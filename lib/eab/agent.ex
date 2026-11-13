@@ -93,10 +93,10 @@ defmodule Eab.Agent do
     #{TaskContract.instructions(spec)}
     Dependencies are prepared. The workspace is offline. Preserve existing behavior and do not weaken tests.
     #{if Eab.Browser.enabled?(spec), do: "Chromium and Playwright are preinstalled. Node tests can import process.env.EAB_BROWSER_MODULE. Bind any test web server to loopback and close browsers/servers after each suite.", else: ""}
-    Allowed edit prefixes: #{Enum.join(spec["allowed_edit_prefixes"], ", ")}.
+    Allowed edit prefixes: #{Enum.join(spec["allowed_edit_prefixes"], ", ")}. Changes anywhere else are discarded before grading.
     When finished, give a short summary. Your current patch is then checked in a fresh workspace.
     #{budget_instructions(settings)}
-    History is never compacted. If a budget is exhausted, the current patch is graded.
+    History is never compacted. #{exhaustion_instructions(settings)}
     Task details: #{Jason.encode!(spec["clarifications"] || %{})}
     """
   end
@@ -140,7 +140,18 @@ defmodule Eab.Agent do
     "Model and tool calls are unlimited. Limits: #{settings["max_tokens"]} generated tokens total, #{settings["window_tokens"]} context tokens including up to #{cap} response tokens."
   end
 
-  defp budget_instructions(settings) do
-    "Model and tool calls are unlimited. Limits: #{settings["max_tokens"]} generated tokens total and #{settings["window_tokens"]} context tokens."
+  # Runs made with a generation budget keep theirs too; later local runs have none (ADR 0016).
+  defp budget_instructions(%{"max_tokens" => budget} = settings) when is_integer(budget) do
+    "Model and tool calls are unlimited. Limits: #{budget} generated tokens total and #{settings["window_tokens"]} context tokens."
   end
+
+  defp budget_instructions(settings) do
+    "Model and tool calls are unlimited, and so are generated tokens. The only limit is the context window: #{settings["window_tokens"]} tokens for the whole conversation, your replies included."
+  end
+
+  defp exhaustion_instructions(%{"max_tokens" => budget}) when is_integer(budget),
+    do: "If a budget is exhausted, the current patch is graded."
+
+  defp exhaustion_instructions(_),
+    do: "When the context window is full, the current patch is graded."
 end

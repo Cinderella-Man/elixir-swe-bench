@@ -142,5 +142,18 @@ defmodule Eab.PiDockerTest do
     )
 
     assert Sandbox.command!(box, "cat extra.txt") == "patch-copy\n"
+
+    # The saved submission covers the case's edit area and top-level notes; whatever else
+    # the agent left in the workspace stays out of it.
+    Sandbox.command!(
+      box,
+      "mkdir -p lib logs && echo a > lib/a.ex && echo n > notes.md && " <>
+        "echo l > logs/out.log && echo b > stray.bin"
+    )
+
+    scoped = Sandbox.patch(Map.put(box, :spec, %{"allowed_edit_prefixes" => ["lib/", "none/"]}))
+    for kept <- ~w(b/lib/a.ex b/notes.md b/repair.txt), do: assert(scoped =~ kept)
+    for stray <- ~w(out.log stray.bin), do: refute(scoped =~ stray)
+    assert Sandbox.patch(box) =~ "b/logs/out.log"
   end
 end

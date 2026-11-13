@@ -116,39 +116,7 @@ defmodule Eab.Grader do
   end
 
   def validate_patch(patch, spec) do
-    blocks = String.split(patch, "diff --git ") |> Enum.drop(1)
-
-    touched =
-      blocks
-      |> Enum.flat_map(fn block ->
-        case OptionParser.split(hd(String.split(block, "\n"))) do
-          ["a/" <> a, "b/" <> b] -> Enum.uniq([a, b])
-          _ -> []
-        end
-      end)
-      |> Enum.frequencies()
-
-    auxiliary =
-      blocks
-      |> Enum.flat_map(fn block ->
-        lines = String.split(block, "\n")
-
-        case OptionParser.split(hd(lines)) do
-          [_, "b/" <> name] ->
-            if Enum.any?(
-                 Enum.take(lines, 4),
-                 &(&1 in ["new file mode 100644", "new file mode 100755"])
-               ) and
-                 touched[name] == 1 and Path.basename(name) == name and
-                 not String.starts_with?(name, ".") and
-                 Path.extname(name) in [".ex", ".exs", ".md", ".txt", ".json"],
-               do: [name],
-               else: []
-
-          _ ->
-            []
-        end
-      end)
+    auxiliary = auxiliary_files(patch)
 
     valid =
       byte_size(patch) <= 1_048_576 and
@@ -173,19 +141,100 @@ defmodule Eab.Grader do
     _ -> {:error, "unsupported_patch_header"}
   end
 
+  # New top-level source, script and note files, touched once: scratch work a solver may
+  # leave beside the project. They are tolerated wherever the case allows edits.
+  defp auxiliary_files(patch) do
+    blocks = String.split(patch, "diff --git ") |> Enum.drop(1)
+
+    touched =
+      blocks
+      |> Enum.flat_map(fn block ->
+        case OptionParser.split(hd(String.split(block, "\n"))) do
+          ["a/" <> a, "b/" <> b] -> Enum.uniq([a, b])
+          _ -> []
+        end
+      end)
+      |> Enum.frequencies()
+
+    Enum.flat_map(blocks, fn block ->
+      lines = String.split(block, "\n")
+
+      case OptionParser.split(hd(lines)) do
+        [_, "b/" <> name] ->
+          if Enum.any?(
+               Enum.take(lines, 4),
+               &(&1 in ["new file mode 100644", "new file mode 100755"])
+             ) and
+               touched[name] == 1 and Path.basename(name) == name and
+               not String.starts_with?(name, ".") and
+               Path.extname(name) in [".ex", ".exs", ".md", ".txt", ".json"],
+             do: [name],
+             else: []
+
+        _ ->
+          []
+      end
+    end)
+  end
+
   defp allowed?(name, spec, auxiliary) do
     not String.starts_with?(name, "/") and not Enum.any?(Path.split(name), &(&1 in ["..", "."])) and
       (name in auxiliary or
          Enum.any?(spec["allowed_edit_prefixes"], &String.starts_with?(name, &1)))
   end
 
+  @doc """
+  The part of a submitted patch inside the case's edit area, and the paths left out of it.
+  A change anywhere else is discarded, never applied: configuration stays as the case
+  prepared it, and a stray log or documentation edit does not decide the outcome. The kept
+  part still goes through `validate_patch/2`.
+  """
+  def scope_patch(patch, spec) when is_binary(patch) do
+    [preamble | blocks] = Regex.split(~r/^(?=diff --git )/m, patch)
+
+    auxiliary =
+      try do
+        auxiliary_files(patch)
+      rescue
+        _ -> []
+      end
+
+    {kept, dropped} =
+      Enum.split_with(blocks, fn block ->
+        case block_paths(block) do
+          # An unreadable header stays in, so validation rejects the patch as before.
+          [] -> true
+          paths -> Enum.all?(paths, &allowed?(&1, spec, auxiliary))
+        end
+      end)
+
+    {preamble <> Enum.join(kept), dropped |> Enum.flat_map(&block_paths/1) |> Enum.uniq()}
+  end
+
+  def scope_patch(patch, _spec), do: {patch, []}
+
+  defp block_paths("diff --git " <> rest) do
+    case OptionParser.split(hd(String.split(rest, "\n"))) do
+      ["a/" <> a, "b/" <> b] -> Enum.uniq([a, b])
+      _ -> []
+    end
+  rescue
+    _ -> []
+  end
+
+  defp block_paths(_), do: []
+
   def grade(id, patch, run_id, opts \\ []) do
     spec = Inventory.spec(id)
+    {patch, discarded} = scope_patch(patch, spec)
 
-    case validate_patch(patch, spec) do
-      {:error, reason} -> %{"passed" => false, "reason" => reason}
-      {:ok, auxiliary} -> do_grade(id, patch, run_id, opts, auxiliary)
-    end
+    result =
+      case validate_patch(patch, spec) do
+        {:error, reason} -> %{"passed" => false, "reason" => reason}
+        {:ok, auxiliary} -> do_grade(id, patch, run_id, opts, auxiliary)
+      end
+
+    Map.put(result, "discarded_files", discarded)
   end
 
   defp do_grade(id, patch, run_id, opts, auxiliary) do

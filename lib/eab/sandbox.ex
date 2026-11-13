@@ -172,17 +172,36 @@ defmodule Eab.Sandbox do
   # whole diff in the activity log each time. The snapshot stages into a copy of the
   # index, so the agent's own `git diff`, `git checkout` and `git stash` see its edits
   # as unstaged changes.
+  #
+  # The submission is what changed inside the case's edit area, plus top-level source,
+  # script and note files, which the grader sorts into kept and discarded. Anything else
+  # the agent left in the workspace, such as a log or a dump in another folder, is not part
+  # of it and cannot make the patch too large to save.
   def patch(box) do
     command!(
       box,
       ~S|index=$(mktemp -u) && trap 'rm -f "$index"' EXIT && | <>
         ~S|cp "$(git rev-parse --git-path index)" "$index" 2>/dev/null; | <>
-        ~S|export GIT_INDEX_FILE="$index" && git add -A && git diff --cached --binary HEAD|,
+        ~S|export GIT_INDEX_FILE="$index" && git add -A && git diff --cached --binary HEAD| <>
+        patch_scope(box[:spec]),
       limit: 1_048_576,
       timeout: 60,
       quiet: true
     )
   end
+
+  @doc false
+  def patch_scope(%{"allowed_edit_prefixes" => [_ | _] = prefixes}) do
+    " -- " <>
+      Enum.map_join(
+        prefixes ++ Enum.map(~w(ex exs md txt json), &":(glob)*.#{&1}"),
+        " ",
+        &Command.quote/1
+      )
+  end
+
+  # A workspace without a declared edit area, as in harness checks, is saved whole.
+  def patch_scope(_), do: ""
 
   def formatter(box) do
     copy_file(

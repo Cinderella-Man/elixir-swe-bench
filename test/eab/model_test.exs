@@ -53,6 +53,19 @@ defmodule Eab.ModelTest do
     refute Map.has_key?(Model.settings(endpoint(), %{"max_calls" => "32"}), "max_calls")
   end
 
+  test "a local run has no generation budget unless it is an older run's own" do
+    # The context window is the only limit (ADR 0016).
+    assert is_nil(Model.settings(endpoint())["max_tokens"])
+    assert is_nil(Model.settings(endpoint(), %{"max_tokens" => ""})["max_tokens"])
+    # A run made with a budget keeps it when it is resumed.
+    assert Model.settings(endpoint(), %{"max_tokens" => 65_536})["max_tokens"] == 65_536
+    assert Model.local?(endpoint())
+    assert Model.local?(%{"backend" => "strata"})
+    refute Model.local?(%{"backend" => "anthropic"})
+    refute Model.local?(%{"backend" => "openai_subscription"})
+    refute Model.local?(%{"backend" => "claude_code"})
+  end
+
   test "stream accounting includes cached input and rejects missing or excessive usage" do
     strata =
       "data: " <>

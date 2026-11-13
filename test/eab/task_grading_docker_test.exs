@@ -167,6 +167,18 @@ defmodule Eab.TaskGradingDockerTest do
         refute Grader.grade(id, reference, "synthetic-contract",
                  expected: control["reference_patch"]
                )["passed"]
+
+        # A stray file outside the edit area is discarded; the rest is graded as before.
+        stray =
+          "diff --git a/out.log b/out.log\nnew file mode 100644\n--- /dev/null\n+++ b/out.log\n@@ -0,0 +1 @@\n+noise\n"
+
+        graded =
+          Grader.grade(id, alternative <> reference_tests <> stray, "synthetic-contract",
+            expected: control["reference_patch"]
+          )
+
+        assert graded["passed"]
+        assert graded["discarded_files"] == ["out.log"]
       end)
     end
   end

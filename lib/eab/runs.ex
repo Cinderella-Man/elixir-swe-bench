@@ -41,7 +41,8 @@ defmodule Eab.Runs do
   Runs one case again, from scratch, on the connected endpoint. The source is a stopped run
   in this installation's history, or `{:series, series_id, run_id}`: a run of a published
   series, which any checkout has. The model, harness, case files and settings must match the
-  source's, and its seed is reused, but the new attempt has no per-reply cap (ADR 0015). The
+  source's, and its seed is reused, but the new attempt has no per-reply cap and, on a local
+  server, no generation budget (ADRs 0015 and 0016). The
   result is a separate, unpublishable partial run, so its outcome is merged by hand.
   """
   def rerun_case(source, case_id, endpoint, key),
@@ -169,8 +170,7 @@ defmodule Eab.Runs do
   def handle_call({:start, endpoint, key, settings, opts}, _from, state) do
     release = Release.freeze()
 
-    # A new run never caps a single reply (ADR 0015); a server that needs a value gets its maximum.
-    settings = Model.settings(endpoint, Map.delete(settings, "response_tokens"))
+    settings = Model.settings(endpoint, without_caps(endpoint, settings))
 
     run =
       release
@@ -281,12 +281,13 @@ defmodule Eab.Runs do
     unless origin.fixtures == release["protocol"]["fixtures"][case_id],
       do: raise("#{case_id} changed since that run; it cannot be run again for it")
 
-    # New attempts never cap a reply (ADR 0015); everything else matches the source run.
-    settings = Model.settings(endpoint, Map.delete(origin.settings, "response_tokens"))
+    # New attempts have no cap of their own (ADRs 0015 and 0016); everything else matches
+    # the source run.
+    caps = caps(endpoint)
+    settings = Model.settings(endpoint, Map.drop(origin.settings, caps))
 
-    unless Map.delete(settings, "response_tokens") ==
-             Map.delete(origin.settings, "response_tokens"),
-           do: raise("This endpoint's settings differ from that run's; connect the same model")
+    unless Map.drop(settings, caps) == Map.drop(origin.settings, caps),
+      do: raise("This endpoint's settings differ from that run's; connect the same model")
 
     run = new_run(release, endpoint, settings)
     same_model!(run, origin.setup)
@@ -320,8 +321,8 @@ defmodule Eab.Runs do
       do: raise("This run cannot be resumed")
 
     if run["cleanup_pending"] == true, do: raise("Container cleanup must finish before resume")
-    # The per-reply cap is no longer a choice (ADR 0015); a resumed run keeps its own.
-    settings = Map.put(settings, "response_tokens", run["settings"]["response_tokens"])
+    # A local run's caps are no longer a choice (ADRs 0015 and 0016); a resumed run keeps its own.
+    settings = Map.merge(settings, Map.take(run["settings"], caps(endpoint)))
     Checkpoints.validate_run!(run, endpoint, Model.settings(endpoint, settings))
     plan = Checkpoints.plan(run)
 
@@ -540,6 +541,14 @@ defmodule Eab.Runs do
 
     {"case_repeat", Enum.filter(source["cases"], &(&1 in cases))}
   end
+
+  # The settings a new local attempt never takes: a per-reply cap (ADR 0015) and a generation
+  # budget (ADR 0016). Hosted models keep their generated-token threshold, so only the
+  # per-reply value is dropped for them.
+  defp caps(endpoint),
+    do: if(Model.local?(endpoint), do: ~w(response_tokens max_tokens), else: ~w(response_tokens))
+
+  defp without_caps(endpoint, settings), do: Map.drop(settings, caps(endpoint))
 
   # What a case run again must match, from a run in this history or a published series run.
   defp rerun_origin({:series, series_id, run_id}, case_id) do

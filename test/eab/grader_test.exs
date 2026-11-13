@@ -169,6 +169,57 @@ defmodule Eab.GraderTest do
     assert {:ok, []} = Grader.validate_patch("diff --git a/lib/x.ex b/lib/x.ex\n", spec)
   end
 
+  test "changes outside the edit area are discarded, not grounds for rejecting the rest" do
+    spec = %{"allowed_edit_prefixes" => ["lib/", "test/", "CHANGELOG.md"]}
+
+    block = fn path, mode ->
+      "diff --git a/#{path} b/#{path}\n#{mode}--- a/#{path}\n+++ b/#{path}\n@@ -1 +1 @@\n-old\n+new\n"
+    end
+
+    kept = block.("lib/x.ex", "") <> block.("test/x_test.exs", "") <> block.("CHANGELOG.md", "")
+    # A text that merely quotes a diff header is content, not a new file section.
+    quoting = block.("lib/doc.ex", "") <> "+  # diff --git a/config/c.exs b/config/c.exs\n"
+
+    stray =
+      block.("README.md", "") <>
+        block.("config/config.exs", "") <>
+        block.("out.log", "new file mode 100644\n") <>
+        block.("tmp/scratch.exs", "new file mode 100644\n")
+
+    note = block.("notes.md", "new file mode 100644\n")
+
+    assert {patch, discarded} = Grader.scope_patch(kept <> stray <> quoting <> note, spec)
+    assert patch == kept <> quoting <> note
+    assert discarded == ~w(README.md config/config.exs out.log tmp/scratch.exs)
+    # What is kept satisfies the strict rule; the stray files alone would have failed it.
+    assert {:ok, ["notes.md"]} = Grader.validate_patch(patch, spec)
+    assert {:error, _} = Grader.validate_patch(kept <> stray, spec)
+
+    # Nothing to discard leaves the patch byte for byte, the empty patch included.
+    assert Grader.scope_patch(kept, spec) == {kept, []}
+    assert Grader.scope_patch("", spec) == {"", []}
+
+    # A path that escapes the workspace is never applied either.
+    assert {"", ["../secret"]} = Grader.scope_patch(block.("../secret", ""), spec)
+
+    # A link inside the edit area is still a reason to reject the submission.
+    link = "diff --git a/lib/l b/lib/l\nnew file mode 120000\n"
+    assert {^link, []} = Grader.scope_patch(link, spec)
+    assert {:error, _} = Grader.validate_patch(link, spec)
+  end
+
+  test "the saved submission covers the edit area and top-level notes only" do
+    scope = Eab.Sandbox.patch_scope(%{"allowed_edit_prefixes" => ["lib/", "it's/", "mix.exs"]})
+
+    assert scope ==
+             " -- 'lib/' 'it'\\''s/' 'mix.exs' ':(glob)*.ex' ':(glob)*.exs' ':(glob)*.md' " <>
+               "':(glob)*.txt' ':(glob)*.json'"
+
+    # A workspace without a declared edit area is saved whole.
+    assert Eab.Sandbox.patch_scope(nil) == ""
+    assert Eab.Sandbox.patch_scope(%{"allowed_edit_prefixes" => []}) == ""
+  end
+
   test "all retained PR reference patches satisfy edit rules and have partial controls" do
     ids = Eab.Inventory.all()
     assert ids != []

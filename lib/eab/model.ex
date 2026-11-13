@@ -115,24 +115,33 @@ defmodule Eab.Model do
         endpoint["context"]
       )
 
-    # No reply has a cap of its own (ADR 0015). Runs made with one keep it, so their retries
-    # and resumes reproduce it; Runs.start never passes one. The benchmark definition's old
-    # response_tokens default stays unread, because changing that file blocks earlier retries.
+    # The context window is a local attempt's only limit: no reply has a cap of its own
+    # (ADR 0015) and the attempt has no generation budget (ADR 0016). Runs made with either
+    # keep it, so their resumes reproduce it; Runs.start never passes one.
     response =
       if input["response_tokens"] in [nil, ""],
         do: nil,
         else: integer(input, "response_tokens", nil, 1, window - 9)
 
+    budget =
+      if input["max_tokens"] in [nil, ""],
+        do: nil,
+        else: integer(input, "max_tokens", nil, 1, 10_000_000)
+
     %{
       "window_tokens" => window,
       "response_tokens" => response,
       "safety_tokens" => 8,
-      "max_tokens" => integer(input, "max_tokens", defaults["max_tokens"], 1, 10_000_000),
+      "max_tokens" => budget,
       "seed" => integer(input, "seed", defaults["seed"], 0, 2_147_483_647),
       "compaction" => false
     }
     |> Map.merge(Eab.Thinking.settings(endpoint, input))
   end
+
+  @doc "A model server the gateway counts and limits itself: llama.cpp or Strata."
+  def local?(endpoint),
+    do: endpoint["backend"] not in ~w(openai_subscription anthropic claude_code)
 
   def count(endpoint, key, payload) do
     route =

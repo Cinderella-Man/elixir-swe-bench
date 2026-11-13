@@ -84,11 +84,15 @@ defmodule Eab.Pi do
                 "input" => ["text"],
                 # Pi requires numeric bookkeeping values. Subscription requests remove its
                 # output cap; compaction is off and these are not provider capacity claims.
-                # A local reply without a per-reply cap may use the whole generation budget.
+                # A local reply has no cap of its own: the gateway bounds it by the context
+                # window, or by an older run's generation budget.
                 "contextWindow" => settings["window_tokens"] || 262_144,
                 "maxTokens" =>
                   settings["response_tokens"] ||
-                    if(subscription, do: 8192, else: settings["max_tokens"]),
+                    if(subscription,
+                      do: 8192,
+                      else: settings["max_tokens"] || settings["window_tokens"]
+                    ),
                 "cost" => %{"input" => 0, "output" => 0, "cacheRead" => 0, "cacheWrite" => 0}
               }
             ]
@@ -98,7 +102,10 @@ defmodule Eab.Pi do
       "settings" => %{
         "compaction" => %{"enabled" => false},
         "retry" => %{"enabled" => false, "provider" => %{"maxRetries" => 0}},
-        "httpIdleTimeoutMs" => 1_260_000,
+        # The bridge hands Pi each reply in one piece, so Pi's HTTP timeout would bound a
+        # whole reply's generation. 0 disables it: the gateway always answers, with the reply
+        # or with an error once the model server has been silent for 20 minutes.
+        "httpIdleTimeoutMs" => 0,
         "cacheWarming" => "off",
         "images" => %{"blockImages" => true},
         "defaultProjectTrust" => "never",
@@ -255,8 +262,8 @@ defmodule Eab.Pi do
   end
 
   # Pi settles after a reply cut off at its token allowance, as if the agent had finished.
-  # A local server's allowance is bounded by the generation budget or the context window left,
-  # or by an older run's per-reply cap; the gateway records which (ADR 0015).
+  # A local server's allowance is bounded by the context window left, or by an older run's
+  # generation budget or per-reply cap; the gateway records which (ADRs 0015 and 0016).
   defp settled_reason(%{last_stop: "length", reply_bound: bound}) when is_binary(bound) do
     case bound do
       "generation" -> "token_budget"

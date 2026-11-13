@@ -300,7 +300,7 @@ defmodule Eab.PiTest do
     assert finish.("length", 100, nil) == "token_budget"
   end
 
-  test "without a per-reply cap a reply may use the budget and context room left", %{
+  test "a run made with a generation budget may use what is left of it and of the context", %{
     prefix: prefix
   } do
     parent = self()
@@ -373,6 +373,94 @@ defmodule Eab.PiTest do
     assert stopped.stop_reason == "context_budget"
     assert stopped.calls == 2
     refute_receive {:allowance, _}
+  end
+
+  test "a local run has no generation budget: only the context window ends a reply", %{
+    prefix: prefix
+  } do
+    parent = self()
+    model = endpoint("llama_cpp")
+    settings = Model.settings(model)
+    assert is_nil(settings["max_tokens"])
+    assert is_nil(settings["response_tokens"])
+    window = settings["window_tokens"]
+
+    config = Pi.config(model, settings, "", "")
+    # Pi needs a number for its bookkeeping; the gateway sets each reply's real limit.
+    assert hd(config["models"]["providers"]["benchmark"]["models"])["maxTokens"] == window
+    # The bridge delivers a reply in one piece, so Pi must not time a whole reply out.
+    assert config["settings"]["httpIdleTimeoutMs"] == 0
+
+    frame = %{
+      "type" => "request",
+      "id" => "1",
+      "method" => "POST",
+      "path" => "/v1/chat/completions",
+      "body" => %{"messages" => [%{"role" => "user", "content" => "ticket"}], "tools" => []}
+    }
+
+    serve = fn count ->
+      Application.put_env(:eab, :http_request, fn opts ->
+        if String.ends_with?(opts[:url], "tokens") do
+          {:ok, %{status: 200, body: %{"input_tokens" => count}}}
+        else
+          allowance = opts[:json]["max_tokens"]
+          send(parent, {:allowance, allowance})
+
+          body =
+            sse([
+              %{
+                "id" => "synthetic",
+                "choices" => [
+                  %{
+                    "index" => 0,
+                    "delta" => %{"role" => "assistant", "reasoning_content" => "Still thinking"},
+                    "finish_reason" => "length"
+                  }
+                ],
+                "usage" => %{"prompt_tokens" => count, "completion_tokens" => allowance}
+              }
+            ]) <> "data: [DONE]\n\n"
+
+          {:ok, %{status: 200, body: body}}
+        end
+      end)
+    end
+
+    # However much the attempt has generated, the next reply gets all the room left.
+    state = Pi.state(model, "", settings, prefix, fn _ -> :ok end, false)
+    state = %{state | generated_tokens: 5_000_000}
+
+    serve.(42)
+    {reply, state} = PiGateway.request(frame, state)
+    assert reply["status"] == 200
+    assert_receive {:allowance, allowance}
+    assert allowance == window - 42 - 8
+    assert state.reply_bound == "context"
+    assert state.generated_tokens == 5_000_000 + allowance
+    assert Store.read("#{prefix}/request-0000.json")["max_tokens"] == allowance
+
+    # A reply cut there ends the attempt as a context cutoff, never a generation one.
+    cut = %{state | settled: true, assistant: true, last_stop: "length", exit_code: 0}
+    assert Pi.finish(%{"state" => cut, "returncode" => 0})["stop_reason"] == "context_budget"
+
+    serve.(window - 8)
+    {reply, stopped} = PiGateway.request(frame, state)
+    assert reply["status"] == 429
+    assert stopped.stop_reason == "context_budget"
+    refute_receive {:allowance, _}
+
+    # The agent is told the one limit it has, and what happens to edits outside its area.
+    spec = Eab.Inventory.spec(hd(Eab.Inventory.all()))
+    instructions = Eab.Agent.instructions(spec, settings)
+    assert instructions =~ "The only limit is the context window: #{window} tokens"
+    assert instructions =~ "When the context window is full, the current patch is graded."
+    assert instructions =~ "Changes anywhere else are discarded before grading."
+    refute instructions =~ "generated tokens total"
+
+    budgeted = Eab.Agent.instructions(spec, Model.settings(model, %{"max_tokens" => 65_536}))
+    assert budgeted =~ "Limits: 65536 generated tokens total and #{window} context tokens."
+    assert budgeted =~ "If a budget is exhausted, the current patch is graded."
   end
 
   test "the bash watchdog kills a command that never exits and Pi continues", %{prefix: prefix} do
@@ -491,6 +579,7 @@ defmodule Eab.PiTest do
   } do
     model = endpoint("llama_cpp")
     settings = Model.settings(model)
+    assert is_nil(settings["max_tokens"])
 
     frame = %{
       "type" => "request",
@@ -506,8 +595,9 @@ defmodule Eab.PiTest do
       flunk("Budget must prevent network access")
     end)
 
-    {reply, stopped} =
-      PiGateway.request(frame, %{state | generated_tokens: settings["max_tokens"]})
+    # A run made with a generation budget keeps it, as when it is resumed.
+    budgeted = %{state | settings: Model.settings(model, %{"max_tokens" => 100})}
+    {reply, stopped} = PiGateway.request(frame, %{budgeted | generated_tokens: 100})
 
     assert reply["status"] == 429
     assert stopped.stop_reason == "token_budget"

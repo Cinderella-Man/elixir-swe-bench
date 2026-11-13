@@ -20,9 +20,9 @@ defmodule EabWeb.DashboardLive do
 
   alias Eab.ClaudeCode.Broker
 
+  # A local run has no generated-token setting: the context window is its only limit (ADR 0016).
   @defaults %{
     "window_tokens" => "",
-    "max_tokens" => "65536",
     "seed" => "101",
     "reasoning_effort" => ""
   }
@@ -1443,7 +1443,7 @@ defmodule EabWeb.DashboardLive do
                 <summary>Advanced run settings</summary>
                 <p :if={@provider == "local"} class="fine-print">
                   Defaults use the detected context up to 262,144 tokens. Full history is retained.
-                  Model and tool calls are unlimited.
+                  Model and tool calls are unlimited. So are generated tokens: an attempt ends when the agent finishes or the context is full.
                 </p>
                 <p :if={@provider == "chatgpt"} class="fine-print">
                   Full history is retained. The generated-token threshold is checked between completed responses and can be exceeded by one response. OpenAI controls context and response limits; seed and strict response caps are unavailable. Reasoning tokens count toward the threshold.
@@ -1473,7 +1473,6 @@ defmodule EabWeb.DashboardLive do
                         _ ->
                           [
                             {"window_tokens", "Context tokens (blank = automatic)"},
-                            {"max_tokens", "Generated tokens per case"},
                             {"seed", "Seed"}
                           ]
                       end
@@ -1781,7 +1780,7 @@ defmodule EabWeb.DashboardLive do
                       Run this case again
                     </button>
                     <p class="fine-print">
-                      A new one-case run on the connected model, with this run's settings but no per-reply cap (ADR 0015). It is never published; compare or merge its result by hand.
+                      A new one-case run on the connected model, with this run's settings but no per-reply cap or generation budget (ADRs 0015 and 0016). It is never published; compare or merge its result by hand.
                     </p>
                     <p :if={match?({^id, _}, @rerun_error)} class="notice error" role="alert">
                       {elem(@rerun_error, 1)}
@@ -1819,6 +1818,19 @@ defmodule EabWeb.DashboardLive do
                         "settings"
                       ]["window_tokens"]} tokens.</span>
                       Prompt tokens include conversation history and tool output; the generation budget counts model output.
+                    </p>
+                    <p
+                      :if={
+                        @case_attempt && @case_attempt["status"] in ["completed", "error"] &&
+                          is_integer(@case_attempt["generated_tokens"]) &&
+                          is_nil(@run["settings"]["max_tokens"]) &&
+                          is_integer(@run["settings"]["window_tokens"])
+                      }
+                      id="case-tokens"
+                      class="fine-print"
+                    >
+                      Generated tokens: {@case_attempt["generated_tokens"]}, with no budget of their own.
+                      Context limit: {@run["settings"]["window_tokens"]} tokens for the whole conversation.
                     </p>
                     <p
                       :if={get_in(@run, ["case_phases", @log_case]) == "qualifying"}
@@ -2267,7 +2279,7 @@ defmodule EabWeb.DashboardLive do
               Run this case again
             </button>
             <p class="fine-print">
-              A one-case run on the connected model with this series' settings and that run's seed, but no per-reply cap (ADR 0015). Cut-off cases are listed first. It is never published; merge its result by hand.
+              A one-case run on the connected model with this series' settings and that run's seed, but no per-reply cap or generation budget (ADRs 0015 and 0016). Cut-off cases are listed first. It is never published; merge its result by hand.
             </p>
             <p
               :if={rerun_error_for(@rerun_error, series["series_id"])}

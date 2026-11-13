@@ -20,7 +20,10 @@ defmodule Eab.PiGateway do
       state.stop_reason ->
         stopped(frame, state, state.stop_reason)
 
-      state.generated_tokens >= state.settings["max_tokens"] ->
+      # Local runs have no generation budget (ADR 0016); hosted runs and older local
+      # runs stop here once theirs is spent.
+      is_integer(state.settings["max_tokens"]) and
+          state.generated_tokens >= state.settings["max_tokens"] ->
         stopped(frame, state, "token_budget")
 
       true ->
@@ -102,10 +105,12 @@ defmodule Eab.PiGateway do
   end
 
   defp exchange(frame, state) do
-    remaining = state.settings["max_tokens"] - state.generated_tokens
+    budget = state.settings["max_tokens"]
+    remaining = if is_integer(budget), do: budget - state.generated_tokens
     cap = state.settings["response_tokens"]
 
-    # Preserve Pi's complete messages/tools. Freeze only declared generation settings.
+    # Preserve Pi's complete messages/tools. Freeze only declared generation settings. The
+    # reply limit is provisional until the prompt is counted: the context window bounds it.
     payload =
       frame["body"]
       |> Map.drop([
@@ -117,7 +122,8 @@ defmodule Eab.PiGateway do
       |> Map.merge(%{
         "model" => state.endpoint["model"],
         "stream" => true,
-        "max_tokens" => if(cap, do: min(cap, remaining), else: remaining),
+        "max_tokens" =>
+          Enum.min(Enum.filter([cap, remaining, state.settings["window_tokens"]], & &1)),
         "seed" => state.settings["seed"]
       })
       |> Eab.Thinking.payload(state.settings)
@@ -152,8 +158,9 @@ defmodule Eab.PiGateway do
         Activity.note(
           "Model call #{state.calls}: #{count} prompt tokens " <>
             "(context limit #{state.settings["window_tokens"]}). " <>
-            "Generated so far: #{state.generated_tokens}/#{state.settings["max_tokens"]} tokens. " <>
-            "Waiting for model response…"
+            "Generated so far: #{state.generated_tokens}" <>
+            if(is_integer(budget), do: "/#{budget}", else: "") <>
+            " tokens. Waiting for model response…"
         )
 
         {body, timing} = Model.stream(state.endpoint, state.key, payload)
@@ -179,24 +186,28 @@ defmodule Eab.PiGateway do
     end
   end
 
-  # A reply may use whatever is left of the generation budget and of the context window after
-  # the prompt (ADR 0015); the model is stopped only when the prompt leaves no room. Runs made
-  # with a per-reply cap keep it and still reserve room for a full capped reply before a call.
-  # The bound names the limit that ends the reply if it stops for length.
+  # A reply may use the room the prompt leaves in the context window (ADRs 0015 and 0016);
+  # the model is stopped only when the prompt leaves no room. A run made with a generation
+  # budget is also bounded by what is left of it. Runs made with a per-reply cap keep it and
+  # still reserve room for a full capped reply before a call. The bound names the limit that
+  # ends the reply if it stops for length.
   defp reply_limit(%{"response_tokens" => cap} = settings, remaining, count)
        when is_integer(cap) do
-    allowance = min(cap, remaining)
+    allowance = if is_integer(remaining), do: min(cap, remaining), else: cap
 
     cond do
       count + allowance + settings["safety_tokens"] > settings["window_tokens"] -> {0, "context"}
-      remaining <= cap -> {allowance, "generation"}
+      is_integer(remaining) and remaining <= cap -> {allowance, "generation"}
       true -> {allowance, "response"}
     end
   end
 
   defp reply_limit(settings, remaining, count) do
     room = settings["window_tokens"] - count - settings["safety_tokens"]
-    if room < remaining, do: {room, "context"}, else: {remaining, "generation"}
+
+    if is_integer(remaining) and remaining <= room,
+      do: {remaining, "generation"},
+      else: {room, "context"}
   end
 
   defp stopped(frame, state, reason) do

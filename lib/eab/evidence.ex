@@ -65,7 +65,8 @@ defmodule Eab.Evidence do
       "passed" => grade["passed"] == true,
       "reason" => grade["reason"],
       "checks" => checks,
-      "submitted_test_files" => grade["submitted_test_files"] || []
+      "submitted_test_files" => grade["submitted_test_files"] || [],
+      "discarded_files" => grade["discarded_files"] || []
     }
   end
 

@@ -87,8 +87,9 @@
   const context = r => r.settings.window_tokens ? `${fmt(r.settings.window_tokens)} context` : "API";
   const sum = (run, key) => run.cases.every(c => Number.isInteger(c[key])) ? run.cases.reduce((n, c) => n + c[key], 0) : null;
   // A local run without a per-reply cap records none (ADR 0015); API runs leave it to the provider.
+  // Local series cap neither a reply (ADR 0015) nor an attempt's generated tokens (ADR 0016).
   const settingValue = (r, key, value) =>
-    key === "response_tokens" && value == null && r.settings.window_tokens ? "No cap" : readable(value);
+    ["response_tokens", "max_tokens"].includes(key) && value == null && r.settings.window_tokens ? "No cap" : readable(value);
   const readable = value => value == null ? "Not recorded" : typeof value === "boolean" ? (value ? "Enabled" : "Disabled") :
     typeof value === "number" ? fmt(value) : value.replaceAll("_", " ");
   // Only a run's sampled peak is a measurement; a loaded-model snapshot is not a run's requirement.

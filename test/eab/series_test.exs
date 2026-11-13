@@ -54,7 +54,8 @@ defmodule Eab.SeriesTest do
         "implementation" => String.duplicate("b", 64),
         "fixtures" => Map.new(cases, &{&1, Results.fixture_hashes(&1)})
       },
-      "settings" => %{"max_tokens" => 65_536, "window_tokens" => 262_144, "seed" => seed},
+      # A local run has no generation budget (ADR 0016).
+      "settings" => %{"max_tokens" => nil, "window_tokens" => 262_144, "seed" => seed},
       "attempts" =>
         cases
         |> Enum.zip(outcomes ++ List.duplicate(true, length(cases)))
@@ -291,6 +292,28 @@ defmodule Eab.SeriesTest do
     plain = run("plain", 101, [])
     Results.publish!(plain, page_root: page)
     assert is_nil(Series.closed_reason(Results.series!(Series.id(plain))))
+  end
+
+  test "a local series made with a generation budget takes no more runs", %{page: page} do
+    budgeted = put_in(run("first", 101, [false]), ["settings", "max_tokens"], 65_536)
+    Results.publish!(budgeted, page_root: page)
+    id = Series.id(budgeted)
+    refute id == Series.id(run("first", 101, [false]))
+    assert Series.closed_reason(Results.series!(id)) =~ "65536-token generation budget"
+
+    next = budgeted |> Map.put("id", "next") |> put_in(["settings", "seed"], 102)
+
+    assert_raise RuntimeError, ~r/takes no more runs/, fn ->
+      Series.contribution!(next, id)
+    end
+
+    # A hosted series keeps its generated-token threshold and stays open.
+    hosted =
+      run("hosted", 101, [])
+      |> put_in(["model", "backend"], "anthropic")
+      |> put_in(["settings"], %{"max_tokens" => 262_144, "seed" => nil})
+
+    refute Series.closed_reason(%{"setup" => Series.setup(hosted)})
   end
 
   test "contributions must match the published setup and use a missing seed", %{page: page} do

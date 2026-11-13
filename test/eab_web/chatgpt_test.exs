@@ -44,7 +44,9 @@ defmodule EabWeb.ChatGPTTest do
 
   test "switching providers preserves each provider's entered settings" do
     {:ok, view, _} = live(build_conn(), "/")
-    view |> form("#settings", settings: %{max_tokens: "12345"}) |> render_change()
+    # A local run has no generated-token setting (ADR 0016); its seed is one it does have.
+    refute has_element?(view, "input[name='settings[max_tokens]']")
+    view |> form("#settings", settings: %{seed: "12345"}) |> render_change()
 
     view |> form("#provider-choice", provider: "chatgpt") |> render_change()
 
@@ -52,7 +54,8 @@ defmodule EabWeb.ChatGPTTest do
     view |> form("#settings", settings: %{max_tokens: "300000"}) |> render_change()
     view |> form("#provider-choice", provider: "local") |> render_change()
     render_async(view)
-    assert has_element?(view, "input[name='settings[max_tokens]'][value='12345']")
+    assert has_element?(view, "input[name='settings[seed]'][value='12345']")
+    refute has_element?(view, "input[name='settings[max_tokens]']")
 
     view |> form("#provider-choice", provider: "chatgpt") |> render_change()
 

@@ -53,15 +53,17 @@ _Avoid_: repeats, trial set, epochs
 
 **Waiting workspace**: A pristine workspace held ready for a coming attempt, before the agent's investigation begins. Attempts start in case order and may finish in any order.
 
-**Submission**: The saved patch produced by an attempt and handed to the grader.
+**Submission**: The saved patch produced by an attempt and handed to the grader. It holds what the attempt changed inside the case's edit area.
+
+**Edit area**: The path prefixes a case allows a solver to change. Changes outside it are discarded before grading.
 
 **Context budget**: The maximum combined input and response space for one model interaction, including a small safety allowance.
 
-**Generation budget**: The cumulative tokens generated during an attempt, including reasoning and tool syntax.
+**Generation budget**: The most tokens an attempt may generate in total, including reasoning and tool syntax. Hosted models have one, as a threshold checked between replies. Local attempts have none since 2026-11-13: only the context budget limits them.
 
-**Response budget**: The most tokens one model reply may generate. Only local series made before 2026-11-13 have one; since then a reply is limited only by the generation and context budgets.
+**Response budget**: The most tokens one model reply may generate. Only local series made before 2026-11-13 have one; since then a local reply is limited only by the context budget.
 
-**Cutoff**: The budget that ended an attempt before the agent finished: generation, context or, in older local series, response. The patch at that point is graded, so a cut-off attempt may still pass.
+**Cutoff**: The budget that ended an attempt before the agent finished: context, generation where a run has that budget or, in older local series, response. The patch at that point is graded, so a cut-off attempt may still pass.
 
 **Harness**: The coding-agent program, tool set and fixed instructions through which a model makes attempts. Pi and Claude Code are harnesses. Each run uses one harness; comparing runs across harnesses confounds the model with the harness.
 

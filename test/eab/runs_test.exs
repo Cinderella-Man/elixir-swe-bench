@@ -260,11 +260,16 @@ defmodule Eab.RunsTest do
     assert message =~ "No evaluation errors"
   end
 
-  test "a case runs again on the connected model with the source settings but no reply cap" do
+  test "a case runs again on the connected model with the source settings but no caps" do
     parent = self()
     Runs.subscribe()
     {source, [_passed, failed | _]} = partial_source()
-    capped = put_in(source, ["settings", "response_tokens"], 8192)
+
+    capped =
+      source
+      |> put_in(["settings", "response_tokens"], 8192)
+      |> put_in(["settings", "max_tokens"], 65_536)
+
     Store.write("runs/source/run.json", capped)
     original = source_files()
 
@@ -291,10 +296,12 @@ defmodule Eab.RunsTest do
     assert run["id"] == id and run["cases"] == [failed] and plan.restart == [failed]
     assert run["selection"]["kind"] == "case_rerun"
     assert run["selection"]["source_run"] == "source"
+    # A local attempt has neither a per-reply cap nor a generation budget (ADRs 0015, 0016).
     assert is_nil(run["settings"]["response_tokens"])
+    assert is_nil(run["settings"]["max_tokens"])
 
-    assert Map.delete(run["settings"], "response_tokens") ==
-             Map.delete(source["settings"], "response_tokens")
+    assert Map.drop(run["settings"], ~w(response_tokens max_tokens)) ==
+             Map.drop(source["settings"], ~w(response_tokens max_tokens))
 
     assert :ok = Eab.Checkpoints.validate_run!(run, endpoint(), run["settings"])
     assert {:error, _} = Runs.rerun_case("source", failed, endpoint(), "")

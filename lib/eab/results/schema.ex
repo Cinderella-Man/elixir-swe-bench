@@ -3,8 +3,9 @@ defmodule Eab.Results.Schema do
   @fields ~w(schema_version series_id benchmark model harness settings setup case_fixtures seeds required_runs runs evidence_url note)
   @run_fields ~w(run_id created_at seed source_release_id code_version deployment cases resources)
   @model_fields ~w(name backend quantization quantization_source size_bytes size_source parameter_count quantized_by quantized_by_source)
-  @nullable_int ~w(window_tokens response_tokens)
-  @integer ~w(safety_tokens max_tokens)
+  # A local series made since ADR 0016 has no generation budget, so its max_tokens is null.
+  @nullable_int ~w(window_tokens response_tokens max_tokens)
+  @integer ~w(safety_tokens)
   @text ~w(budget_policy context_policy reasoning_effort reasoning_effort_source thinking_policy)
   @cutoffs ~w(generation_budget context_budget response_budget)
   @thinking %{
