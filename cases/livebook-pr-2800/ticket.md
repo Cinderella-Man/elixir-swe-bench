@@ -1,1 +1,1 @@
-An Erlang cell with a syntax error shows an ArgumentError instead of the actual error; fix it.
+An Erlang cell with a syntax error shows an ArgumentError instead of the actual error; fix it, including when the offending code contains non-ASCII characters.
