@@ -93,6 +93,8 @@ For multiple required runs, compare releases/experiments, model/settings, agent 
 
 Read every submitted patch for correctness, weakened tests and grader shortcuts. A valid implementation may differ from the reference or touch fewer files. Preserve all patches, reviews and sanitized result summaries in the case's verification directory, including earlier unsuccessful attempts and amendments.
 
+Write the case's summary page, `docs/cases/<case-id>.md`, following the existing pages. It gives the title, kind and project, two to four sentences on the problem (not the fix), and links to the ticket, case files and upstream pull request. Add a row to `docs/cases/README.md`. The results page links each case name to this page, and its build refuses a case without one. Keep the page outside the case folder: every file in that folder is a fixture.
+
 Once those gates pass, move the **unchanged complete bundle** from `cases/<case-id>/` to `cases_approved/<case-id>/` while the controller is idle. For a migration, preserve the old held bundle outside both active/approved folders before parking its reviewed replacement; do not merge directories. Record bundle hashes and approved status. For a multi-case batch, commit/push the checkpoint on its curation branch, rebuild the controller before the next run, and continue with the next requested candidate. Stop at the requested scope; finishing one candidate does not authorize an open-ended queue.
 
 ## 6. Restore the inventory and finish the branch

@@ -373,10 +373,23 @@ defmodule Eab.Results do
     end)
   end
 
+  @doc """
+  Cases without the summary page the results page links each case name to. It lives in
+  docs/cases/, outside the case folder, so writing it changes no case fixture.
+  """
+  def missing_case_pages(cases),
+    do: Enum.reject(cases, &File.regular?(Eab.Inventory.path("docs/cases/#{&1}.md")))
+
   def build!(records, destination \\ Path.join(root(), "dist"), opts \\ []) do
     page = opts[:page_root] || root()
     inventory = opts[:inventory] || Eab.Inventory.definition()
     expected = Map.new(inventory["cases"], &{&1, fixture_hashes(&1, opts[:case_root])})
+    missing = missing_case_pages(inventory["cases"])
+
+    require!(
+      missing == [],
+      "Write a summary page in docs/cases/ for: #{Enum.join(missing, ", ")}"
+    )
 
     for record <- records do
       validate!(record)

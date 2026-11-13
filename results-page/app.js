@@ -68,6 +68,16 @@
         "response limit before the agent had finished, which ended the attempt",
     },
   };
+  // Each case name links to its summary page in the repository, when the page was built with one.
+  const repository = document.querySelector('nav[aria-label="Links"] a')?.getAttribute("href") || "";
+  const caseName = id => {
+    if (!repository.startsWith("https://github.com/")) return id;
+    const link = node("a", "", id);
+    link.href = `${repository}/blob/main/docs/cases/${encodeURIComponent(id)}.md`;
+    link.target = "_blank"; link.rel = "noopener";
+    link.title = "What this case asks for, its ticket and its files";
+    return link;
+  };
   const cutoffTag = (r, kind, n, where) => {
     const tag = node("span", "cutoff-tag", cutoffs[kind].label(r) + (n > 1 ? ` ×${n}` : ""));
     tag.title = `${where}, ${cutoffs[kind].text(r)}. The patch at that point was graded.`;
@@ -136,7 +146,8 @@
     head.append(hr); table.append(head);
     const tbody = node("tbody");
     for (const c of r.runs[0].cases) {
-      const row = node("tr"), count = r.case_passes[c.id], name = node("td", "case-id", c.id);
+      const row = node("tr"), count = r.case_passes[c.id], name = node("td", "case-id");
+      name.append(caseName(c.id));
       const tries = r.runs.map(run => run.cases.find(other => other.id === c.id));
       const over = tries.filter(t => overBudget(r, t)).length;
       if (over) name.append(budgetTag(r, over, `in ${over} of ${r.run_count} runs`));

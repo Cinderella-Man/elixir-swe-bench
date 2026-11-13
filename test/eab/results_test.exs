@@ -641,4 +641,9 @@ defmodule Eab.ResultsTest do
 
     page
   end
+
+  test "every current case has the summary page its name links to" do
+    assert Results.missing_case_pages(Eab.Inventory.all()) == []
+    assert Results.missing_case_pages(["no-such-case"]) == ["no-such-case"]
+  end
 end
