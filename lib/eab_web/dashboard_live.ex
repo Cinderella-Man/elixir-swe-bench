@@ -88,6 +88,7 @@ defmodule EabWeb.DashboardLive do
         readiness: nil,
         readiness_error: nil,
         selected_case: nil,
+        rerun_error: nil,
         log_case: nil,
         case_attempt: nil,
         log_sections: [],
@@ -494,6 +495,28 @@ defmodule EabWeb.DashboardLive do
          ) do
       {:ok, _} -> {:noreply, refresh(assign(socket, error: nil))}
       {:error, message} -> {:noreply, assign(socket, error: message)}
+    end
+  end
+
+  def handle_event("rerun_case", %{"id" => case_id}, %{assigns: %{endpoint: nil}} = socket),
+    do:
+      {:noreply,
+       assign(socket,
+         rerun_error: {case_id, "Connect the model this run used before running a case again."}
+       )}
+
+  def handle_event("rerun_case", %{"id" => case_id}, socket) do
+    assigns = socket.assigns
+
+    case Runs.rerun_case(assigns.selected, case_id, assigns.endpoint, assigns.key) do
+      {:ok, id} ->
+        {:noreply,
+         refresh(
+           assign(socket, selected: id, selected_case: nil, case_offset: 0, rerun_error: nil)
+         )}
+
+      {:error, message} ->
+        {:noreply, assign(socket, rerun_error: {case_id, message})}
     end
   end
 
@@ -1696,6 +1719,29 @@ defmodule EabWeb.DashboardLive do
                   <p :if={get_in(@run, ["attempts", @log_case, "error"])} class="notice error">
                     {get_in(@run, ["attempts", @log_case, "error"])}
                   </p>
+                  <div
+                    :if={
+                      @run["status"] in ~w(completed error interrupted cancelled) and
+                        @run["cleanup_pending"] == false
+                    }
+                    id="case-rerun"
+                  >
+                    <button
+                      id={"rerun-#{id}"}
+                      class="secondary"
+                      phx-click="rerun_case"
+                      phx-value-id={id}
+                      disabled={busy?(@snapshot)}
+                    >
+                      Run this case again
+                    </button>
+                    <p class="fine-print">
+                      A new one-case run on the connected model, with this run's settings but no per-reply cap (ADR 0015). It is never published; compare or merge its result by hand.
+                    </p>
+                    <p :if={match?({^id, _}, @rerun_error)} class="notice error" role="alert">
+                      {elem(@rerun_error, 1)}
+                    </p>
+                  </div>
                   <section id="case-verdict" aria-label="Case result explanation" tabindex="-1">
                     <p :if={Eab.Harness.name(@run) != "claude_code"} id="case-time" class="fine-print">
                       Case time: {Eab.Measurement.label((@case_attempt || %{})["measurement"])} · Pi startup through completion, excluding preparation and grading.

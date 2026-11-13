@@ -98,6 +98,11 @@ defmodule Eab.Report do
   defp scope(%{"selection" => %{"kind" => "case_repeat", "source_run" => id}}),
     do: "Selected-case repeat of " <> id
 
+  defp scope(%{
+         "selection" => %{"kind" => "case_rerun", "source_run" => id, "cases" => [case_id]}
+       }),
+       do: "Rerun of #{case_id} from #{id}, without a per-reply cap"
+
   defp scope(%{"selection" => %{"kind" => "dry_attempt", "cases" => [id]}}),
     do: "Unscored dry attempt on " <> id
 

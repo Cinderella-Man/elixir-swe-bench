@@ -260,6 +260,52 @@ defmodule Eab.RunsTest do
     assert message =~ "No evaluation errors"
   end
 
+  test "a case runs again on the connected model with the source settings but no reply cap" do
+    parent = self()
+    Runs.subscribe()
+    {source, [_passed, failed | _]} = partial_source()
+    capped = put_in(source, ["settings", "response_tokens"], 8192)
+    Store.write("runs/source/run.json", capped)
+    original = source_files()
+
+    Application.put_env(:eab, :runner, fn run, _, _ ->
+      send(parent, {:rerun, run, Eab.Checkpoints.plan(run)})
+
+      receive do
+        :finish -> :ok
+      end
+    end)
+
+    assert {:error, message} = Runs.rerun_case("source", "unknown", endpoint(), "")
+    assert message =~ "Choose a case"
+
+    other = Map.put(endpoint(), "context", 16_384)
+    assert {:error, _} = Runs.rerun_case("source", failed, other, "")
+
+    other = put_in(endpoint(), ["profile"], %{"chat_template" => "{{ other }}"})
+    assert {:error, message} = Runs.rerun_case("source", failed, other, "")
+    assert message =~ "connected model differs from that run's (chat template sha256)"
+
+    assert {:ok, id} = Runs.rerun_case("source", failed, endpoint(), "")
+    assert_receive {:rerun, run, plan}, 3000
+    assert run["id"] == id and run["cases"] == [failed] and plan.restart == [failed]
+    assert run["selection"]["kind"] == "case_rerun"
+    assert run["selection"]["source_run"] == "source"
+    assert is_nil(run["settings"]["response_tokens"])
+
+    assert Map.delete(run["settings"], "response_tokens") ==
+             Map.delete(source["settings"], "response_tokens")
+
+    assert :ok = Eab.Checkpoints.validate_run!(run, endpoint(), run["settings"])
+    assert {:error, _} = Runs.rerun_case("source", failed, endpoint(), "")
+    assert source_files() == original
+
+    Eab.Report.write(run)
+    assert File.read!(Store.path("runs/#{id}/report.md")) =~ "Rerun of #{failed} from source"
+    Runs.stop()
+    await_cleanup()
+  end
+
   test "explicit repeats run only selected completed cases from scratch and retain every prior outcome" do
     parent = self()
     Runs.subscribe()

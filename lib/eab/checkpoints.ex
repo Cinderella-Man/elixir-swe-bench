@@ -123,7 +123,7 @@ defmodule Eab.Checkpoints do
           cases == inventory
 
         %{"kind" => kind, "cases" => ^cases, "source_run" => source}
-        when kind in ["error_retry", "case_repeat"] ->
+        when kind in ["error_retry", "case_repeat", "case_rerun"] ->
           Store.valid_id?(source) and is_list(cases) and cases != [] and
             Enum.filter(inventory, &(&1 in cases)) == cases
 

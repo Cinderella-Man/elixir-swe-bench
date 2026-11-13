@@ -390,6 +390,32 @@ defmodule EabWeb.DashboardTest do
     assert has_element?(view, "#case-panel-#{c} #case-verdict", "Evaluation error")
   end
 
+  test "a stopped run's case can be run again, and needs a connected model" do
+    id = "case-rerun-test"
+    [a, b | _] = Eab.Inventory.all()
+
+    Eab.Store.write("runs/#{id}/run.json", %{
+      "id" => id,
+      "created_at" => "9999-01-01T00:00:00Z",
+      "status" => "completed",
+      "cleanup_pending" => false,
+      "cases" => [a, b],
+      "attempts" => %{
+        a => %{"status" => "completed", "grade" => %{"passed" => true}},
+        b => %{"status" => "completed", "grade" => %{"passed" => false}}
+      },
+      "settings" => %{},
+      "model" => %{"model" => "synthetic"}
+    })
+
+    on_exit(fn -> File.rm_rf!(Eab.Store.path("runs/#{id}")) end)
+    {:ok, view, _} = live(build_conn(), "/")
+    view |> element("#case-#{b}") |> render_click()
+    assert has_element?(view, "#case-panel-#{b} #rerun-#{b}", "Run this case again")
+    view |> element("#rerun-#{b}") |> render_click()
+    assert has_element?(view, "#case-rerun [role=alert]", "Connect the model this run used")
+  end
+
   test "concurrent case stages and selected background messages remain visible" do
     id = "concurrent-progress-test"
     [a, b, c | _] = Eab.Inventory.all()
