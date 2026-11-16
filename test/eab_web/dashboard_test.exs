@@ -506,6 +506,83 @@ defmodule EabWeb.DashboardTest do
     assert has_element?(view, "#run:not([disabled])")
   end
 
+  test "a local model needs its source declared before Run, and the source is looked up" do
+    Application.put_env(:eab, :http_request, fn opts ->
+      body =
+        case URI.parse(opts[:url]).path do
+          "/health" ->
+            %{"status" => "ok"}
+
+          "/v1/models" ->
+            %{"data" => [%{"id" => "test-model"}]}
+
+          "/props" ->
+            %{
+              "model_alias" => "test-model",
+              "model_path" => "/models/Qwen3.8-27B-UD-Q6_K_L.gguf",
+              "default_generation_settings" => %{"n_ctx" => 32768}
+            }
+        end
+
+      {:ok, %{status: 200, body: body}}
+    end)
+
+    commit = String.duplicate("3", 40)
+
+    Application.put_env(:eab, :hugging_face_request, fn opts ->
+      body =
+        if opts[:method] == :get,
+          do: %{"sha" => commit, "lastModified" => "2026-11-12T08:00:00.000Z"},
+          else: [
+            %{
+              "path" => "Qwen3.8-27B-UD-Q6_K_L.gguf",
+              "lfs" => %{"oid" => String.duplicate("e", 64), "size" => 24_170_553_344},
+              "lastCommit" => %{"id" => commit, "date" => "2026-11-10T00:00:00.000Z"}
+            }
+          ]
+
+      {:ok, %{status: 200, body: body}}
+    end)
+
+    on_exit(fn ->
+      Application.delete_env(:eab, :http_request)
+      Application.delete_env(:eab, :hugging_face_request)
+      File.rm(Eab.Store.path("model-sources.json"))
+    end)
+
+    {:ok, view, _} = live(build_conn(), "/")
+    view |> form("#connection", connection: %{url: "http://fixture", key: ""}) |> render_change()
+    render_async(view)
+    view |> element("#run") |> render_click()
+    assert render(view) =~ "Declare where the model file came from first"
+
+    url = "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-UD-Q6_K_L.gguf"
+
+    view
+    |> form("#model-source", source: %{url: "https://huggingface.co/unsloth", release_label: ""})
+    |> render_submit()
+
+    assert has_element?(view, "#source-error", "Link the model file itself")
+
+    view
+    |> form("#model-source", source: %{url: url, release_label: "v3.1"})
+    |> render_submit()
+
+    html = render_async(view)
+    assert html =~ "Qwen3.8-27B · UD-Q6_K_L · v3.1"
+    assert has_element?(view, "#declared-source", commit)
+    assert has_element?(view, "#declared-source", "unsloth")
+    refute has_element?(view, "#source-name-warning")
+
+    # The next connection to this file offers the same source again, to be looked up anew.
+    {:ok, view, _} = live(build_conn(), "/")
+    view |> form("#connection", connection: %{url: "http://fixture", key: ""}) |> render_change()
+    render_async(view)
+    assert has_element?(view, "#source-url[value='#{url}']")
+    assert has_element?(view, "#source-release[value='v3.1']")
+    refute has_element?(view, "#declared-source")
+  end
+
   test "the per-token Claude API is not offered, and its address is not contacted" do
     parent = self()
     Application.put_env(:eab, :http_request, fn opts -> send(parent, {:request, opts}) end)

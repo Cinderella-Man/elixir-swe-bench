@@ -418,6 +418,109 @@ defmodule Eab.ResultsTest do
     end
   end
 
+  test "the declared source, the hashed files and the GGUF's release details are published" do
+    artifact = "Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf"
+    sha = String.duplicate("e", 64)
+    commit = String.duplicate("1", 40)
+    file = %{"name" => artifact, "size_bytes" => 1234, "sha256" => sha}
+
+    {:ok, declared} =
+      Eab.ModelSource.declare(
+        "https://huggingface.co/ukisai/Swift-GGUF/blob/main/#{artifact}",
+        "v2"
+      )
+
+    source =
+      Map.put(declared, "lookup", %{
+        "commit" => String.duplicate("3", 40),
+        "commit_date" => "2026-11-12T00:00:00.000Z",
+        "files" => [
+          %{
+            "path" => artifact,
+            "size_bytes" => 1234,
+            "sha256" => sha,
+            "last_commit" => commit,
+            "last_commit_date" => "2026-11-10T00:00:00.000Z"
+          }
+        ]
+      })
+
+    session = %{
+      "sample_count" => 1,
+      "identity" => %{
+        "model_artifact" => artifact,
+        "backend" => "llama_cpp",
+        "weight_files" => %{
+          "size_bytes" => 1234,
+          "files" => [Map.delete(file, "sha256")],
+          "gguf" => %{"general.version" => "v2", "quantize.imatrix.chunks_count" => 720}
+        }
+      },
+      "weight_hashes" => %{"status" => "hashed", "files" => [file]}
+    }
+
+    traced =
+      run()
+      |> put_in(["model", "source"], source)
+      |> Map.put("memory", %{"sessions" => [session]})
+
+    result = Results.export!(traced, resources: nil, network: false)
+    model = result["model"]
+    assert model["weight_files"] == [file]
+    assert result["setup"]["model"]["sha256"] == [sha]
+    assert model["gguf"] == %{"general.version" => "v2", "quantize.imatrix.chunks_count" => 720}
+
+    assert Map.take(model["source"], ~w(author repository release_label commit verification)) ==
+             %{
+               "author" => "ukisai",
+               "repository" => "ukisai/Swift-GGUF",
+               "release_label" => "v2",
+               "commit" => commit,
+               "verification" => "verified"
+             }
+
+    refute Jason.encode!(result) =~ "lookup"
+
+    # Without hashes the source is published unchecked; a label needs a source.
+    plain = put_in(run(), ["model", "source"], declared)
+    unchecked = Results.export!(plain, network: false)["model"]
+    assert unchecked["source"]["verification"] == "not_checked"
+    assert unchecked["weight_files"] == nil and unchecked["gguf"] == nil
+
+    assert_raise ArgumentError, ~r/needs the model's source/, fn ->
+      Results.export!(run(), release_label: "v3")
+    end
+
+    # The publisher can name the source of an older run; a bad link or field is refused.
+    supplied =
+      Results.export!(run(),
+        source_url: "https://example.com/#{artifact}",
+        release_label: "v1",
+        network: false
+      )["model"]["source"]
+
+    assert supplied["declared_by"] == "publisher" and supplied["release_label"] == "v1"
+
+    assert_raise ArgumentError, fn ->
+      Results.export!(run(), source_url: "https://huggingface.co/x")
+    end
+
+    assert_raise ArgumentError, ~r/verified source/, fn ->
+      Results.validate!(
+        put_in(result, ["model", "weight_files"], nil)
+        |> put_in(["setup", "model"], %{})
+      )
+    end
+
+    assert_raise ArgumentError, ~r/Unexpected GGUF key/, fn ->
+      Results.validate!(put_in(result, ["model", "gguf"], %{"tokenizer.chat_template" => "x"}))
+    end
+
+    assert_raise ArgumentError, ~r/setup's weight hashes/, fn ->
+      Results.validate!(put_in(result, ["setup", "model", "sha256"], [String.duplicate("f", 64)]))
+    end
+  end
+
   test "incomplete, partial, mismatched and duplicated runs cannot be published" do
     variants = [
       Map.put(run(), "status", "error"),

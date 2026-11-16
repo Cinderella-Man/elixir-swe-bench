@@ -10,7 +10,7 @@ Current inventory update, 2026-10-15: v4 contains nine cases with two reviewed A
 | --- | --- |
 | Cases | Nine actual upstream PR repairs: three Plausible, six Livebook |
 | Model | One endpoint and its currently served model per run |
-| Identification | Server-reported metadata; unknown properties stay explicit; no manual artifact pins |
+| Identification | Server-reported metadata and the served files' sha256; unknown properties stay explicit; the operator declares each local model's source, checked against those hashes ([ADR 0018](adr/0018-declare-and-hash-model-sources.md)) |
 | Agent | Pinned Pi CLI inside each problem container, using read, bash, edit and write |
 | Dependencies | Docker supplies the application, build tools, PostgreSQL and ClickHouse |
 | Deployment | Public, portable configuration without personal paths, machine identities or host-specific hardware policies |
@@ -276,6 +276,8 @@ On 2026-11-13, before running about fifty more models, the user asked for an aud
 - **Cases:** livebook-pr-2800 and ash-pr-3031 had required checks whose trigger the solver's text never named. Their texts now state it; see the [case-fix record](../verification/case-fixes-2026-11-13/README.md).
 
 The changed cases and limits make benchmark `elixir-agent-benchmark-v6`. The user asked to keep v5 as the page's primary results for the time being and to collect new runs in v6. The results page therefore holds releases side by side: the twelve v5 series moved to `results-page/releases/v5/` and are kept as published, `results-page/results/` takes the v6 series, and `results-page/releases.json` names v5 as the release the page opens on. A switch under the title shows the other release; the two never share a chart.
+
+On 2026-11-16 the user asked for each local model to be declared with its full source before it is run. Makers overwrite files under the same name (Unsloth's v3.1 Qwen3.8-27B quants replaced v3), and different makers publish different quants under one name, so a file name cannot say which file was run once the link moves on. The dashboard now asks for the model file's URL and an optional release label before a local run, and looks a Hugging Face file up for its commit and shard hashes. The collector hashes the served files on the model host, caching each hash until the file changes, and records the GGUF's release and calibration keys and the server's command line. The measured hashes join the run series setup, so a re-upload starts another series; series published earlier keep their IDs. Publication compares the hashes with the source and searches the repository's history for the matching upload. Public schema 8 adds `model.source`, `model.weight_files` and `model.gguf` ([ADR 0018](adr/0018-declare-and-hash-model-sources.md)).
 
 ## Selecting future new cases — 2026-10-18
 

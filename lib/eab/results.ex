@@ -98,6 +98,14 @@ defmodule Eab.Results do
 
     series = Series.id(projected)
 
+    # A series published before hashes were recorded names none in its setup; a run started
+    # for it still joins it, and merge!/2 compares the files when the series records them.
+    series =
+      if run["series"] && run["series"] != series &&
+           Series.id(projected, hashes: false) == run["series"],
+         do: run["series"],
+         else: series
+
     require!(
       is_nil(run["series"]) or run["series"] == series,
       "This run was started for run series #{String.slice(run["series"] || "", 0, 12)} but its setup no longer matches it"
@@ -114,6 +122,8 @@ defmodule Eab.Results do
       )
 
     file_size = weights && weights["size_bytes"]
+    # The bytes served, as the collector hashed them on the model host (ADR 0018).
+    measured = Series.weights(run)
     # Strata reports only its pack folder; the collector names the GGUF files behind it.
     files = if is_nil(identity["artifact"]), do: ModelIdentity.from_files(weights)
     file_quant = files["quantization"]
@@ -138,7 +148,7 @@ defmodule Eab.Results do
     profile = model["profile"] || %{}
 
     record = %{
-      "schema_version" => 7,
+      "schema_version" => 8,
       "series_id" => series,
       "benchmark" => selected["id"],
       "model" => %{
@@ -171,7 +181,10 @@ defmodule Eab.Results do
             creator -> "artifact_files"
             opts[:quantized_by] -> "owner_supplied"
             true -> "not_reported"
-          end
+          end,
+        "source" => public_source(model, measured, opts),
+        "weight_files" => measured,
+        "gguf" => gguf(weights)
       },
       "harness" => public_harness(run),
       "settings" => settings,
@@ -241,6 +254,46 @@ defmodule Eab.Results do
     end
   end
 
+  # Where the files came from: as declared when the run started, or as the publisher gives it
+  # with --source-url, checked against the measured hashes (ADR 0018).
+  defp public_source(model, measured, opts) do
+    source =
+      case opts[:source_url] do
+        nil ->
+          model["source"]
+
+        url ->
+          case Eab.ModelSource.declare(url, nil, "publisher") do
+            {:ok, source} -> source
+            {:error, message} -> raise ArgumentError, message
+          end
+      end
+
+    require!(
+      is_nil(opts[:release_label]) or not is_nil(source),
+      "A release label needs the model's source; add --source-url"
+    )
+
+    source =
+      if opts[:release_label] && source,
+        do: Map.put(source, "release_label", String.trim(opts[:release_label])),
+        else: source
+
+    source
+    |> Eab.ModelSource.verify(measured, network: Keyword.get(opts, :network, true))
+    |> Eab.ModelSource.public()
+  end
+
+  @doc false
+  def gguf(nil), do: nil
+
+  def gguf(weights) do
+    case weights["gguf"] do
+      %{} = metadata when map_size(metadata) > 0 -> metadata
+      _ -> nil
+    end
+  end
+
   defp public_harness(%{"harness" => %{"name" => "claude_code"} = harness}) do
     %{
       "name" => "claude_code",
@@ -263,6 +316,15 @@ defmodule Eab.Results do
     require!(
       record["series_id"] == addition["series_id"],
       "The run belongs to another run series"
+    )
+
+    recorded = record["model"]["weight_files"]
+    served = addition["model"]["weight_files"]
+
+    require!(
+      is_nil(recorded) or is_nil(served) or
+        Enum.map(recorded, & &1["sha256"]) == Enum.map(served, & &1["sha256"]),
+      "The served weight files differ from the ones this run series was made with"
     )
 
     cond do
@@ -487,7 +549,7 @@ defmodule Eab.Results do
       "releases.json names #{primary} as primary, which is not a release on this page"
     )
 
-    payload = %{"schema_version" => 7, "primary" => primary, "releases" => releases}
+    payload = %{"schema_version" => 8, "primary" => primary, "releases" => releases}
 
     repository =
       opts[:repository] ||

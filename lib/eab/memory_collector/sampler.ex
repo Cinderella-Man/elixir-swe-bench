@@ -51,14 +51,120 @@ defmodule Eab.MemoryCollector do
         else: %{}
 
     {:ok, host} = :inet.gethostname()
+    args = server_args(state.proc, state.pid)
 
     Map.merge(state.expected, %{
       "host" => to_string(host),
       "service" => Path.basename(state.group),
-      "kv_cache" => engine["kv"],
+      "kv_cache" => engine["kv"] || kv_cache(args),
+      "server_args" => args,
       "weight_files" => Eab.MemoryCollector.Weights.read(get(state, "/props")["model_path"]),
       "cpu" => cpu(state.proc)
     })
+  end
+
+  @doc """
+  Hashes the served weight files in a separate process and sends `{:weights, event}` to
+  `parent`: their sha256 in shard order, from the host's cache when a file is unchanged.
+  Reading a large model takes minutes, so samples continue meanwhile.
+  """
+  def hash_weights(state, parent, cache_file \\ weights_cache()) do
+    spawn(fn ->
+      event =
+        try do
+          path = get(state, "/props")["model_path"]
+          started_at = started_at(state.proc, state.started)
+
+          case Eab.MemoryCollector.Weights.files(path) do
+            [] ->
+              %{"status" => "unavailable", "message" => "No weight files were found to hash"}
+
+            files ->
+              case Eab.MemoryCollector.Weights.hashes(files, started_at, cache_file) do
+                {:ok, hashed} -> %{"status" => "hashed", "files" => hashed}
+                {:changed, message} -> %{"status" => "changed", "message" => message}
+              end
+          end
+        rescue
+          _ -> %{"status" => "unreadable", "message" => "The weight files could not be read"}
+        end
+
+      send(parent, {:weights, Map.put(event, "type", "weights")})
+    end)
+  end
+
+  def weights_cache,
+    do:
+      System.get_env("EAB_WEIGHTS_CACHE") ||
+        "/var/cache/eab-memory-collector/weight-hashes.json"
+
+  # The process start in Unix seconds: boot time plus its start in clock ticks (USER_HZ is
+  # 100 on Linux), or nil when procfs does not say.
+  def started_at(proc, ticks) do
+    boot =
+      File.read!(Path.join(proc, "stat"))
+      |> String.split("\n")
+      |> Enum.find_value(fn
+        "btime " <> value -> String.to_integer(String.trim(value))
+        _ -> nil
+      end)
+
+    if boot, do: boot + div(String.to_integer(ticks), 100)
+  rescue
+    _ -> nil
+  end
+
+  @secret_flags ~w(--api-key --api-key-file --ssl-key-file --hf-token -hft)
+
+  @doc "The model server's command line, with secrets such as its API key replaced."
+  def server_args(proc, pid) do
+    case File.read(Path.join([proc, to_string(pid), "cmdline"])) do
+      {:ok, body} ->
+        body
+        |> String.split(<<0>>, trim: true)
+        |> Enum.map(&String.replace_invalid/1)
+        |> redact([])
+
+      _ ->
+        nil
+    end
+  end
+
+  defp redact([], acc), do: Enum.reverse(acc)
+
+  defp redact([flag, _secret | rest], acc) when flag in @secret_flags,
+    do: redact(rest, ["[redacted]", flag | acc])
+
+  defp redact([arg | rest], acc) do
+    case String.split(arg, "=", parts: 2) do
+      [flag, _] when flag in @secret_flags -> redact(rest, [flag <> "=[redacted]" | acc])
+      _ -> redact(rest, [arg | acc])
+    end
+  end
+
+  # llama.cpp's KV cache types; unset ones are its f16 default. Only a command line that
+  # loads a model is llama-server's own, not a proxy's.
+  def kv_cache(args) when is_list(args) do
+    if Enum.any?(args, &(flag_name(&1) in ~w(-m --model -hf --hf-repo -mu --model-url))) do
+      k = flag(args, ~w(-ctk --cache-type-k)) || "f16"
+      v = flag(args, ~w(-ctv --cache-type-v)) || "f16"
+      if k == v, do: k, else: "K #{k} · V #{v}"
+    end
+  end
+
+  def kv_cache(_), do: nil
+
+  defp flag_name(arg), do: arg |> String.split("=", parts: 2) |> hd()
+
+  defp flag(args, names) do
+    args
+    |> Enum.chunk_every(2, 1, [nil])
+    |> Enum.find_value(fn [arg, next] ->
+      case String.split(arg, "=", parts: 2) do
+        [name, value] -> if name in names, do: value
+        [name] -> if name in names and is_binary(next), do: next
+      end
+    end)
   end
 
   def sample(state) do
@@ -180,7 +286,7 @@ defmodule Eab.MemoryCollector do
     Map.merge(expected, %{
       "kind" => "loaded_snapshot",
       "observed_at" => now(),
-      "kv_cache" => engine["kv"],
+      "kv_cache" => engine["kv"] || kv_cache(server_args(state.proc, pid)),
       "cpu" => cpu(state.proc),
       "gpus" => Enum.map(gpus, &Map.delete(&1, "uuid")),
       "ram_rss_bytes" => kib(status, "VmRSS"),

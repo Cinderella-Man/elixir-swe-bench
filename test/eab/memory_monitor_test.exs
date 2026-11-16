@@ -28,7 +28,9 @@ defmodule Eab.MemoryMonitorTest do
       target: "fixture",
       collector: "fixture",
       known_hosts: "fixture",
-      executable: "/opt/pi/node",
+      # The tooling image's Node, or the developer's own.
+      executable:
+        if(File.exists?("/opt/pi/node"), do: "/opt/pi/node", else: System.find_executable("node")),
       args: ["test/support/memory_collector.mjs", mode]
     )
   end
@@ -43,6 +45,32 @@ defmodule Eab.MemoryMonitorTest do
         "profile" => %{"model_path" => "/models/fixture-Q4_K_M.gguf"}
       }
     }
+
+  test "the collector's weight hashes are kept with the session without ending it" do
+    configure("hashes")
+    assert {:ok, pid, _} = MemoryMonitor.start(run("memory-hashes"))
+
+    hashes = fn ->
+      Store.read("runs/memory-hashes/memory.json")["sessions"]
+      |> List.last()
+      |> Map.get("weight_hashes")
+    end
+
+    assert Enum.find_value(1..50, fn _ -> hashes.() || (Process.sleep(20) && nil) end) == %{
+             "status" => "hashed",
+             "files" => [
+               %{
+                 "name" => "fixture-Q4_K_M.gguf",
+                 "size_bytes" => 7,
+                 "sha256" => String.duplicate("a", 64)
+               }
+             ]
+           }
+
+    result = MemoryMonitor.finish(pid, "memory-hashes", "completed")
+    assert result["status"] == "complete"
+    assert hd(result["sessions"])["weight_hashes"]["status"] == "hashed"
+  end
 
   test "SSH uses a configured key and otherwise offers none" do
     config = [target: "root@10.77.0.2", collector: "/srv/collector", known_hosts: "/data/hosts"]

@@ -40,6 +40,8 @@ defmodule Eab.MemoryCollector.CLI do
     emit(%{"type" => "ready", "identity" => identity, "interval_ms" => @interval})
     emit(sample)
     parent = self()
+    # Older benchmarks do not ask for hashes and would not understand the event.
+    if request["hash_weights"] == true, do: Eab.MemoryCollector.hash_weights(state, parent)
 
     spawn_link(fn ->
       IO.binread(:stdio, 1)
@@ -51,6 +53,10 @@ defmodule Eab.MemoryCollector.CLI do
 
   defp loop(state, deadline) do
     receive do
+      {:weights, event} ->
+        emit(event)
+        loop(state, deadline)
+
       :stop ->
         {sample, _} = Eab.MemoryCollector.sample(state)
         emit(sample)

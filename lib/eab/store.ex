@@ -110,7 +110,7 @@ defmodule Eab.Store do
       Map.update(summary, "model", %{}, fn endpoint ->
         endpoint
         |> Eab.ModelIdentity.attach()
-        |> Map.take(~w(model backend identity_note identity))
+        |> Map.take(~w(model backend identity_note identity source))
       end)
 
     write("runs/#{run["id"]}/summary.json", summary)

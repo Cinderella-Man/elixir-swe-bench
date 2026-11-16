@@ -78,9 +78,16 @@ defmodule Eab.ModelIdentity do
   def label(endpoint) do
     identity = details(endpoint)
 
-    if identity["quantization"],
-      do: identity["name"] <> " · " <> identity["quantization"],
-      else: identity["name"]
+    label =
+      if identity["quantization"],
+        do: identity["name"] <> " · " <> identity["quantization"],
+        else: identity["name"]
+
+    # A maker's re-upload keeps the file name; the declared release tells them apart (ADR 0018).
+    case get_in(endpoint || %{}, ["source", "release_label"]) do
+      release when is_binary(release) and release != "" -> label <> " · " <> release
+      _ -> label
+    end
   end
 
   def size_label(endpoint) do

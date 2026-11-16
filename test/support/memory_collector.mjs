@@ -31,6 +31,10 @@ process.stdin.on('data', text => {
         model_artifact: 'fixture-Q4_K_M.gguf', context_tokens: 262144, backend: 'strata',
         backend_version: 'fixture', cpu: 'fixture', kv_cache: 'int8'}});
       emit(sample(1, 100, 20));
+      if (mode === 'hashes' && JSON.parse(line).hash_weights === true) {
+        emit({type: 'weights', status: 'hashed', files: [
+          {name: 'fixture-Q4_K_M.gguf', size_bytes: 7, sha256: 'a'.repeat(64)}]});
+      }
       if (mode === 'disconnect') process.exit(1);
     } else {
       emit(sample(mode === 'gap' ? 8 : 2, 30, 80));

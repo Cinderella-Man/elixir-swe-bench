@@ -9,7 +9,7 @@
     if (text !== undefined) e.textContent = text;
     return e;
   };
-  if (!data || data.schema_version !== 7 || !Array.isArray(data.releases) || data.releases.length === 0) {
+  if (!data || data.schema_version !== 8 || !Array.isArray(data.releases) || data.releases.length === 0) {
     $("chart").append(node("p", "empty", "Results could not be loaded. Please reload."));
     return;
   }
@@ -55,7 +55,8 @@
   const effort = r => ({minimal: "Minimal", low: "Low", medium: "Medium", high: "High", xhigh: "Extra", max: "Max",
     on: "Thinking", off: "No thinking"})[r.settings.reasoning_effort];
   // Who made the quantization comes before it, as in "Unsloth UD-Q5_K_XL": the same name can come from several makers.
-  const quant = r => [r.model.quantized_by, r.model.quantization].filter(Boolean).join(" ");
+  // A release label the operator declared follows it ("Unsloth UD-Q6_K_L v3.1"): makers re-upload files under the same name.
+  const quant = r => [r.model.quantized_by, r.model.quantization, r.model.source?.release_label].filter(Boolean).join(" ");
   const chartName = r => [r.model.name, quant(r), effort(r)].filter(Boolean).join(" ");
   // Claude Code cannot enforce the declared generation budget, so going over it is flagged, not failed (ADR 0010).
   const overBudget = (r, c) => Number.isInteger(r.settings.max_tokens) && Number.isInteger(c?.generated_tokens) &&
@@ -132,6 +133,49 @@
     }
     return values;
   }
+  // The model's files: where they came from, which upload that was and the bytes served (ADR 0018).
+  const ggufLabels = {
+    "general.version": "Version in file", "general.name": "Name in file", "general.basename": "Base name in file",
+    "general.finetune": "Finetune", "general.size_label": "Size label", "general.organization": "Organization",
+    "general.architecture": "Architecture", "general.license": "License", "general.url": "URL in file",
+    "general.repo_url": "Repository in file", "general.source.url": "Original model",
+    "general.source.huggingface.repository": "Original repository", "general.base_model.count": "Base models",
+    "general.base_model.0.name": "Base model", "general.base_model.0.organization": "Base model organization",
+    "general.base_model.0.version": "Base model version", "general.base_model.0.repo_url": "Base model repository",
+    "general.file_type": "GGUF file type", "general.quantization_version": "Quantization version",
+    "quantize.imatrix.file": "Imatrix file", "quantize.imatrix.dataset": "Imatrix dataset",
+    "quantize.imatrix.entries_count": "Imatrix entries", "quantize.imatrix.chunks_count": "Imatrix chunks",
+  };
+  const short = commit => commit ? commit.slice(0, 7) : "";
+  const day = date => date ? date.slice(0, 10) : "";
+  function modelFiles(r) {
+    const m = r.model, s = m.source, list = node("dl", "setting-list");
+    const add = (label, value) => { list.append(node("dt", "", label)); const dd = node("dd"); dd.append(value); list.append(dd); };
+    if (s) {
+      const link = node("a", "", s.repository ? `${s.repository} · ${s.file}` : s.url);
+      link.href = s.repository && s.commit ? `https://huggingface.co/${s.repository}/blob/${s.commit}/${s.path.split("/").map(encodeURIComponent).join("/")}` : s.url;
+      link.target = "_blank"; link.rel = "noopener";
+      add("Source", link);
+      if (s.author) add("Hugging Face author", s.author);
+      if (s.release_label) add("Release", s.release_label);
+      if (s.revision) add("Declared revision", s.revision);
+      if (s.commit) add(s.verification === "verified" ? "Uploaded in commit" : "Commit looked up", `${short(s.commit)}${s.commit_date ? ` · ${day(s.commit_date)}` : ""}`);
+      const check = {verified: "The served files' sha256 match this upload", differs: "The served files' sha256 differ from this source",
+        not_checked: "Not compared with the source"}[s.verification];
+      add("Check", [check, s.verification_note].filter(Boolean).join(". "));
+      add("Declared by", s.declared_by === "publisher" ? "the publisher" : "the operator, before the run");
+    } else {
+      add("Source", hosted(r) ? "Hosted API" : "Not declared");
+    }
+    for (const [i, file] of (m.weight_files || []).entries()) {
+      const code = node("code", "sha", file.sha256);
+      code.title = `${file.name} · ${fmt(file.size_bytes)} bytes`;
+      add(m.weight_files.length > 1 ? `sha256 · shard ${i + 1}` : "sha256", code);
+    }
+    if (!m.weight_files && !hosted(r)) add("sha256", "Not recorded");
+    for (const [key, value] of Object.entries(m.gguf || {})) add(ggufLabels[key] || key, typeof value === "number" ? fmt(value) : value);
+    return list;
+  }
   function definitionList(entries) {
     const list = node("dl", "setting-list");
     for (const [label, value] of entries) list.append(node("dt", "", label), node("dd", "", value));
@@ -205,7 +249,8 @@
         [readable(key), typeof value === "object" && value !== null ? JSON.stringify(value) : readable(value)])));
     }
     const conditions = node("div");
-    conditions.append(node("h3", "", "Memory & deployment"));
+    conditions.append(node("h3", "", "Model files"), modelFiles(r));
+    conditions.append(node("h3", "settings-heading", "Memory & deployment"));
     const maker = {artifact_files: "named in the model file", owner_supplied: "given by the publisher"}[r.model.quantized_by_source];
     const memory = [["Quantized by", r.model.quantized_by ? `${r.model.quantized_by} · ${maker}` : hosted(r) ? "Hosted API" : "Not recorded"],
       ["Model weights", gb(r.model.size_bytes)], ["Context limit", context(r)]];

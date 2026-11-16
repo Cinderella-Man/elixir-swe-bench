@@ -277,6 +277,96 @@ defmodule Eab.SeriesTest do
     assert Results.publish!(same, page_root: page, resources: nil) == :added
   end
 
+  # The collector's sha256 of the served file, as it reports it after the ready identity.
+  defp hashed(run, sha) do
+    run = if run["memory"], do: run, else: served(run, "Unsloth")
+
+    update_in(run, ["memory", "sessions"], fn sessions ->
+      Enum.map(sessions, fn session ->
+        Map.put(session, "weight_hashes", %{
+          "status" => "hashed",
+          "files" => [
+            %{"name" => "Swift-27B-Q4_K_M.gguf", "size_bytes" => 15, "sha256" => sha}
+          ]
+        })
+      end)
+    end)
+  end
+
+  test "a re-upload under the same name is another series; hashes are checked again at export",
+       %{page: page} do
+    v3 = String.duplicate("d", 64)
+    v3_1 = String.duplicate("e", 64)
+    first = hashed(run("first", 101, [false]), v3)
+    assert Series.setup(first)["model"]["sha256"] == [v3]
+    refute Series.id(first) == Series.id(hashed(run("first", 101, [false]), v3_1))
+
+    assert Series.id(first, hashes: false) ==
+             Series.id(served(run("first", 101, [false]), "Unsloth"))
+
+    Results.publish!(first, page_root: page, resources: nil)
+    id = Series.id(first)
+    assert Results.series!(id)["model"]["weight_files"] == Series.weights(first)
+
+    # The start check cannot read hashes yet; export refuses the other upload.
+    assert :ok = Series.contribution!(run("next", 102, []), id)
+    other = run("other", 102, []) |> Map.put("series", id) |> hashed(v3_1)
+
+    assert_raise ArgumentError, ~r/no longer matches/, fn ->
+      Results.publish!(other, page_root: page, resources: nil)
+    end
+
+    same = run("same", 102, [], "2026-10-27T12:00:00Z") |> Map.put("series", id) |> hashed(v3)
+    assert Results.publish!(same, page_root: page, resources: nil) == :added
+
+    # A session that disagrees with another about the bytes leaves them unknown.
+    mixed =
+      update_in(first, ["memory", "sessions"], fn [session] ->
+        [session, put_in(session, ["weight_hashes", "files", Access.at(0), "sha256"], v3_1)]
+      end)
+
+    assert Series.weights(mixed) == nil
+  end
+
+  test "a series published before hashes were recorded still takes runs started for it",
+       %{page: page} do
+    old = served(run("old", 101, [false]), "Unsloth")
+    Results.publish!(old, page_root: page, resources: nil)
+    id = Series.id(old)
+    refute Map.has_key?(Results.series!(id)["setup"]["model"], "sha256")
+
+    next =
+      run("next", 102, [], "2026-10-27T12:00:00Z")
+      |> Map.put("series", id)
+      |> hashed(String.duplicate("d", 64))
+
+    assert Results.publish!(next, page_root: page, resources: nil) == :added
+
+    # Once the series records hashes, a run of other bytes cannot join it.
+    record = Results.series!(id)
+    path = Path.join([page, "results", id <> ".json"])
+
+    Results.write!(
+      path,
+      put_in(record, ["model", "weight_files"], [
+        %{
+          "name" => "Swift-27B-Q4_K_M.gguf",
+          "size_bytes" => 15,
+          "sha256" => String.duplicate("c", 64)
+        }
+      ])
+    )
+
+    last =
+      run("last", 103, [], "2026-10-27T13:00:00Z")
+      |> Map.put("series", id)
+      |> hashed(String.duplicate("d", 64))
+
+    assert_raise ArgumentError, ~r/differ from the ones this run series/, fn ->
+      Results.publish!(last, page_root: page, resources: nil)
+    end
+  end
+
   test "a local series made with a per-reply cap takes no more runs", %{page: page} do
     capped = put_in(run("first", 101, [false]), ["settings", "response_tokens"], 8192)
     Results.publish!(capped, page_root: page)

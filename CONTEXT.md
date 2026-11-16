@@ -20,7 +20,10 @@ _Avoid_: enrichment, synthetic PR
 
 **Model profile**: The served model, quantization, context capacity and serving configuration reported by an endpoint. Missing metadata remains unknown; aliases do not establish exact artifact identity.
 
-**Model identity**: The artifact name and quantization recovered from reported model metadata, and the quantization's maker when the served file names one, kept separately from the API routing alias used to send requests. Two makers' identically named files are different models.
+**Model identity**: The artifact name and quantization recovered from reported model metadata, the quantization's maker when the served file names one, and the sha256 of the served weight files when the collector hashed them, kept separately from the API routing alias used to send requests. Two makers' identically named files are different models, and so are two uploads of one name.
+
+**Model file source**: Where the served weight files came from, as the operator declares it before a local run: the file's URL, parsed into Hugging Face author, repository, revision and path, and an optional release label such as "v3.1". A Hugging Face source is looked up for its commit and shard hashes, and is verified when the hashes measured on the model host match an upload in that repository's history. A declaration alone is unverified.
+_Avoid_: model source (the dashboard's choice of local server, ChatGPT or Claude Code), model card
 
 **Model weight size**: The recorded size of the model's weight files in bytes, displayed in decimal GB. It excludes context and runtime memory and is not a total VRAM requirement.
 

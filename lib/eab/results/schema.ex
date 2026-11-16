@@ -2,7 +2,7 @@ defmodule Eab.Results.Schema do
   @moduledoc false
   @fields ~w(schema_version series_id benchmark model harness settings setup case_fixtures seeds required_runs runs evidence_url note)
   @run_fields ~w(run_id created_at seed source_release_id code_version deployment cases resources)
-  @model_fields ~w(name backend quantization quantization_source size_bytes size_source parameter_count quantized_by quantized_by_source)
+  @model_fields ~w(name backend quantization quantization_source size_bytes size_source parameter_count quantized_by quantized_by_source source weight_files gguf)
   # A local series made since ADR 0016 has no generation budget, so its max_tokens is null.
   @nullable_int ~w(window_tokens response_tokens max_tokens)
   @integer ~w(safety_tokens)
@@ -15,8 +15,8 @@ defmodule Eab.Results.Schema do
   }
 
   def validate!(r) do
-    fields!(r, @fields, "Expected a public v7 run series; export the original run.json with add")
-    require!(r["schema_version"] === 7, "Unsupported result schema")
+    fields!(r, @fields, "Expected a public v8 run series; export the original run.json with add")
+    require!(r["schema_version"] === 8, "Unsupported result schema")
     hex!(r["series_id"], "A series ID is required")
     text!(r["benchmark"], "benchmark")
 
@@ -63,6 +63,19 @@ defmodule Eab.Results.Schema do
           is_binary(model["quantized_by"]) and String.trim(model["quantized_by"]) != "" and
             String.length(model["quantized_by"]) <= 100,
           "quantized_by must be nonempty text of at most 100 characters"
+        )
+
+    weight_files!(model["weight_files"])
+    source!(model["source"], model["weight_files"])
+    gguf!(model["gguf"])
+
+    # The served files' hashes in the setup are the first run's (ADR 0018).
+    if hashes = get_in(r, ["setup", "model", "sha256"]),
+      do:
+        require!(
+          is_list(model["weight_files"]) and
+            Enum.map(model["weight_files"], & &1["sha256"]) == hashes,
+          "The setup's weight hashes must be the recorded files'"
         )
 
     harness!(r["harness"])
@@ -213,6 +226,87 @@ defmodule Eab.Results.Schema do
 
     r
   end
+
+  defp weight_files!(nil), do: :ok
+
+  defp weight_files!(files) do
+    require!(is_list(files) and files != [], "weight_files must be a nonempty list or null")
+
+    for file <- files do
+      fields!(file, ~w(name size_bytes sha256), "Unexpected weight file fields")
+      name = text!(file["name"], "weight file name")
+      require!(Path.basename(name) == name, "Only a weight file's name is public")
+      require!(positive?(file["size_bytes"]), "Invalid weight file size")
+      hex!(file["sha256"], "Invalid weight file sha256")
+    end
+  end
+
+  defp source!(nil, _files), do: :ok
+
+  defp source!(source, files) do
+    fields!(source, Eab.ModelSource.public_fields(), "Unexpected model source fields")
+    uri = URI.parse(text!(source["url"], "source url"))
+
+    require!(
+      uri.scheme in ~w(https http) and is_binary(uri.host) and uri.host != "" and
+        is_nil(uri.userinfo) and is_nil(uri.query),
+      "The model source must be an HTTP(S) link without credentials or query"
+    )
+
+    for key <- ~w(host path file), do: text!(source[key], "source #{key}")
+
+    for key <- ~w(author repository revision release_label verification_note),
+        do: require!(is_nil(source[key]) or text?(source[key]), "Invalid source #{key}")
+
+    require!(
+      is_nil(source["release_label"]) or String.length(source["release_label"]) <= 40,
+      "The release label is too long"
+    )
+
+    require!(source["declared_by"] in ~w(operator publisher), "Invalid source declarer")
+
+    require!(
+      is_nil(source["commit"]) or Regex.match?(~r/^[a-f0-9]{40}$/, source["commit"]),
+      "Invalid source commit"
+    )
+
+    if source["commit_date"], do: date!(source["commit_date"])
+
+    require!(
+      source["verification"] in ~w(verified differs not_checked),
+      "Invalid source verification"
+    )
+
+    if source["verification"] == "verified",
+      do:
+        require!(
+          source["host"] == "huggingface.co" and is_binary(source["commit"]) and
+            is_list(files),
+          "A verified source names its commit and the hashed files"
+        )
+  end
+
+  defp gguf!(nil), do: :ok
+
+  defp gguf!(metadata) do
+    allowed = Eab.MemoryCollector.Weights.keys() -- ["general.quantized_by"]
+
+    require!(
+      is_map(metadata) and map_size(metadata) > 0,
+      "gguf must be a nonempty object or null"
+    )
+
+    for {key, value} <- metadata do
+      require!(key in allowed, "Unexpected GGUF key: #{key}")
+
+      require!(
+        is_integer(value) or (text?(value) and byte_size(value) <= 200),
+        "Invalid GGUF value for #{key}"
+      )
+    end
+  end
+
+  defp text?(value), do: is_binary(value) and String.trim(value) != ""
 
   defp harness!(%{"name" => "pi"} = harness) do
     fields!(harness, ~w(name version), "Unexpected harness fields")

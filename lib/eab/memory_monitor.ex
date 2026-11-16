@@ -288,7 +288,9 @@ defmodule Eab.MemoryMonitor do
       "backend" => run["model"]["backend"],
       # The model server's own API key, over SSH: the collector only queries that server.
       "key" => config[:api_key],
-      "key_file" => config[:key_file]
+      "key_file" => config[:key_file],
+      # The collector reads the served weight files once and caches their sha256 on the host.
+      "hash_weights" => true
     }
 
     Port.command(port, Jason.encode!(request) <> "\n")
@@ -436,6 +438,20 @@ defmodule Eab.MemoryMonitor do
     end
   end
 
+  # The served files' sha256, sent once the collector has read them; it does not end a session.
+  defp event(%{"type" => "weights"} = event, state) do
+    record =
+      if event["status"] == "hashed" and valid_hashes?(event["files"]),
+        do: Map.take(event, ~w(status files)),
+        else: %{
+          "status" =>
+            if(event["status"] == "hashed", do: "invalid", else: to_string(event["status"])),
+          "message" => if(is_binary(event["message"]), do: String.slice(event["message"], 0, 200))
+        }
+
+    {:noreply, save(%{state | session: Map.put(state.session, "weight_hashes", record)})}
+  end
+
   defp event(%{"type" => "stopped"}, %{stopping: {_, reason}} = state),
     do: end_session(state, "complete", reason)
 
@@ -493,6 +509,15 @@ defmodule Eab.MemoryMonitor do
       "sample_count" => Enum.sum(Enum.map(sessions, & &1["sample_count"])),
       "peaks" => Enum.reduce(sessions, %{}, &maxima(&2, &1["peaks"]))
     }
+  end
+
+  defp valid_hashes?(files) do
+    is_list(files) and files != [] and
+      Enum.all?(files, fn file ->
+        is_map(file) and is_binary(file["name"]) and Path.basename(file["name"]) == file["name"] and
+          is_integer(file["size_bytes"]) and file["size_bytes"] > 0 and
+          is_binary(file["sha256"]) and file["sha256"] =~ ~r/\A[0-9a-f]{64}\z/
+      end)
   end
 
   defp maxima(left, right), do: Map.merge(left, right, fn _, a, b -> max(a, b) end)

@@ -8,6 +8,8 @@ defmodule EabWeb.DashboardLive do
     Inventory,
     LogSections,
     Model,
+    ModelIdentity,
+    ModelSource,
     Readiness,
     Results,
     Retention,
@@ -56,6 +58,9 @@ defmodule EabWeb.DashboardLive do
           "claude_code" => %{}
         },
         validation: false,
+        source_form: %{"url" => "", "release_label" => ""},
+        source_busy: false,
+        source_error: nil,
         host_key: nil,
         trusted_hosts: [],
         parallel: 1,
@@ -360,11 +365,42 @@ defmodule EabWeb.DashboardLive do
      )}
   end
 
+  def handle_event("source", %{"source" => values}, socket),
+    do: {:noreply, assign(socket, source_form: Map.take(values, ~w(url release_label)))}
+
+  def handle_event("declare_source", _, %{assigns: %{endpoint: nil}} = socket),
+    do: {:noreply, assign(socket, source_error: "Connect to a model first")}
+
+  def handle_event("declare_source", %{"source" => values}, socket) do
+    form = Map.take(values, ~w(url release_label))
+    artifact = ModelIdentity.served_artifact(socket.assigns.endpoint)
+
+    case ModelSource.declare(form["url"], form["release_label"]) do
+      {:ok, source} ->
+        {:noreply,
+         socket
+         |> assign(source_form: form, source_busy: true, source_error: nil)
+         |> start_async(:source_lookup, fn -> {artifact, ModelSource.look_up(source)} end)}
+
+      {:error, message} ->
+        {:noreply, assign(socket, source_form: form, source_error: message)}
+    end
+  end
+
   def handle_event("settings", %{"settings" => values}, socket),
     do: {:noreply, assign(socket, settings: Map.merge(socket.assigns.settings, values))}
 
   def handle_event("run", _, %{assigns: %{endpoint: nil}} = socket),
     do: {:noreply, assign(socket, error: "Connect to a model first")}
+
+  def handle_event("run", _, %{assigns: %{provider: "local", endpoint: endpoint}} = socket)
+      when not is_map_key(endpoint, "source"),
+      do:
+        {:noreply,
+         assign(socket,
+           error:
+             "Declare where the model file came from first: paste its Hugging Face file link under Model file source."
+         )}
 
   def handle_event("run", _, socket) do
     claude_code = socket.assigns.provider == "claude_code"
@@ -622,8 +658,43 @@ defmodule EabWeb.DashboardLive do
     {:noreply, assign(socket, models: rows, detecting: false, error: nil)}
   end
 
-  def handle_async(:discovery, {:ok, {:ok, endpoint}}, socket),
-    do: {:noreply, assign(socket, endpoint: endpoint, detecting: false, error: nil)}
+  def handle_async(:discovery, {:ok, {:ok, endpoint}}, socket) do
+    # The last source declared for this served file is offered again, not applied: a maker may
+    # have replaced the file since, so declaring it looks the source up again.
+    remembered = if endpoint, do: ModelSource.remembered(ModelIdentity.served_artifact(endpoint))
+
+    {:noreply,
+     assign(socket,
+       endpoint: endpoint,
+       detecting: false,
+       error: nil,
+       source_error: nil,
+       source_busy: false,
+       source_form: remembered || %{"url" => "", "release_label" => ""}
+     )}
+  end
+
+  def handle_async(:source_lookup, {:ok, {artifact, source}}, socket) do
+    endpoint = socket.assigns.endpoint
+
+    if endpoint && ModelIdentity.served_artifact(endpoint) == artifact do
+      ModelSource.remember(artifact, source)
+
+      {:noreply,
+       assign(socket,
+         endpoint: Map.put(endpoint, "source", source),
+         source_busy: false,
+         source_error: source["lookup_error"]
+       )}
+    else
+      {:noreply, assign(socket, source_busy: false)}
+    end
+  end
+
+  def handle_async(:source_lookup, {:exit, _}, socket),
+    do:
+      {:noreply,
+       assign(socket, source_busy: false, source_error: "The source lookup stopped. Try again.")}
 
   def handle_async(:readiness, {:ok, {:ok, readiness}}, socket),
     do: {:noreply, assign(socket, readiness: readiness, readiness_error: nil)}
@@ -975,6 +1046,42 @@ defmodule EabWeb.DashboardLive do
   # Memory status depends on known_hosts, not only on the endpoint; naming the hosts trusted in
   # this session makes LiveView render these lines again after a key is trusted.
   defp memory_label(endpoint, _trusted_hosts), do: Eab.MemoryMonitor.configuration_label(endpoint)
+
+  defp size_label(bytes) when is_integer(bytes), do: "#{Float.round(bytes / 1_000_000_000, 2)} GB"
+  defp size_label(_), do: "size unknown"
+
+  # A declared file whose name differs from the served one is allowed (downloads get renamed),
+  # but the operator should see it before running.
+  defp source_mismatch(%{"source" => %{"file" => file}} = endpoint) do
+    served = ModelIdentity.served_artifact(endpoint)
+
+    if served && not ModelIdentity.folder?(served) &&
+         Series.artifact(served) != Series.artifact(file),
+       do: "The server serves #{served}, but the declared source is #{file}."
+  end
+
+  defp source_mismatch(_), do: nil
+
+  # The hashes measured on the model host, compared with the stored lookup only.
+  defp weights_label(run) do
+    measured = Series.weights(run)
+    source = ModelSource.verify(run["model"]["source"], measured, network: false)
+
+    cond do
+      is_nil(measured) ->
+        "served files not hashed yet"
+
+      source && source["verification"] == "verified" ->
+        "served files match commit #{String.slice(source["commit"], 0, 7)}"
+
+      source && source["verification"] == "differs" ->
+        "served files differ from the declared revision; publishing searches its history"
+
+      true ->
+        "served sha256 #{String.slice(hd(measured)["sha256"], 0, 12)}…"
+    end
+  end
+
   defp untrusted_host(endpoint, _trusted_hosts), do: Eab.MemoryMonitor.untrusted_host(endpoint)
 
   defp model_detail(endpoint, field) do
@@ -1395,6 +1502,66 @@ defmodule EabWeb.DashboardLive do
               <p :if={@provider == "local"} id="server-thinking" class="fine-print">
                 Server thinking preset: {Eab.Thinking.reported(@endpoint) || "Not reported"}
               </p>
+              <form
+                :if={@provider == "local"}
+                id="model-source"
+                phx-change="source"
+                phx-submit="declare_source"
+              >
+                <h4>Model file source <span class="muted">— required before Run</span></h4>
+                <label for="source-url">Model file URL</label>
+                <input
+                  id="source-url"
+                  name="source[url]"
+                  value={@source_form["url"]}
+                  placeholder="https://huggingface.co/author/repository/blob/main/file.gguf"
+                  autocomplete="off"
+                />
+                <label for="source-release">
+                  Release label <span class="muted">— optional, such as v3.1</span>
+                </label>
+                <input
+                  id="source-release"
+                  name="source[release_label]"
+                  value={@source_form["release_label"]}
+                  maxlength="40"
+                  autocomplete="off"
+                />
+                <button type="submit" disabled={@source_busy}>
+                  {if @source_busy, do: "Looking up…", else: "Declare source"}
+                </button>
+                <p :if={@source_error} id="source-error" class="fine-print" role="alert">
+                  {@source_error}
+                </p>
+              </form>
+              <dl :if={@provider == "local" and @endpoint["source"]} id="declared-source">
+                <div>
+                  <dt>Source</dt><dd>{ModelSource.label(@endpoint["source"])}</dd>
+                </div><div :if={@endpoint["source"]["author"]}>
+                  <dt>Hugging Face author</dt><dd>{@endpoint["source"]["author"]}</dd>
+                </div><div :if={@endpoint["source"]["lookup"]}>
+                  <dt>Commit</dt><dd>
+                    <code>{@endpoint["source"]["lookup"]["commit"]}</code>
+                    {if @endpoint["source"]["lookup"]["commit_date"],
+                      do: " · " <> String.slice(@endpoint["source"]["lookup"]["commit_date"], 0, 10)}
+                  </dd>
+                </div><div :for={file <- (@endpoint["source"]["lookup"] || %{})["files"] || []}>
+                  <dt>{Path.basename(file["path"])}</dt><dd>
+                    <code>{file["sha256"] || "no sha256"}</code>
+                    · {size_label(file["size_bytes"])}
+                    {if file["last_commit_date"],
+                      do: " · uploaded " <> String.slice(file["last_commit_date"], 0, 10)}
+                  </dd>
+                </div>
+              </dl>
+              <p
+                :if={@provider == "local" and source_mismatch(@endpoint)}
+                id="source-name-warning"
+                class="fine-print"
+                role="alert"
+              >
+                {source_mismatch(@endpoint)}
+              </p>
             </div>
             <form id="settings" phx-change="settings">
               <label :if={@provider == "claude" and @endpoint}>
@@ -1580,6 +1747,13 @@ defmodule EabWeb.DashboardLive do
                 0,
                 12
               )}</code></span>
+            </p>
+            <p
+              :if={@run["model"]["source"] || Series.weights(@run)}
+              id="run-source"
+              class="fine-print"
+            >
+              Model file source: {ModelSource.label(@run["model"]["source"])} · {weights_label(@run)}
             </p>
             <p
               class="run-message"

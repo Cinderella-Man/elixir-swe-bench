@@ -41,7 +41,8 @@ defmodule Eab.Series do
           "quantization" => identity["quantization"],
           "api_model" => if(model["backend"] in @api_backends, do: model["model"])
         }
-        |> put_creator(creator(run)),
+        |> put_creator(creator(run))
+        |> put_hashes(weights(run)),
       "chat_template_sha256" =>
         if(is_binary(profile["chat_template"]), do: Eab.Inventory.hash(profile["chat_template"])),
       "sampling_defaults" =>
@@ -50,7 +51,12 @@ defmodule Eab.Series do
     }
   end
 
-  def id(run), do: Cache.key(setup(run))
+  def id(run, opts \\ [])
+
+  def id(run, hashes: false),
+    do: Cache.key(update_in(setup(run), ["model"], &Map.delete(&1, "sha256")))
+
+  def id(run, _), do: Cache.key(setup(run))
 
   @doc """
   Who made the served quantization, as its GGUF names itself; the memory collector reads it
@@ -72,6 +78,32 @@ defmodule Eab.Series do
   # Only a known maker joins the identity, so series whose files name no one keep their IDs.
   defp put_creator(model, nil), do: model
   defp put_creator(model, creator), do: Map.put(model, "quantized_by", creator)
+
+  @doc """
+  The served weight files with the sha256 the collector measured on the model host, in shard
+  order, or nil when they were not hashed. Every session that hashed them must agree.
+  """
+  def weights(run) do
+    model = run["model"] || %{}
+    artifact = ModelIdentity.served_artifact(model)
+
+    hashed =
+      for session <- get_in(run, ["memory", "sessions"]) || [],
+          identity = session["identity"] || %{},
+          identity["model_artifact"] == artifact and identity["backend"] == model["backend"],
+          %{"status" => "hashed", "files" => files} <- [session["weight_hashes"]],
+          do: files
+
+    case Enum.uniq(hashed) do
+      [files] -> files
+      _ -> nil
+    end
+  end
+
+  # The bytes served join the identity (ADR 0018): a maker's re-upload under the same name is
+  # another model. Series made before hashes were recorded keep their IDs.
+  defp put_hashes(model, nil), do: model
+  defp put_hashes(model, files), do: Map.put(model, "sha256", Enum.map(files, & &1["sha256"]))
 
   @doc "An artifact's name without its shard number, as a series records it."
   def artifact(nil), do: nil
@@ -260,17 +292,18 @@ defmodule Eab.Series do
         "case_fixtures" => record["case_fixtures"]
       })
 
-    # A run about to start has no memory yet, so its files' maker is still unread; export
-    # compares the whole setup again once the collector has named it.
+    # A run about to start has no memory yet, so its files' maker and hashes are still
+    # unread; export compares the whole setup again once the collector has read them.
     actual =
-      case {expected["model"], setup(run)} do
-        {%{"quantized_by" => creator}, %{"model" => model} = actual}
-        when not is_map_key(model, "quantized_by") ->
-          put_in(actual, ["model", "quantized_by"], creator)
+      Enum.reduce(~w(quantized_by sha256), setup(run), fn key, actual ->
+        case {expected["model"], actual["model"]} do
+          {%{^key => value}, model} when not is_map_key(model, key) ->
+            put_in(actual, ["model", key], value)
 
-        {_, actual} ->
-          actual
-      end
+          _ ->
+            actual
+        end
+      end)
 
     differences =
       for field <- Enum.sort(Map.keys(expected)),

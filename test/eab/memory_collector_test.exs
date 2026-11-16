@@ -245,11 +245,98 @@ defmodule Eab.MemoryCollectorTest do
     File.write!(silent, gguf([{"general.name", 8, "Swift 1.5"}]))
     refute Map.has_key?(Weights.read(silent), "quantized_by")
 
+    # Release and calibration keys are kept, a calibration path only by its file name.
+    versioned = Path.join(dir, "Versioned-UD-Q6_K_L.gguf")
+
+    File.write!(
+      versioned,
+      gguf([
+        {"general.version", 8, "v3.1"},
+        {"tokenizer.ggml.tokens", 9, ["a", "b"]},
+        {"quantize.imatrix.dataset", 8, "/workspace/calibration_v3.txt"},
+        {"quantize.imatrix.chunks_count", 4, 720},
+        {"general.quantized_by", 8, "Unsloth"},
+        {"tokenizer.chat_template", 8, "{{ messages }}"}
+      ])
+    )
+
+    assert Weights.read(versioned)["gguf"] == %{
+             "general.version" => "v3.1",
+             "quantize.imatrix.dataset" => "calibration_v3.txt",
+             "quantize.imatrix.chunks_count" => 720
+           }
+
+    assert Weights.read(versioned)["quantized_by"] == "Unsloth"
+
     # A header cut short still counts the file; it only names no one.
     broken = Path.join(dir, "Broken-Q8_0.gguf")
     File.write!(broken, <<"GGUF", 3::little-32, 0::little-64, 5::little-64, 99::little-64>>)
     assert Weights.read(broken)["size_bytes"] > 0
     refute Map.has_key?(Weights.read(broken), "quantized_by")
+  end
+
+  test "hashes each served file once, reusing the host cache until the file changes", ctx do
+    alias Eab.MemoryCollector.Weights
+    dir = Path.join(ctx.proc, "hashed")
+    File.mkdir_p!(dir)
+    first = Path.join(dir, "Model-Q8_0-00001-of-00002.gguf")
+    second = Path.join(dir, "Model-Q8_0-00002-of-00002.gguf")
+    File.write!(first, "first shard")
+    File.write!(second, "second shard")
+    cache = Path.join(dir, "cache/weight-hashes.json")
+    sha = &(:crypto.hash(:sha256, &1) |> Base.encode16(case: :lower))
+
+    assert {:ok, files} = Weights.hashes(Weights.files(first), nil, cache)
+
+    assert files == [
+             %{
+               "name" => Path.basename(first),
+               "size_bytes" => 11,
+               "sha256" => sha.("first shard")
+             },
+             %{
+               "name" => Path.basename(second),
+               "size_bytes" => 12,
+               "sha256" => sha.("second shard")
+             }
+           ]
+
+    # An unchanged file is not read again: a planted cache value is returned as it is.
+    planted = JSON.decode!(File.read!(cache))
+    planted = put_in(planted, [first, "sha256"], String.duplicate("b", 64))
+    File.write!(cache, JSON.encode!(planted))
+    assert {:ok, [%{"sha256" => cached}, _]} = Weights.hashes([first, second], nil, cache)
+    assert cached == String.duplicate("b", 64)
+
+    # A replaced file (new inode, size and times) is read again.
+    File.rm!(first)
+    File.write!(first, "a newer upload")
+    assert {:ok, [%{"sha256" => fresh}, _]} = Weights.hashes([first, second], nil, cache)
+    assert fresh == sha.("a newer upload")
+
+    # A file changed after the server started is not what it loaded, so nothing is hashed.
+    started = System.os_time(:second) - 3600
+    assert {:changed, _} = Weights.hashes([first, second], started, cache)
+  end
+
+  test "records the server's command line without secrets, and llama.cpp's KV cache types", ctx do
+    args =
+      ["/opt/llama/llama-server", "-m", "/models/m.gguf", "--api-key", "secret", "-ctk", "q8_0"] ++
+        ["--cache-type-v=q8_0", "--hf-token=abc"]
+
+    File.write!(Path.join([ctx.proc, "10", "cmdline"]), Enum.join(args, <<0>>) <> <<0>>)
+    recorded = Collector.server_args(ctx.proc, 10)
+    refute Enum.any?(recorded, &(&1 =~ "secret" or &1 =~ "abc"))
+    assert "--hf-token=[redacted]" in recorded
+    assert Collector.kv_cache(recorded) == "q8_0"
+
+    assert Collector.kv_cache(["llama-server", "--model", "m.gguf", "-ctk", "q4_0"]) ==
+             "K q4_0 · V f16"
+
+    assert Collector.kv_cache(["llama-server", "-hf", "unsloth/X"]) == "f16"
+    # A proxy in front of the server says nothing about its cache.
+    assert Collector.kv_cache(["llama-swap", "--config", "c.yaml"]) == nil
+    assert Collector.server_args(ctx.proc, 11) == nil
   end
 
   test "counts the GGUF files a Strata pack lists, except a drafter-only file", ctx do

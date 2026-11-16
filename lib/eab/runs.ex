@@ -599,12 +599,15 @@ defmodule Eab.Runs do
   end
 
   # A case run again must use the source's model and harness. Server build, slots and hardware
-  # may differ, as within a run series (ADR 0011); the maker is read from the files only later.
+  # may differ, as within a run series (ADR 0011); the maker and hashes are read from the files
+  # only later.
   defp same_model!(run, expected) do
     fields = ~w(harness server_type model chat_template_sha256 sampling_defaults)
 
     comparable = fn setup ->
-      setup |> Map.take(fields) |> update_in(["model"], &Map.delete(&1 || %{}, "quantized_by"))
+      setup
+      |> Map.take(fields)
+      |> update_in(["model"], &Map.drop(&1 || %{}, ~w(quantized_by sha256)))
     end
 
     expected = comparable.(expected)
