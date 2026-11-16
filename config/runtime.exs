@@ -45,8 +45,17 @@ if config_env() != :test do
     lookahead: String.to_integer(System.get_env("EAB_PREPARE_AHEAD", "4")),
     preparation_workers: String.to_integer(System.get_env("EAB_PREPARE_WORKERS", "2"))
 
+  # The dashboard listens on 127.0.0.1. EAB_DASHBOARD_HOSTS lists further hostnames/IPs it is
+  # opened from through a forward (such as Tailscale serve); its live connections accept them too.
+  dashboard_hosts =
+    (present.("EAB_DASHBOARD_HOSTS") || "")
+    |> String.split(",", trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+
   config :eab, EabWeb.Endpoint,
     secret_key_base: File.read!(secret_path),
     http: [ip: {127, 0, 0, 1}, port: String.to_integer(System.get_env("PORT", "4000"))],
+    check_origin: ["//localhost", "//127.0.0.1" | Enum.map(dashboard_hosts, &("//" <> &1))],
     server: true
 end

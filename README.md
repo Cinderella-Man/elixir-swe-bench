@@ -22,6 +22,14 @@ docker compose up --build -d
 
 Open [http://localhost:4000](http://localhost:4000). Enter the server root, for example `http://localhost:8080`, and an optional API key. Model details load automatically. Click **Run benchmark**; first preparation downloads project dependencies and fixture images. The website shows each stage, case results and downloadable evidence.
 
+The dashboard listens on `127.0.0.1` only. To open it from another machine, forward the port (for example `tailscale serve --bg --tcp=4000 tcp://127.0.0.1:4000` on this host) and list the names you open it by in the ignored `.env`, then recreate the container (`docker compose up -d`):
+
+```dotenv
+EAB_DASHBOARD_HOSTS=<host>.<tailnet>.ts.net,<host>,<tailscale-ip>
+```
+
+Without them the page loads but its live updates and buttons are refused. ChatGPT sign-in still needs `localhost`: its callback returns to `127.0.0.1` on the browser's machine.
+
 To use your ChatGPT subscription, choose **ChatGPT** under **Model source**, then **Continue with ChatGPT**. Authorize this app in your browser using your usual sign-in method, including Google, and select a model from your account's catalog. The endpoint is configured automatically. The callback uses `127.0.0.1` on the dashboard port. No Platform API key or Codex credential file is needed. Saved account/workspace registrations appear in the connection panel; each keeps its own credentials. [Manage the app's ChatGPT allowance](https://chatgpt.com/settings/usage).
 
 To use Claude models on your Claude subscription, choose **Claude Code** under **Model source**. These runs use the Claude Code harness instead of Pi ([ADR 0010](docs/adr/0010-run-subscription-claude-through-claude-code-harness.md)): install the solver kit with `scripts/install-claude-code-kit.sh`, open its folder in a Claude desktop Code session, start the run here and type `/solve-run` there. Each run records its harness; compare models only within one harness. See [the runbook](docs/runbook.md#claude-code-harness).
