@@ -38,6 +38,14 @@ _Avoid_: repeats, trial set, epochs
 
 **Published result**: Outcomes for the current admitted cases from one run series, with matching case fixture hashes, model identity, harness and recorded evaluation conditions. Rejected cases are omitted. Each published result is one run series, not a single run: its score is the mean of the runs it has so far, it states how many of the three required runs that is, and each case shows how many of those runs passed. Rows may have different effective settings. Each run also states the case times and model speed it recorded, which belong to that run alone.
 
+**Machine**: Where a run's model was served: the model host's GPUs with their memory, CPU, system RAM, the model server and its build, the KV cache type and the server's speed-related flags. Runs of one run series may use different machines; each published run states its own.
+_Avoid_: hardware profile, rig
+
+**Speed cases**: A few current cases of a benchmark release on which model speed is compared, ranging from short to long conversations. A model generates more slowly as its conversation grows, so only measurements on the same cases compare.
+
+**Speed run**: A run of only the speed cases, one at a time, on a model served by llama.cpp or Strata, published for its case times, model speed and machine. It is never scored and joins no run series, so any quantization or machine of a model can be measured. A full run timed on every speed case also counts as a speed measurement.
+_Avoid_: speed benchmark, speed series
+
 **Attempt**: One agent's investigation, edits, tool calls and submission for a case. A run records one scored attempt per case and retains interrupted work separately.
 
 **Parallel attempts**: The most attempts one run works on at the same time. It is a run setting, 1 by default; runs of one run series may use different values. Elapsed attempt time is recorded only when it is 1.

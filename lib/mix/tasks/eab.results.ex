@@ -42,13 +42,15 @@ defmodule Mix.Tasks.Eab.Results do
             do: Keyword.put(export_opts, :resources, Eab.Results.read!(opts[:resources])),
             else: export_opts
 
-        status = Eab.Results.publish!(Eab.Results.read!(path), export_opts)
+        run = Eab.Results.read!(path)
+        status = Eab.Results.publish!(run, export_opts)
 
         Mix.shell().info(
-          if(status == :added,
-            do: "Added to its run series on the results page",
-            else: "Already added; rebuilt results page"
-          )
+          cond do
+            status != :added -> "Already added; rebuilt results page"
+            Eab.Results.speed_run?(run) -> "Added to the speed runs on the results page"
+            true -> "Added to its run series on the results page"
+          end
         )
 
       ["check"] ->

@@ -58,6 +58,8 @@ defmodule EabWeb.DashboardLive do
           "claude_code" => %{}
         },
         validation: false,
+        speed: false,
+        speed_case_count: speed_case_count(),
         source_form: %{"url" => "", "release_label" => ""},
         source_busy: false,
         source_error: nil,
@@ -125,6 +127,13 @@ defmodule EabWeb.DashboardLive do
   defp subscription_defaults,
     do: Map.merge(@defaults, %{"max_tokens" => "262144", "reasoning_effort" => "high"})
 
+  # The current benchmark's speed cases, or none before config/speed-cases.json names them.
+  defp speed_case_count do
+    length(Inventory.speed_cases())
+  rescue
+    _ -> 0
+  end
+
   defp prefill_contribution(socket, series) do
     settings =
       series["settings"]
@@ -136,7 +145,8 @@ defmodule EabWeb.DashboardLive do
     assign(socket,
       contribution: series,
       settings: Map.merge(socket.assigns.settings, settings),
-      validation: false
+      validation: false,
+      speed: false
     )
   end
 
@@ -287,6 +297,17 @@ defmodule EabWeb.DashboardLive do
   def handle_event("validation", params, socket),
     do: {:noreply, assign(socket, validation: params["validation"] == "true")}
 
+  # A speed run times the speed cases only and joins no run series (ADR 0020).
+  def handle_event("speed", params, socket) do
+    speed = params["speed"] == "true"
+
+    {:noreply,
+     assign(socket,
+       speed: speed,
+       contribution: if(speed, do: nil, else: socket.assigns.contribution)
+     )}
+  end
+
   def handle_event("claude_code_scope", %{"scope" => scope}, socket) do
     kind = if scope["kind"] in ["dry_attempt", "escape_test"], do: scope["kind"], else: ""
     {:noreply, assign(socket, check_kind: kind, check_case: scope["case"] || "")}
@@ -408,6 +429,7 @@ defmodule EabWeb.DashboardLive do
     opts = [
       parallel_attempts: socket.assigns.parallel,
       validation: socket.assigns.validation and claude_code,
+      speed: socket.assigns.speed and socket.assigns.provider == "local",
       series: socket.assigns.contribution && socket.assigns.contribution["series_id"],
       check:
         if(claude_code and socket.assigns.check_kind != "",
@@ -1667,6 +1689,20 @@ defmodule EabWeb.DashboardLive do
                 Cases worked on at once. Keep 1 for a model on a single local server; above 1, no elapsed times are recorded.
               </p>
             </form>
+            <form
+              :if={@provider == "local" and @speed_case_count > 0}
+              id="speed-form"
+              phx-change="speed"
+            >
+              <label class="run-choice">
+                <input type="hidden" name="speed" value="false" />
+                <input id="speed-run" type="checkbox" name="speed" value="true" checked={@speed} />
+                Speed run · only the {@speed_case_count} speed cases, one at a time; never scored
+              </label>
+              <p :if={@speed} id="speed-run-note" class="fine-print">
+                Publishes the cases' times, the model's tokens per second and the model host's GPUs, CPU, RAM, server build and speed-related server flags. It joins no run series, so any quantization and machine can be measured.
+              </p>
+            </form>
           </div>
           <button
             id="run"
@@ -1775,9 +1811,12 @@ defmodule EabWeb.DashboardLive do
               · Experiment <code>{String.slice(@run["experiment_id"], 0, 12)}</code>
               · {@run["resume_count"] || 0} resumptions
             </p>
-            <p :if={@run["selection"]} class="fine-print">
+            <p :if={@run["selection"] && !Results.speed_run?(@run)} class="fine-print">
               Partial run based on {@run["selection"]["source_run"]}. Original outcomes are preserved;
               this run has no full benchmark score.
+            </p>
+            <p :if={Results.speed_run?(@run)} id="speed-run-scope" class="fine-print">
+              Speed run on the {length(@run["cases"])} speed cases: published for its times, model speed and machine, never scored.
             </p>
             <button
               :if={@run["release_id"] && @run["status"] in ["interrupted", "cancelled", "error"]}
@@ -1836,9 +1875,11 @@ defmodule EabWeb.DashboardLive do
                 <a :if={@report_available} href={"/artifacts/#{@run["id"]}/report.md"} download>Download report ↓</a>
                 <button
                   :if={
-                    @run["status"] == "completed" && is_nil(@run["selection"]) &&
-                      !is_nil(@score["score_percent"]) &&
-                      (@run["validation"] != true || Eab.Series.admitted_validation?(@run))
+                    (@run["status"] == "completed" && is_nil(@run["selection"]) &&
+                       !is_nil(@score["score_percent"]) &&
+                       (@run["validation"] != true || Eab.Series.admitted_validation?(@run))) ||
+                      (@run["status"] == "completed" && Results.speed_run?(@run) &&
+                         @score["passed"] + @score["failed"] == @score["planned"])
                   }
                   id="add-result"
                   class="secondary"
@@ -1858,6 +1899,9 @@ defmodule EabWeb.DashboardLive do
 
                     @result_added ->
                       "Added to results page"
+
+                    Results.speed_run?(@run) ->
+                      "Add speed run to results page"
 
                     true ->
                       "Add to results page"

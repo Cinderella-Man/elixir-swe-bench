@@ -379,6 +379,11 @@ defmodule Eab.MemoryMonitor do
     end
   end
 
+  defp put_ram(session, bytes) when is_integer(bytes) and bytes > 0,
+    do: Map.put(session, "host_ram_bytes", bytes)
+
+  defp put_ram(session, _), do: session
+
   defp event(%{"type" => "ready", "identity" => identity}, state) do
     {:noreply, %{state | session: Map.put(state.session, "identity", identity)}}
   end
@@ -409,6 +414,8 @@ defmodule Eab.MemoryMonitor do
         |> Map.put("last_sample_at", sample["at"])
         |> Map.put("peaks", maxima(state.session["peaks"], Map.take(sample, @counters)))
         |> Map.put("gpus", gpu_maxima(state.session["gpus"], sample["gpus"]))
+        # The model host's installed RAM, published with the run's machine (ADR 0020).
+        |> put_ram(sample["host_ram_total_bytes"])
 
       state =
         %{

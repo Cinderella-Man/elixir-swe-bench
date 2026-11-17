@@ -243,13 +243,13 @@ defmodule Eab.ResultsTest do
     end
   end
 
-  test "schema 8 series stay valid unchanged and are upgraded when they take another run" do
+  test "older series stay valid unchanged and are upgraded when they take another run" do
     timed = fn source ->
       put_in(source, ["attempts", "case-a", "measurement"], llama_measurement())
     end
 
     record = Results.export!(timed.(run()))
-    assert record["schema_version"] == 9
+    assert record["schema_version"] == 10
 
     published =
       record
@@ -257,7 +257,7 @@ defmodule Eab.ResultsTest do
       |> update_in(["runs"], fn [run] ->
         [
           run
-          |> Map.delete("timing")
+          |> Map.drop(["timing", "machine"])
           |> Map.update!("cases", fn cases -> Enum.map(cases, &Map.delete(&1, "timing")) end)
         ]
       end)
@@ -280,13 +280,263 @@ defmodule Eab.ResultsTest do
       |> Results.export!()
 
     merged = Results.merge!(published, second)
-    assert merged["schema_version"] == 9
+    assert merged["schema_version"] == 10
     [first, added] = merged["runs"]
     assert first["timing"] == nil and Enum.all?(first["cases"], &is_nil(&1["timing"]))
+    assert first["machine"] == nil
     assert added["timing"]["time_ms"] == 120_000
 
     # A repeated click keeps the published file as it was.
     assert Results.merge!(published, record) == published
+  end
+
+  # A run's memory record from the model host, with the server's command line.
+  defp machine_memory(args, ram \\ 137_438_953_472) do
+    identity =
+      Map.take(snapshot(), ~w(model_artifact backend backend_version context_tokens kv_cache cpu))
+      |> Map.merge(%{
+        "host" => "private-machine",
+        "service" => "private.service",
+        "server_args" => args
+      })
+
+    %{
+      "kind" => "run_samples",
+      "status" => "complete",
+      "sample_count" => 2,
+      "peaks" => %{
+        "vram_bytes" => 100,
+        "service_ram_bytes" => 80,
+        "process_rss_bytes" => 90,
+        "combined_bytes" => 120
+      },
+      "sessions" => [
+        %{
+          "identity" => identity,
+          "started_at" => "2026-10-18T00:00:00Z",
+          "finished_at" => "2026-10-18T00:00:02Z",
+          "sample_count" => 2,
+          "interval_ms" => 1000,
+          "gap_count" => 0,
+          "host_ram_bytes" => ram,
+          "gpus" => [
+            %{
+              "uuid" => "private-gpu",
+              "name" => "fixture",
+              "capacity_bytes" => 1000,
+              "used_bytes" => 100
+            }
+          ]
+        }
+      ]
+    }
+  end
+
+  @server_args [
+    "/private/bin/llama-server",
+    "--model",
+    "/models/private-model.gguf",
+    "-ngl",
+    "99",
+    "-ts",
+    "1,1",
+    "-fa",
+    "on",
+    "--no-mmap",
+    "-ctk",
+    "q8_0",
+    "--model-draft",
+    "/models/private-dir/draft-0.6B.gguf",
+    "-ot",
+    "exps=CPU",
+    "-ot",
+    "blk.1=CUDA0",
+    "-t",
+    "-1",
+    "--parallel=1",
+    "--host",
+    "10.9.8.7",
+    "--port",
+    "8414",
+    "--api-key-file",
+    "/private/secret-key"
+  ]
+
+  defp with_machine(source, args \\ @server_args) do
+    source
+    |> put_in(["settings", "window_tokens"], 262_144)
+    |> Map.put("memory", machine_memory(args))
+  end
+
+  test "each run names its machine: GPUs, CPU, RAM, server and its speed flags, never paths or keys" do
+    record = Results.export!(with_machine(run()))
+
+    assert entry(record)["machine"] == %{
+             "gpus" => [%{"name" => "fixture", "memory_bytes" => 1000}],
+             "cpu" => "fixture",
+             "ram_bytes" => 137_438_953_472,
+             "server" => "llama_cpp",
+             "server_build" => "fixture",
+             "kv_cache" => "f16",
+             "flags" => %{
+               "--n-gpu-layers" => "99",
+               "--tensor-split" => "1,1",
+               "--flash-attn" => "on",
+               "--no-mmap" => true,
+               "--cache-type-k" => "q8_0",
+               "--model-draft" => "draft-0.6B.gguf",
+               "--override-tensor" => "exps=CPU blk.1=CUDA0",
+               "--threads" => "-1",
+               "--parallel" => "1"
+             }
+           }
+
+    for private <-
+          ~w(private-machine private.service private-gpu private-model private-dir secret-key 10.9.8.7 8414 /private/),
+        do: refute(Jason.encode!(record) =~ private)
+
+    # Without a memory record, or a command line, nothing is invented.
+    assert entry(Results.export!(run()))["machine"] == nil
+    assert entry(Results.export!(with_machine(run(), [])))["machine"]["flags"] == nil
+
+    change = fn fun -> update_in(record, ["runs"], fn [run] -> [fun.(run)] end) end
+
+    for {message, bad} <- [
+          {~r/Unexpected server flag/,
+           change.(&put_in(&1, ["machine", "flags", "--api-key-file"], "/secret"))},
+          {~r/Invalid value/, change.(&put_in(&1, ["machine", "flags", "--threads"], 4))},
+          {~r/Unknown model server/, change.(&put_in(&1, ["machine", "server"], "vllm"))},
+          {~r/Invalid system RAM/, change.(&put_in(&1, ["machine", "ram_bytes"], 0))},
+          {~r/Unexpected machine fields/, change.(&put_in(&1, ["machine", "host"], "rig"))}
+        ] do
+      assert_raise ArgumentError, message, fn -> Results.validate!(bad) end
+    end
+
+    # A run whose sessions saw different machines cannot say which one it ran on.
+    source = with_machine(run())
+    [session] = source["memory"]["sessions"]
+    other = Map.put(session, "host_ram_bytes", 68_719_476_736)
+
+    assert_raise ArgumentError, ~r/different machines/, fn ->
+      Results.export!(put_in(source, ["memory", "sessions"], [session, other]))
+    end
+  end
+
+  # A completed speed run of case-b, the example benchmark's only speed case here.
+  defp speed_run do
+    run()
+    |> with_machine()
+    |> Map.merge(%{
+      "cases" => ["case-b"],
+      "selection" => %{"kind" => "speed", "cases" => ["case-b"]}
+    })
+    |> put_in(["attempts", "case-b", "measurement"], llama_measurement())
+    |> Map.update!("attempts", &Map.take(&1, ["case-b"]))
+  end
+
+  test "a speed run publishes its speed cases' times and its machine, apart from any series" do
+    speed = Results.export_speed!(speed_run(), speed_cases: ["case-b"])
+    assert speed["kind"] == "speed_run" and speed["schema_version"] == 10
+    assert speed["series_id"] == Eab.Series.id(with_machine(run()))
+    assert speed["run"]["run_id"] == "test-run"
+    assert Enum.map(speed["run"]["cases"], & &1["id"]) == ["case-b"]
+    assert Map.keys(speed["case_fixtures"]) == ["case-b"]
+    assert speed["run"]["timing"]["time_ms"] == 120_000
+    assert speed["run"]["machine"]["flags"]["--tensor-split"] == "1,1"
+    refute Jason.encode!(speed) =~ "private"
+
+    for {message, bad} <- [
+          {~r/not this benchmark's speed cases/,
+           fn -> Results.export_speed!(speed_run(), speed_cases: ["case-a"]) end},
+          {~r/one case at a time/,
+           fn ->
+             Results.export_speed!(Map.put(speed_run(), "parallel_attempts", 2),
+               speed_cases: ["case-b"]
+             )
+           end},
+          {~r/states its time/,
+           fn ->
+             speed_run()
+             |> put_in(["attempts", "case-b", "measurement"], %{"not_measured" => "off"})
+             |> Results.export_speed!(speed_cases: ["case-b"])
+           end},
+          {~r/names the machine/,
+           fn ->
+             Results.export_speed!(Map.delete(speed_run(), "memory"), speed_cases: ["case-b"])
+           end},
+          {~r/published on its own/, fn -> Results.export!(speed_run()) end},
+          {~r/Only a speed run/, fn -> Results.export_speed!(run(), speed_cases: ["case-b"]) end}
+        ] do
+      assert_raise ArgumentError, message, bad
+    end
+  end
+
+  test "speed runs are added beside the series, listed on the page and kept on repeat clicks",
+       %{dir: dir} do
+    page = page(dir)
+    inventory = Eab.Inventory.definition()
+    cases = Eab.Inventory.speed_cases()
+    full = current() |> with_machine()
+
+    source =
+      full
+      |> Map.merge(%{
+        "id" => "speed-run",
+        "cases" => cases,
+        "selection" => %{"kind" => "speed", "cases" => cases}
+      })
+      |> Map.update!("attempts", fn attempts ->
+        attempts
+        |> Map.take(cases)
+        |> Map.new(fn {id, attempt} ->
+          {id, Map.put(attempt, "measurement", llama_measurement())}
+        end)
+      end)
+
+    opts = [page_root: page, inventory: inventory]
+    assert Results.publish!(source, opts) == :added
+    assert File.regular?(Path.join([page, "speed", "speed-run.json"]))
+    assert Results.added?("speed-run", page_root: page)
+    assert Results.publish!(source, opts) == :already_added
+    assert Path.wildcard(Path.join(page, "results/*.json")) == []
+
+    payload = Results.read!(Path.join(page, "dist/results.json"))
+    assert payload["schema_version"] == 10
+    release = Enum.find(payload["releases"], & &1["current"])
+    assert release["speed_cases"] == cases
+    assert [%{"run" => %{"run_id" => "speed-run"}}] = release["speed_runs"]
+
+    # A full run beside it publishes as before, with its machine.
+    assert Results.publish!(full, opts) == :added
+    [series] = built(Path.join(page, "dist/results.json"))
+    assert entry(series)["machine"]["cpu"] == "fixture"
+  end
+
+  test "speed cases are current cases in inventory order, named for this benchmark" do
+    definition = Eab.Inventory.definition()
+    cases = Eab.Inventory.speed_cases(definition)
+    assert Enum.filter(definition["cases"], &(&1 in cases)) == cases
+
+    assert_raise ArgumentError, ~r/another benchmark/, fn ->
+      Eab.Inventory.speed_cases(Map.put(definition, "id", "another-benchmark"))
+    end
+
+    assert_raise ArgumentError, ~r/inventory order/, fn ->
+      Eab.Inventory.speed_cases(Map.put(definition, "cases", Enum.reverse(definition["cases"])))
+    end
+
+    # A speed run resumes on exactly its speed cases.
+    release = %{"protocol" => %{"inventory" => definition}}
+
+    speed = fn cases ->
+      %{"cases" => cases, "selection" => %{"kind" => "speed", "cases" => cases}}
+    end
+
+    assert Eab.Checkpoints.validate_cases!(speed.(cases), release) == :ok
+
+    assert_raise RuntimeError, ~r/differ from the frozen selection/, fn ->
+      Eab.Checkpoints.validate_cases!(speed.(Enum.reverse(cases)), release)
+    end
   end
 
   test "each case says which budget cut its attempt off, including older Pi runs" do

@@ -5,7 +5,14 @@ defmodule Eab.Results do
   `results/` holds the current benchmark release's series; `releases/<name>/` holds an
   earlier release's, kept as published. `releases.json` says which release the page shows first.
   """
-  alias Eab.{ModelIdentity, Results.Schema, Results.Timing, Series}
+  alias Eab.{
+    ModelIdentity,
+    Results.Machine,
+    Results.Schema,
+    Results.Speed,
+    Results.Timing,
+    Series
+  }
 
   def root,
     do:
@@ -31,10 +38,14 @@ defmodule Eab.Results do
     |> Map.new(&{&1, hash(File.read!(Path.join(dir, &1)))})
   end
 
+  @doc "Whether a run is a speed run (ADR 0020): published on its own, never scored."
+  def speed_run?(run), do: get_in(run, ["selection", "kind"]) == "speed"
+
   @doc "A public series record holding only this run, for a new series or to merge."
   def export!(run, opts \\ []) do
     require!(is_map(run), "Expected a run.json object")
     require!(run["status"] == "completed", "Only completed runs can be published")
+    require!(not speed_run?(run), "A speed run is published on its own, not into a run series")
 
     require!(
       run["validation"] != true or Series.admitted_validation?(run),
@@ -55,7 +66,96 @@ defmodule Eab.Results do
     )
 
     require!(Enum.uniq(ids) == ids, "Duplicate case IDs")
+    graded!(run, ids)
+    selected = opts[:inventory] || inventory
+    selected_ids = selected["cases"]
 
+    require!(
+      is_list(selected_ids) and Enum.all?(selected_ids, &(&1 in ids)),
+      "The run has not evaluated every current case"
+    )
+
+    current_fixtures!(run, selected_ids, opts)
+    parts = public_parts!(run, selected, selected_ids, opts)
+    series = Series.id(parts.projected)
+
+    # A series published before hashes were recorded names none in its setup; a run started
+    # for it still joins it, and merge!/2 compares the files when the series records them.
+    series =
+      if run["series"] && run["series"] != series &&
+           Series.id(parts.projected, hashes: false) == run["series"],
+         do: run["series"],
+         else: series
+
+    require!(
+      is_nil(run["series"]) or run["series"] == series,
+      "This run was started for run series #{String.slice(run["series"] || "", 0, 12)} but its setup no longer matches it"
+    )
+
+    record = %{
+      "schema_version" => Schema.current_version(),
+      "series_id" => series,
+      "benchmark" => selected["id"],
+      "model" => parts.model,
+      "harness" => parts.harness,
+      "settings" => parts.settings,
+      "setup" => parts.setup,
+      "case_fixtures" => parts.case_fixtures,
+      "seeds" => if(is_integer(parts.run["seed"]), do: Series.seeds()),
+      "required_runs" => Series.required(),
+      "runs" => [parts.run],
+      "evidence_url" => opts[:evidence_url],
+      "note" => opts[:note] || ""
+    }
+
+    validate!(record)
+  end
+
+  @doc """
+  The public record of a completed speed run (ADR 0020): its model, settings, machine and the
+  speed cases with their times. `series_id` is the run series its setup belongs to.
+  """
+  def export_speed!(run, opts \\ []) do
+    require!(is_map(run), "Expected a run.json object")
+    require!(run["status"] == "completed", "Only completed runs can be published")
+    require!(speed_run?(run), "Only a speed run is published as one")
+    inventory = get_in(run, ["protocol", "inventory"]) || %{}
+    selected = opts[:inventory] || inventory
+    speed = opts[:speed_cases] || Eab.Inventory.speed_cases(selected)
+    ids = run["cases"]
+    require!(ids == speed, "The run's cases are not this benchmark's speed cases")
+
+    require!(
+      is_list(selected["cases"]) and
+        Enum.all?(selected["cases"], &(&1 in (inventory["cases"] || []))),
+      "The run was made for other cases than the current ones"
+    )
+
+    require!(
+      (run["parallel_attempts"] || 1) == 1,
+      "A speed run works on one case at a time"
+    )
+
+    graded!(run, ids)
+    current_fixtures!(run, ids, opts)
+    parts = public_parts!(run, selected, ids, opts)
+
+    Speed.validate!(%{
+      "schema_version" => Schema.current_version(),
+      "kind" => "speed_run",
+      "series_id" => Series.id(parts.projected),
+      "benchmark" => selected["id"],
+      "model" => parts.model,
+      "harness" => parts.harness,
+      "settings" => parts.settings,
+      "setup" => parts.setup,
+      "case_fixtures" => parts.case_fixtures,
+      "run" => parts.run,
+      "note" => opts[:note] || ""
+    })
+  end
+
+  defp graded!(run, ids) do
     for id <- ids do
       attempt = get_in(run, ["attempts", id]) || %{}
 
@@ -64,25 +164,26 @@ defmodule Eab.Results do
         "#{id}: missing, interrupted or errored outcome cannot be scored"
       )
     end
+  end
 
-    selected = opts[:inventory] || inventory
-    selected_ids = selected["cases"]
+  defp current_fixtures!(run, ids, opts) do
     fixtures = get_in(run, ["protocol", "fixtures"]) || %{}
 
-    require!(
-      is_list(selected_ids) and Enum.all?(selected_ids, &(&1 in ids)),
-      "The run has not evaluated every current case"
-    )
-
     if opts[:inventory] do
-      for id <- selected_ids do
+      for id <- ids do
         require!(
           fixtures[id] == fixture_hashes(id, opts[:case_root]),
           "#{id}: recorded fixtures differ from the current case"
         )
       end
     end
+  end
 
+  # The public model, harness, settings and setup of a run, and the run itself with the
+  # outcomes of `ids`. The setup is the series' over the current cases, `selected`.
+  defp public_parts!(run, selected, ids, opts) do
+    inventory = get_in(run, ["protocol", "inventory"]) || %{}
+    fixtures = get_in(run, ["protocol", "fixtures"]) || %{}
     claude_code = get_in(run, ["harness", "name"]) == "claude_code"
 
     require!(
@@ -93,23 +194,8 @@ defmodule Eab.Results do
     # The series is defined by the current cases only; retired cases are projected away.
     projected =
       run
-      |> Map.put("cases", selected_ids)
+      |> Map.put("cases", selected["cases"])
       |> put_in(["protocol", "inventory"], Map.put(inventory, "id", selected["id"]))
-
-    series = Series.id(projected)
-
-    # A series published before hashes were recorded names none in its setup; a run started
-    # for it still joins it, and merge!/2 compares the files when the series records them.
-    series =
-      if run["series"] && run["series"] != series &&
-           Series.id(projected, hashes: false) == run["series"],
-         do: run["series"],
-         else: series
-
-    require!(
-      is_nil(run["series"]) or run["series"] == series,
-      "This run was started for run series #{String.slice(run["series"] || "", 0, 12)} but its setup no longer matches it"
-    )
 
     model = run["model"] || %{}
     identity = ModelIdentity.details(model)
@@ -144,13 +230,12 @@ defmodule Eab.Results do
       end
 
     settings = Map.delete(run["settings"] || %{}, "seed")
-    seed = get_in(run, ["settings", "seed"])
     profile = model["profile"] || %{}
     # Times are comparable only when the run worked on one case at a time (ADRs 0014 and 0019).
     timed? = (run["parallel_attempts"] || 1) == 1 and not claude_code
 
     cases =
-      Enum.map(selected_ids, fn id ->
+      Enum.map(ids, fn id ->
         attempt = run["attempts"][id]
 
         %{
@@ -163,11 +248,9 @@ defmodule Eab.Results do
         }
       end)
 
-    record = %{
-      "schema_version" => 9,
-      "series_id" => series,
-      "benchmark" => selected["id"],
-      "model" => %{
+    %{
+      projected: projected,
+      model: %{
         "name" => opts[:model_label] || files["name"] || identity["name"],
         "backend" => model["backend"],
         "quantization" => quant,
@@ -202,35 +285,29 @@ defmodule Eab.Results do
         "weight_files" => measured,
         "gguf" => gguf(weights)
       },
-      "harness" => public_harness(run),
-      "settings" => settings,
-      "setup" => Series.public_setup(Series.setup(projected)),
-      "case_fixtures" => Map.new(selected_ids, &{&1, fixtures[&1] || %{}}),
-      "seeds" => if(is_integer(seed), do: Series.seeds()),
-      "required_runs" => Series.required(),
-      "runs" => [
-        %{
-          "run_id" => run["id"],
-          "created_at" => run["created_at"],
-          "seed" => seed,
-          "source_release_id" => run["release_id"],
-          "code_version" =>
-            List.last(run["code_versions"] || [get_in(run, ["protocol", "implementation"])]),
-          "deployment" => %{
-            "server_build" => profile["build_info"],
-            "total_slots" => profile["total_slots"],
-            "parallel_attempts" => run["parallel_attempts"] || 1
-          },
-          "cases" => cases,
-          "timing" => Timing.of_run(cases),
-          "resources" => resources
-        }
-      ],
-      "evidence_url" => opts[:evidence_url],
-      "note" => opts[:note] || ""
+      harness: public_harness(run),
+      settings: settings,
+      setup: Series.public_setup(Series.setup(projected)),
+      case_fixtures: Map.new(ids, &{&1, fixtures[&1] || %{}}),
+      run: %{
+        "run_id" => run["id"],
+        "created_at" => run["created_at"],
+        "seed" => get_in(run, ["settings", "seed"]),
+        "source_release_id" => run["release_id"],
+        "code_version" =>
+          List.last(run["code_versions"] || [get_in(run, ["protocol", "implementation"])]),
+        "deployment" => %{
+          "server_build" => profile["build_info"],
+          "total_slots" => profile["total_slots"],
+          "parallel_attempts" => run["parallel_attempts"] || 1
+        },
+        "cases" => cases,
+        "timing" => Timing.of_run(cases),
+        # Where the model ran: GPUs, CPU, RAM, server and its speed flags (ADR 0020).
+        "machine" => Machine.from_run(run["memory"]),
+        "resources" => resources
+      }
     }
-
-    validate!(record)
   end
 
   @doc """
@@ -350,18 +427,21 @@ defmodule Eab.Results do
     end
   end
 
-  # A schema 8 series published no timing; its runs say so with null when it takes another.
-  defp upgrade(%{"schema_version" => 8} = record) do
+  # An older series takes the current schema when it takes another run. Its runs recorded
+  # what they recorded: timing before schema 9 and the machine before 10 are null.
+  defp upgrade(record) do
     runs =
       Enum.map(record["runs"], fn run ->
-        cases = Enum.map(run["cases"], &Map.put(&1, "timing", nil))
-        Map.merge(run, %{"cases" => cases, "timing" => nil})
+        cases = Enum.map(run["cases"], &Map.put_new(&1, "timing", nil))
+
+        run
+        |> Map.put("cases", cases)
+        |> Map.put_new("timing", nil)
+        |> Map.put_new("machine", nil)
       end)
 
-    %{record | "schema_version" => 9, "runs" => runs}
+    %{record | "schema_version" => Schema.current_version(), "runs" => runs}
   end
-
-  defp upgrade(record), do: record
 
   def load!(directory \\ Path.join(root(), "results")) do
     records =
@@ -413,7 +493,23 @@ defmodule Eab.Results do
         "releases/#{name}: the series of one release must share its benchmark, cases and case files"
       )
 
-      %{"id" => first["benchmark"], "case_count" => length(cases), "records" => records}
+      speed = Speed.load!(Path.join(directory, "speed"))
+
+      speed_cases =
+        speed |> Enum.map(&Enum.map(&1["run"]["cases"], fn c -> c["id"] end)) |> Enum.uniq()
+
+      require!(
+        Enum.all?(speed, &(&1["benchmark"] == first["benchmark"])) and length(speed_cases) <= 1,
+        "releases/#{name}: its speed runs must share its benchmark and speed cases"
+      )
+
+      %{
+        "id" => first["benchmark"],
+        "case_count" => length(cases),
+        "records" => records,
+        "speed" => speed,
+        "speed_cases" => List.first(speed_cases)
+      }
     end)
   end
 
@@ -444,20 +540,31 @@ defmodule Eab.Results do
   end
 
   def added?(id, opts \\ []) do
+    page = opts[:page_root] || root()
+
     is_binary(id) and Regex.match?(~r/^[A-Za-z0-9_-]+$/, id) and
-      Enum.any?(
-        Path.wildcard(Path.join([opts[:page_root] || root(), "results", "*.json"])) ++
-          Path.wildcard(Path.join([opts[:page_root] || root(), "releases", "*", "*.json"])),
-        fn path ->
-          case Jason.decode(File.read!(path)) do
-            {:ok, %{"runs" => runs}} when is_list(runs) -> Enum.any?(runs, &(&1["run_id"] == id))
-            _ -> false
-          end
-        end
-      )
+      (File.regular?(Path.join([page, "speed", id <> ".json"])) or
+         Path.wildcard(Path.join([page, "releases", "*", "speed", id <> ".json"])) != [] or
+         added_to_series?(id, opts))
   end
 
-  @doc "Adds a completed run to its series and rebuilds the page; repeats keep the record."
+  defp added_to_series?(id, opts) do
+    Enum.any?(
+      Path.wildcard(Path.join([opts[:page_root] || root(), "results", "*.json"])) ++
+        Path.wildcard(Path.join([opts[:page_root] || root(), "releases", "*", "*.json"])),
+      fn path ->
+        case Jason.decode(File.read!(path)) do
+          {:ok, %{"runs" => runs}} when is_list(runs) -> Enum.any?(runs, &(&1["run_id"] == id))
+          _ -> false
+        end
+      end
+    )
+  end
+
+  @doc """
+  Adds a completed run to its series, or a speed run to the speed runs (ADR 0020), and rebuilds
+  the page; repeats keep the published record.
+  """
   def publish!(run, opts \\ []) do
     page = opts[:page_root] || root()
 
@@ -465,12 +572,26 @@ defmodule Eab.Results do
     :global.trans({{__MODULE__, Path.expand(page)}, self()}, fn ->
       inventory = opts[:inventory] || Eab.Inventory.definition()
       opts = Keyword.merge(opts, page_root: page, inventory: inventory)
-      addition = export!(run, opts)
       records = load!(Path.join(page, "results"))
-      existing = Enum.find(records, &(&1["series_id"] == addition["series_id"]))
-      record = if existing, do: merge!(existing, addition), else: addition
-      status = if existing == record, do: :already_added, else: :added
-      records = Enum.reject(records, &(&1["series_id"] == record["series_id"])) ++ [record]
+      speed = Speed.load!(Path.join(page, "speed"))
+
+      {status, file, record, records, speed} =
+        if speed_run?(run) do
+          addition = export_speed!(run, opts)
+          id = addition["run"]["run_id"]
+
+          if Enum.any?(speed, &(&1["run"]["run_id"] == id)),
+            do: {:already_added, nil, nil, records, speed},
+            else:
+              {:added, Path.join("speed", id <> ".json"), addition, records, speed ++ [addition]}
+        else
+          addition = export!(run, opts)
+          existing = Enum.find(records, &(&1["series_id"] == addition["series_id"]))
+          record = if existing, do: merge!(existing, addition), else: addition
+          status = if existing == record, do: :already_added, else: :added
+          records = Enum.reject(records, &(&1["series_id"] == record["series_id"])) ++ [record]
+          {status, Path.join("results", record["series_id"] <> ".json"), record, records, speed}
+        end
 
       stage =
         Path.join(
@@ -478,19 +599,17 @@ defmodule Eab.Results do
           ".publish-#{Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)}"
         )
 
-      destination = Path.join([page, "results", record["series_id"] <> ".json"])
-
       try do
         # Validate every record and generate every asset before changing the series.
-        build!(records, stage, opts)
-        mkdir_owned!(Path.join(page, "results"), page)
+        build!(records, stage, Keyword.put(opts, :speed, speed))
         mkdir_owned!(Path.join(page, "dist"), page)
 
         if status == :added do
-          staged = Path.join(stage, "series.json")
+          mkdir_owned!(Path.join(page, Path.dirname(file)), page)
+          staged = Path.join(stage, "record.json")
           write!(staged, record)
           inherit_owner!(staged, page)
-          File.rename!(staged, destination)
+          File.rename!(staged, Path.join(page, file))
         end
 
         # Replace complete files, with HTML last so it references the new asset hashes.
@@ -539,14 +658,49 @@ defmodule Eab.Results do
     ids = Enum.map(records, & &1["series_id"])
     require!(Enum.uniq(ids) == ids, "Duplicate series ID")
 
+    # Speed runs of the current release, on its speed cases (ADR 0020).
+    speed = opts[:speed] || Speed.load!(Path.join(page, "speed"))
+    speed_cases = current_speed_cases(inventory, opts)
+
+    for record <- speed do
+      Speed.validate!(record)
+      cases = Enum.map(record["run"]["cases"], & &1["id"])
+
+      require!(
+        record["benchmark"] == inventory["id"] and cases == speed_cases and
+          record["case_fixtures"] == Map.take(expected, cases),
+        "Speed run #{record["run"]["run_id"]} does not match the current speed cases"
+      )
+    end
+
     # Earlier releases stay on the page beside the current one, which takes the new runs.
     frozen = frozen!(page)
     settings = page_settings(page)
     notes = settings["notes"] || %{}
 
     releases =
-      Enum.map(frozen, &release(&1["id"], &1["case_count"], &1["records"], false, notes)) ++
-        [release(inventory["id"], length(inventory["cases"]), records, true, notes)]
+      Enum.map(frozen, fn f ->
+        release(
+          f["id"],
+          f["case_count"],
+          f["records"],
+          false,
+          notes,
+          f["speed"],
+          f["speed_cases"]
+        )
+      end) ++
+        [
+          release(
+            inventory["id"],
+            length(inventory["cases"]),
+            records,
+            true,
+            notes,
+            speed,
+            speed_cases
+          )
+        ]
 
     release_ids = Enum.map(releases, & &1["benchmark"]["id"])
 
@@ -556,10 +710,13 @@ defmodule Eab.Results do
     )
 
     runs =
-      for release <- releases,
-          series <- release["results"],
-          run <- series["runs"],
-          do: run["run_id"]
+      for(
+        release <- releases,
+        series <- release["results"],
+        run <- series["runs"],
+        do: run["run_id"]
+      ) ++
+        for release <- releases, record <- release["speed_runs"], do: record["run"]["run_id"]
 
     require!(Enum.uniq(runs) == runs, "A run appears in more than one release")
     primary = settings["primary"] || inventory["id"]
@@ -569,7 +726,11 @@ defmodule Eab.Results do
       "releases.json names #{primary} as primary, which is not a release on this page"
     )
 
-    payload = %{"schema_version" => 9, "primary" => primary, "releases" => releases}
+    payload = %{
+      "schema_version" => Schema.current_version(),
+      "primary" => primary,
+      "releases" => releases
+    }
 
     repository =
       opts[:repository] ||
@@ -607,14 +768,27 @@ defmodule Eab.Results do
   end
 
   # One release as the page shows it. Its label is the ID's last part, such as "v6".
-  defp release(id, case_count, records, current?, notes) do
+  defp release(id, case_count, records, current?, notes, speed, speed_cases) do
     %{
       "benchmark" => %{"id" => id, "case_count" => case_count},
       "label" => id |> String.split("-") |> List.last(),
       "current" => current?,
       "note" => notes[id],
-      "results" => Enum.map(records, &aggregate/1)
+      "results" => Enum.map(records, &aggregate/1),
+      "speed_cases" => speed_cases,
+      "speed_runs" => speed
     }
+  end
+
+  # The current speed cases. A benchmark whose speed cases are not named yet has none; its
+  # full runs still publish, but no speed run can.
+  defp current_speed_cases(inventory, opts) do
+    opts[:speed_cases] ||
+      try do
+        Eab.Inventory.speed_cases(inventory)
+      rescue
+        _ in [ArgumentError, File.Error] -> nil
+      end
   end
 
   @doc "A series with its mean score, interval, per-case passes, missing seeds and peak memory."

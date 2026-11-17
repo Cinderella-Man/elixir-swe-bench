@@ -100,6 +100,8 @@ defmodule Eab.MemoryMonitorTest do
            }
 
     assert hd(result["sessions"])["gpus"] |> hd() |> Map.fetch!("used_bytes") == 100
+    # The model host's installed RAM is kept for the run's published machine (ADR 0020).
+    assert hd(result["sessions"])["host_ram_bytes"] == 4000
     assert Store.read("runs/memory-test/memory.json") == result
 
     assert {:ok, resumed, _} =

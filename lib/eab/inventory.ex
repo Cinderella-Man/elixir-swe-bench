@@ -20,6 +20,28 @@ defmodule Eab.Inventory do
 
   def all, do: definition()["cases"]
 
+  @doc """
+  The benchmark's speed cases, in inventory order (ADR 0020). They live apart from
+  `config/benchmark.json` so that naming them does not change the frozen release.
+  """
+  def speed_cases(definition \\ definition()) do
+    config = read_json(path("config/speed-cases.json"))
+    cases = config["cases"]
+
+    unless config["benchmark"] == definition["id"],
+      do:
+        raise(
+          ArgumentError,
+          "The speed cases name another benchmark; update config/speed-cases.json"
+        )
+
+    unless is_list(cases) and cases != [] and
+             Enum.filter(definition["cases"], &(&1 in cases)) == cases,
+           do: raise(ArgumentError, "Speed cases must be current cases, in inventory order")
+
+    cases
+  end
+
   def spec(id) do
     unless Process.get({__MODULE__, id}) || id in all(),
       do: raise(ArgumentError, "Unknown benchmark case")

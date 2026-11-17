@@ -115,6 +115,9 @@ defmodule Eab.Report do
        }),
        do: "Rerun of #{case_id} from #{id}, without a per-reply cap or generation budget"
 
+  defp scope(%{"selection" => %{"kind" => "speed", "cases" => cases}}),
+    do: "Speed run on the #{length(cases)} speed cases, never scored"
+
   defp scope(%{"selection" => %{"kind" => "dry_attempt", "cases" => [id]}}),
     do: "Unscored dry attempt on " <> id
 

@@ -4,6 +4,7 @@ const emit = value => process.stdout.write(JSON.stringify(value) + '\n');
 const sample = (n, gpu, ram) => ({
   type: 'sample', at: `2026-10-18T00:00:0${n}Z`, monotonic_ms: n * 1000,
   vram_bytes: gpu, service_ram_bytes: ram, process_rss_bytes: ram, combined_bytes: gpu + ram,
+  host_ram_total_bytes: 4000,
   gpus: [{uuid: 'gpu-test', name: 'Fixture', capacity_bytes: 1000, used_bytes: gpu}]
 });
 let buffer = '', started = false;

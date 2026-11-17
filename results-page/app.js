@@ -9,8 +9,8 @@
     if (text !== undefined) e.textContent = text;
     return e;
   };
-  // A schema 8 payload, built by a controller from before ADR 0019, simply has no timing.
-  if (!data || ![8, 9].includes(data.schema_version) ||!Array.isArray(data.releases) || data.releases.length === 0) {
+  // An older controller's payload (schema 8 or 9) simply has no timing or machines.
+  if (!data || ![8, 9, 10].includes(data.schema_version) || !Array.isArray(data.releases) || data.releases.length === 0) {
     $("chart").append(node("p", "empty", "Results could not be loaded. Please reload."));
     return;
   }
@@ -204,35 +204,155 @@
     for (const [label, value] of entries) list.append(node("dt", "", label), node("dd", "", value));
     return list;
   }
-  // Each run's total case time and its model speed summed over the run's model calls.
-  function timing(r) {
-    const table = node("table", "case-table"), head = node("thead"), headRow = node("tr");
-    for (const title of ["Run", "Cases timed", "Case time", "Generation tok/s", "Prompt tok/s", "Draft accepted"]) headRow.append(node("th", "", title));
+  // Where a run's model was served (ADR 0020). Runs published before schema 10 name their GPUs, CPU and server only
+  // through their memory record, without system RAM or server flags.
+  const machineOf = run => run.machine || (run.resources ? {
+    gpus: run.resources.gpus.map(g => ({name: g.name, memory_bytes: g.capacity_bytes})), cpu: run.resources.cpu,
+    ram_bytes: null, server: run.resources.backend, server_build: run.resources.backend_version,
+    kv_cache: run.resources.kv_cache, flags: null} : null);
+  const gpusText = m => {
+    if (!m.gpus.length) return "No GPU";
+    const groups = new Map();
+    for (const g of m.gpus) {
+      const key = `${g.name.replace(/^NVIDIA (GeForce )?/, "")} ${Math.round(g.memory_bytes / 2**30)} GB`;
+      groups.set(key, (groups.get(key) || 0) + 1);
+    }
+    return [...groups].map(([key, n]) => (n > 1 ? `${n}× ` : "") + key).join(" + ");
+  };
+  const cpuText = m => m.cpu && m.cpu.replace(/\((R|TM)\)/g, "").replace(/\s+\d+-Core Processor$/, "").trim();
+  const machineText = m => [gpusText(m), cpuText(m), m.ram_bytes && `${Math.round(m.ram_bytes / 2**30)} GB RAM`].filter(Boolean).join(" · ");
+  const serverText = m => {
+    const name = {llama_cpp: "llama.cpp", strata: "Strata"}[m.server] || m.server;
+    const build = !m.server_build ? name : m.server_build.startsWith(name) ? m.server_build : `${name} ${m.server_build}`;
+    return [build, m.kv_cache && `KV cache ${m.kv_cache}`]
+      .filter(Boolean).join(" · ");
+  };
+  const flagsText = m => m.flags == null ? null :
+    Object.entries(m.flags).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => v === true ? k : `${k} ${v}`).join(" ");
+  // Model speed summed over cases, as a run's timing sums it.
+  const speedSum = cases => cases.map(c => c.timing?.model_speed).filter(Boolean).reduce((a, s) => !a ? {...s} : {
+    source: a.source === s.source ? a.source : "mixed", calls: a.calls + s.calls,
+    prompt_tokens: a.prompt_tokens + s.prompt_tokens, prompt_ms: a.prompt_ms + s.prompt_ms,
+    generated_tokens: a.generated_tokens + s.generated_tokens, generation_ms: a.generation_ms + s.generation_ms,
+    draft_tokens: (a.draft_tokens ?? 0) + (s.draft_tokens ?? 0) || null,
+    draft_accepted: (a.draft_accepted ?? 0) + (s.draft_accepted ?? 0) || null}, null);
+  const generation = s => (s && rate(s.generated_tokens, s.generation_ms)) || "—";
+  const prompt = s => (s && rate(s.prompt_tokens, s.prompt_ms)) || "—";
+  // Speed on the speed cases (ADR 0020): every full run timed on all of them, and every speed run. All rows cover the
+  // same cases, so they compare across quantizations and machines; how fast a model generates depends on how long its
+  // conversations get, so a run's total over other cases would not.
+  const speedCases = release.speed_cases || [];
+  let speedRowsCache = null;
+  function allSpeedRows() {
+    if (speedRowsCache) return speedRowsCache;
+    const rows = [];
+    const add = (r, run, cases, kind) => {
+      const machine = machineOf(run);
+      rows.push({r, run, kind, cases, machine, speed: speedSum(cases), family: family(r),
+        time: cases.reduce((n, c) => n + c.timing.time_ms, 0), passed: cases.filter(c => c.passed).length,
+        hardware: machine ? gpusText(machine) : "Not recorded"});
+    };
+    if (speedCases.length) {
+      for (const r of records) for (const run of r.runs) {
+        const picked = speedCases.map(id => run.cases.find(c => c.id === id));
+        if (picked.every(c => c?.timing)) add(r, run, picked, "run");
+      }
+      for (const s of release.speed_runs || []) add(s, s.run, s.run.cases, "speed");
+    }
+    const tokens = row => row.speed ? row.speed.generated_tokens / row.speed.generation_ms : 0;
+    return speedRowsCache = rows.sort((a, b) => tokens(b) - tokens(a));
+  }
+  const speedNote = () => `Tokens per second on the same ${speedCases.length} speed cases (${speedCases.join(", ")}), so every row ` +
+    "covers the same work: a full run counts its times on these cases, and a speed run runs only these, one at a time. " +
+    "llama.cpp reports its own timings, network excluded; Strata is timed by the benchmark, network included. " +
+    "Pass counts show whether a setup still solves the cases; speed is never scored. Hover a server for its flags.";
+  function speedTable(rows, {showModel} = {}) {
+    const table = node("table", "case-table speed-table"), head = node("thead"), headRow = node("tr");
+    for (const title of [...(showModel ? ["Model"] : []), "Quantization", "Machine", "Server", "Generation tok/s", "Prompt tok/s", "Passed", "Run"])
+      headRow.append(node("th", "", title));
     head.append(headRow); table.append(head);
     const body = node("tbody");
-    for (const run of r.runs) {
-      const row = node("tr"), t = run.timing, s = t?.model_speed;
-      row.append(node("td", "case-id", runName(run)));
-      if (!t) {
-        const cell = node("td", "numeric", untimed(run));
-        cell.colSpan = 5; row.append(cell);
-      } else {
-        const time = node("td", "numeric", duration(t.time_ms));
-        time.title = `${seconds(t.time_ms)} over ${t.measured_cases} cases`;
-        row.append(node("td", "numeric", `${t.measured_cases}/${run.cases.length}`), time,
-          node("td", "numeric", (s && rate(s.generated_tokens, s.generation_ms)) || "—"),
-          node("td", "numeric", (s && rate(s.prompt_tokens, s.prompt_ms)) || "—"),
-          node("td", "numeric", s?.draft_tokens ? `${Math.round(100 * s.draft_accepted / s.draft_tokens)}%` : "—"));
-        row.title = speedText(s);
-      }
-      body.append(row);
+    for (const row of rows) {
+      const tr = node("tr");
+      if (showModel) tr.append(node("td", "case-id", row.r.model.name));
+      tr.append(node("td", "case-id", memberName(row.r)));
+      tr.append(node("td", "case-id", row.machine ? machineText(row.machine) : "Not recorded"));
+      const server = node("td", "case-id", row.machine ? serverText(row.machine) : "—");
+      if (row.machine) server.title = flagsText(row.machine) || "No server flags recorded";
+      const gen = node("td", "numeric", generation(row.speed)), pp = node("td", "numeric", prompt(row.speed));
+      gen.title = pp.title = `${speedText(row.speed)} · ${duration(row.time)} over the speed cases`;
+      const run = node("td", "case-id", `${row.kind === "speed" ? "Speed run" : "Full run"} · ${row.run.created_at.slice(0, 10)}`);
+      run.title = row.run.run_id;
+      tr.append(server, gen, pp, node("td", "numeric", `${row.passed}/${row.cases.length}`), run);
+      body.append(tr);
     }
     table.append(body);
-    return [node("h3", "settings-heading", "Time & speed"), table, node("p", "detail-note",
-      "Case time runs from the agent's start to its finish, model and tool calls included, preparation and grading excluded; " +
-      "a run's time adds up its cases. Speeds are tokens over the time the model spent on them, summed over the run's model calls: " +
-      "llama.cpp reports its own timings, network excluded; other local servers are timed by the benchmark, network included. " +
-      "Times are recorded only when a run works on one case at a time. Runs may come from different machines and days, so speed is not scored.")];
+    // Wide on a phone: the table scrolls in its own box rather than the page.
+    const scroll = node("div", "table-scroll");
+    scroll.append(table);
+    return scroll;
+  }
+  // The speed of every model on every machine, filtered by machine and by the family buttons.
+  let speedOpen = false, speedMachine = "";
+  function speedView() {
+    const rows = allSpeedRows();
+    if (!rows.length) return null;
+    const view = node("details", "table-view");
+    view.open = speedOpen;
+    view.addEventListener("toggle", () => { speedOpen = view.open; });
+    view.append(node("summary", "", `Speed by machine · ${rows.length} measured setups`));
+    const filter = node("label", "speed-filter", "GPUs ");
+    const select = node("select");
+    select.append(new Option("All machines", ""), ...[...new Set(rows.map(row => row.hardware))].sort().map(h => new Option(h, h)));
+    select.value = speedMachine;
+    select.addEventListener("change", () => { speedMachine = select.value; render(); });
+    filter.append(select);
+    const shown = rows.filter(row => (!speedMachine || row.hardware === speedMachine) && (!chosen.size || chosen.has(row.family)));
+    view.append(filter, speedTable(shown, {showModel: true}), node("p", "detail-note", speedNote()));
+    return view;
+  }
+  // One block per run: its outcomes, the machine and server its model ran on, and how fast, together.
+  function runBlocks(r) {
+    const blocks = node("div", "run-blocks");
+    for (const [i, run] of r.runs.entries()) {
+      const block = node("div", "run-block"), list = node("dl", "setting-list");
+      const add = (label, value, className) => {
+        list.append(node("dt", "", label));
+        const dd = node("dd", className || ""); dd.append(value); list.append(dd);
+      };
+      const tokens = sum(run, "generated_tokens"), calls = sum(run, "model_calls");
+      const over = run.cases.filter(c => overBudget(r, c)).length, cut = run.cases.filter(c => c.cutoff);
+      block.append(node("div", "run-block-head", `Run ${i + 1} · ${runName(run)}` + (run.seed != null ? ` · seed ${run.seed}` : "")));
+      const outcome = node("span", "", `${run.cases.filter(c => c.passed).length}/${run.cases.length} passed · ${cut.length} cut off · ` +
+        `${tokens == null ? "—" : fmt(tokens)} output tokens · ${calls == null ? "—" : fmt(calls)} model calls`);
+      if (cut.length) outcome.title = Object.keys(cutoffs).map(kind => [kind, cut.filter(c => c.cutoff === kind).length])
+        .filter(([, n]) => n).map(([kind, n]) => `${cutoffs[kind].label(r)}: ${n}`).join(" · ");
+      if (over) outcome.append(budgetTag(r, over, `in ${over} of this run's ${run.cases.length} cases`));
+      add("Outcome", outcome);
+      const m = machineOf(run);
+      add("Machine", m ? machineText(m) : hosted(r) ? "Hosted API" : "Not recorded");
+      if (m) {
+        add("Server", serverText(m));
+        // Each flag keeps its value on one line; lines break between flags.
+        const code = node("code", "flags");
+        if (m.flags && Object.keys(m.flags).length)
+          for (const [i, [k, v]] of Object.entries(m.flags).sort(([a], [b]) => a.localeCompare(b)).entries())
+            code.append(...(i ? [" "] : []), node("span", "flag", v === true ? k : `${k} ${v}`));
+        else code.textContent = m.flags ? "None of the listed speed flags" : m.server === "strata" ? "Strata reports none" : "Not recorded";
+        add("Server flags", code);
+      }
+      const t = run.timing, s = t?.model_speed;
+      add("Speed", s ? speedText(s) : t ? "No model speed recorded" : untimed(run));
+      if (t) add("Case time", `${duration(t.time_ms)} over ${t.measured_cases}/${run.cases.length} cases, one at a time`);
+      const picked = speedCases.map(id => run.cases.find(c => c.id === id));
+      if (speedCases.length && picked.every(c => c?.timing)) {
+        const speed = speedSum(picked);
+        add("Speed cases", `generation ${generation(speed)} tok/s · prompt ${prompt(speed)} tok/s on the ${speedCases.length} speed cases`);
+      }
+      if (run.resources?.peak_combined_bytes) add("Memory peak", `${gb(run.resources.peak_combined_bytes)} VRAM + RAM`);
+      block.append(list); blocks.append(block);
+    }
+    return blocks;
   }
   function details(r) {
     const body = node("section", "run-detail");
@@ -287,27 +407,12 @@
       tbody.append(row);
     }
     table.append(tbody); outcomes.append(table);
-    outcomes.append(node("h3", "settings-heading", "Runs"));
-    const runs = node("table", "case-table");
-    const runHead = node("thead"), runRow = node("tr");
-    for (const title of ["Run", "Seed", "Parallel attempts", "Passed", "Cut off", "Output tokens", "Model calls"]) runRow.append(node("th", "", title));
-    runHead.append(runRow); runs.append(runHead);
-    const runBody = node("tbody");
-    for (const run of r.runs) {
-      const row = node("tr"), tokens = sum(run, "generated_tokens"), calls = sum(run, "model_calls");
-      const over = run.cases.filter(c => overBudget(r, c)).length, tokenCell = node("td", "numeric", tokens == null ? "—" : fmt(tokens));
-      if (over) tokenCell.append(budgetTag(r, over, `in ${over} of this run's ${run.cases.length} cases`));
-      const kinds = Object.keys(cutoffs).map(kind => [kind, run.cases.filter(c => c.cutoff === kind).length]).filter(([, n]) => n);
-      const cutCell = node("td", "numeric", `${run.cases.filter(c => c.cutoff).length}/${run.cases.length}`);
-      if (kinds.length) cutCell.title = kinds.map(([kind, n]) => `${cutoffs[kind].label(r)}: ${n}`).join(" · ");
-      row.append(node("td", "case-id", runName(run)), node("td", "numeric", run.seed ?? "—"),
-        node("td", "numeric", run.deployment?.parallel_attempts ?? 1),
-        node("td", "numeric", `${run.cases.filter(c => c.passed).length}/${run.cases.length}`),
-        cutCell, tokenCell, node("td", "numeric", calls == null ? "—" : fmt(calls)));
-      runBody.append(row);
-    }
-    runs.append(runBody); outcomes.append(runs);
-    if (timed(r)) outcomes.append(...timing(r));
+    outcomes.append(node("h3", "settings-heading", "Runs"), runBlocks(r));
+    // Only this series' own setup: its runs and the speed runs of the same files, quantization and settings, on
+    // whatever machines measured them. Other quantizations of the model are compared under Speed by machine.
+    const ownRows = allSpeedRows().filter(row => row.r.series_id === r.series_id);
+    if (ownRows.length > 1) outcomes.append(node("h3", "settings-heading", "Speed of this setup on the speed cases"),
+      speedTable(ownRows), node("p", "detail-note", speedNote() + " Other quantizations and settings of this model are under Speed by machine."));
     if (!r.complete) {
       outcomes.append(node("h3", "settings-heading", "Required setup for the missing runs"));
       outcomes.append(definitionList(Object.entries(r.setup).map(([key, value]) =>
@@ -575,6 +680,8 @@
     tipBox.hidden = true;
     tipBox.setAttribute("role", "tooltip");
     figure.append(body, node("div", "axis-caption", "Peak VRAM + RAM in our runs"), node("ol", "point-key"), tipBox, table(shown));
+    const speed = speedView();
+    if (speed) figure.append(speed);
     return figure;
   }
   const overlaps = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;

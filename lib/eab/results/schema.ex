@@ -15,16 +15,63 @@ defmodule Eab.Results.Schema do
     "harness_agent_file" => ~w(harness_agent_file)
   }
 
+  # Fields each schema version adds to a run and to its cases: timing in 9 (ADR 0019), the
+  # machine in 10 (ADR 0020). Series published earlier keep their files unchanged and are
+  # upgraded when they take another run.
+  @versions %{
+    8 => {[], []},
+    9 => {["timing"], ["timing"]},
+    10 => {["timing", "machine"], ["timing"]}
+  }
+  def versions, do: Map.keys(@versions)
+  def current_version, do: 10
+
   def validate!(r) do
     fields!(r, @fields, "Expected a public run series; export the original run.json with add")
-    require!(r["schema_version"] in [8, 9], "Unsupported result schema")
-    # Schema 9 adds each run's and case's timing (ADR 0019). Series published as schema 8 keep
-    # their files unchanged and are upgraded when they take another run.
-    timing = if r["schema_version"] == 9, do: ["timing"], else: []
+    require!(Map.has_key?(@versions, r["schema_version"]), "Unsupported result schema")
     hex!(r["series_id"], "A series ID is required")
     text!(r["benchmark"], "benchmark")
+    model!(r["model"], r["setup"])
+    harness!(r["harness"])
+    settings!(r["settings"])
+    require!(is_map(r["setup"]) and map_size(r["setup"]) > 0, "The series setup is required")
+    require!(r["required_runs"] === 3, "A run series has three runs")
 
-    model = r["model"]
+    require!(
+      is_nil(r["seeds"]) or r["seeds"] == [101, 102, 103],
+      "Local series use seeds 101, 102 and 103"
+    )
+
+    runs = r["runs"]
+    require!(is_list(runs) and length(runs) in 1..3, "A series holds one to three runs")
+    ids = Enum.map(hd(runs)["cases"] || [], & &1["id"])
+    require!(ids != [] and Enum.uniq(ids) == ids, "Invalid or duplicated case IDs")
+    for run <- runs, do: run!(run, r, ids)
+
+    run_ids = Enum.map(runs, & &1["run_id"])
+    require!(Enum.uniq(run_ids) == run_ids, "Duplicate run IDs")
+    seeds = Enum.map(runs, & &1["seed"])
+    require!(is_nil(r["seeds"]) or Enum.uniq(seeds) == seeds, "Each seed counts once")
+    require!(Enum.sort_by(runs, & &1["created_at"]) == runs, "Runs are listed oldest first")
+    case_fixtures!(r["case_fixtures"], ids)
+    require!(is_binary(r["note"]), "note must be text")
+
+    if not is_nil(r["evidence_url"]) do
+      url = r["evidence_url"]
+      uri = URI.parse(text!(url, "evidence_url"))
+
+      require!(
+        uri.scheme in ~w(https http) and is_binary(uri.host) and uri.host != "" and
+          is_nil(uri.userinfo),
+        "Evidence must be a public HTTP(S) link without embedded credentials"
+      )
+    end
+
+    r
+  end
+
+  @doc false
+  def model!(model, setup) do
     fields!(model, @model_fields, "Unexpected model fields")
     for key <- ~w(name backend), do: text!(model[key], key)
 
@@ -74,17 +121,17 @@ defmodule Eab.Results.Schema do
     gguf!(model["gguf"])
 
     # The served files' hashes in the setup are the first run's (ADR 0018).
-    if hashes = get_in(r, ["setup", "model", "sha256"]),
+    if hashes = get_in(setup || %{}, ["model", "sha256"]),
       do:
         require!(
           is_list(model["weight_files"]) and
             Enum.map(model["weight_files"], & &1["sha256"]) == hashes,
           "The setup's weight hashes must be the recorded files'"
         )
+  end
 
-    harness!(r["harness"])
-
-    settings = r["settings"]
+  @doc false
+  def settings!(settings) do
     require!(is_map(settings) and map_size(settings) > 0, "Effective settings are required")
 
     Enum.each(settings, fn {key, value} ->
@@ -113,101 +160,97 @@ defmodule Eab.Results.Schema do
             "Unreported thinking must be unknown"
           )
     end
+  end
 
-    require!(is_map(r["setup"]) and map_size(r["setup"]) > 0, "The series setup is required")
-    require!(r["required_runs"] === 3, "A run series has three runs")
+  @doc "Checks one published run of a series or speed record `r` against its case IDs."
+  def run!(run, r, ids, opts \\ []) do
+    {run_extra, case_extra} = @versions[r["schema_version"]]
+    fields!(run, @run_fields ++ run_extra, "Unexpected run fields")
 
     require!(
-      is_nil(r["seeds"]) or r["seeds"] == [101, 102, 103],
-      "Local series use seeds 101, 102 and 103"
+      Regex.match?(~r/^[A-Za-z0-9_-]+$/, text!(run["run_id"], "run_id")),
+      "Invalid run ID"
     )
 
-    runs = r["runs"]
-    require!(is_list(runs) and length(runs) in 1..3, "A series holds one to three runs")
-    ids = Enum.map(hd(runs)["cases"] || [], & &1["id"])
-    require!(ids != [] and Enum.uniq(ids) == ids, "Invalid or duplicated case IDs")
+    date!(run["created_at"])
+    hex!(run["source_release_id"], "A frozen source release ID is required")
+    require!(is_nil(run["code_version"]) or hex?(run["code_version"]), "Invalid code version")
 
-    for run <- runs do
-      fields!(run, @run_fields ++ timing, "Unexpected run fields")
-
-      require!(
-        Regex.match?(~r/^[A-Za-z0-9_-]+$/, text!(run["run_id"], "run_id")),
-        "Invalid run ID"
-      )
-
-      date!(run["created_at"])
-      hex!(run["source_release_id"], "A frozen source release ID is required")
-      require!(is_nil(run["code_version"]) or hex?(run["code_version"]), "Invalid code version")
-
-      if r["seeds"],
-        do: require!(run["seed"] in r["seeds"], "Each run needs one of the series seeds"),
-        else: require!(is_nil(run["seed"]), "This series records no seed")
-
-      # Runs published before ADR 0014 ran one attempt at a time and record no value.
-      fields!(
-        Map.delete(run["deployment"] || %{}, "parallel_attempts"),
-        ~w(server_build total_slots),
-        "Unexpected deployment fields"
-      )
-
-      require!(
-        is_nil(run["deployment"]["parallel_attempts"]) or
-          run["deployment"]["parallel_attempts"] in 1..8,
-        "Invalid parallel attempts"
-      )
-
-      require!(
-        is_nil(run["deployment"]["server_build"]) or is_binary(run["deployment"]["server_build"]),
-        "Invalid server build"
-      )
-
-      require!(
-        is_nil(run["deployment"]["total_slots"]) or positive?(run["deployment"]["total_slots"]),
-        "Invalid slot count"
-      )
-
-      require!(is_list(run["cases"]), "Missing case outcomes")
-      require!(Enum.map(run["cases"], & &1["id"]) == ids, "Every run must list the same cases")
-
-      for c <- run["cases"] do
-        fields!(c, @case_fields ++ timing, "Unexpected case fields")
-        require!(is_boolean(c["passed"]), "Every case needs a final pass/fail outcome")
-
-        require!(
-          c["cutoff"] in [nil | @cutoffs],
-          "cutoff must be generation_budget, context_budget, response_budget or null"
-        )
-
-        # Claude Code cannot enforce the generation budget; going over it is flagged instead.
-        require!(
-          c["cutoff"] != "generation_budget" or r["harness"]["name"] == "pi",
-          "Only Pi enforces the generation budget"
-        )
-
-        for key <- ~w(generated_tokens model_calls),
-            do:
-              require!(
-                is_nil(c[key]) or nonnegative?(c[key]),
-                "#{key} must be a nonnegative integer or null"
-              )
-      end
-
-      # Case times and model speed, when the run recorded them (ADR 0019).
-      Eab.Results.Timing.validate!(run, r["harness"]["name"])
-
-      if not is_nil(run["resources"]),
-        do: Eab.Results.Resources.validate!(run["resources"], model, settings, r["setup"])
+    cond do
+      opts[:any_seed] -> require!(is_nil(run["seed"]) or is_integer(run["seed"]), "Invalid seed")
+      r["seeds"] -> require!(run["seed"] in r["seeds"], "Each run needs one of the series seeds")
+      true -> require!(is_nil(run["seed"]), "This series records no seed")
     end
 
-    run_ids = Enum.map(runs, & &1["run_id"])
-    require!(Enum.uniq(run_ids) == run_ids, "Duplicate run IDs")
-    seeds = Enum.map(runs, & &1["seed"])
-    require!(is_nil(r["seeds"]) or Enum.uniq(seeds) == seeds, "Each seed counts once")
-    require!(Enum.sort_by(runs, & &1["created_at"]) == runs, "Runs are listed oldest first")
+    # Runs published before ADR 0014 ran one attempt at a time and record no value.
+    fields!(
+      Map.delete(run["deployment"] || %{}, "parallel_attempts"),
+      ~w(server_build total_slots),
+      "Unexpected deployment fields"
+    )
 
-    fields!(r["case_fixtures"], ids, "Case fixture identities are required")
+    require!(
+      is_nil(run["deployment"]["parallel_attempts"]) or
+        run["deployment"]["parallel_attempts"] in 1..8,
+      "Invalid parallel attempts"
+    )
 
-    for files <- Map.values(r["case_fixtures"]) do
+    require!(
+      is_nil(run["deployment"]["server_build"]) or is_binary(run["deployment"]["server_build"]),
+      "Invalid server build"
+    )
+
+    require!(
+      is_nil(run["deployment"]["total_slots"]) or positive?(run["deployment"]["total_slots"]),
+      "Invalid slot count"
+    )
+
+    require!(is_list(run["cases"]), "Missing case outcomes")
+    require!(Enum.map(run["cases"], & &1["id"]) == ids, "Every run must list the same cases")
+
+    for c <- run["cases"] do
+      fields!(c, @case_fields ++ case_extra, "Unexpected case fields")
+      require!(is_boolean(c["passed"]), "Every case needs a final pass/fail outcome")
+
+      require!(
+        c["cutoff"] in [nil | @cutoffs],
+        "cutoff must be generation_budget, context_budget, response_budget or null"
+      )
+
+      # Claude Code cannot enforce the generation budget; going over it is flagged instead.
+      require!(
+        c["cutoff"] != "generation_budget" or r["harness"]["name"] == "pi",
+        "Only Pi enforces the generation budget"
+      )
+
+      for key <- ~w(generated_tokens model_calls),
+          do:
+            require!(
+              is_nil(c[key]) or nonnegative?(c[key]),
+              "#{key} must be a nonnegative integer or null"
+            )
+    end
+
+    # Case times and model speed, when the run recorded them (ADR 0019).
+    Eab.Results.Timing.validate!(run, r["harness"]["name"])
+
+    # The machine the model was served on, when the collector identified it (ADR 0020).
+    Eab.Results.Machine.validate!(run["machine"])
+
+    require!(
+      is_nil(run["machine"]) or run["machine"]["server"] == r["model"]["backend"],
+      "The machine's server differs from the model's"
+    )
+
+    if not is_nil(run["resources"]),
+      do: Eab.Results.Resources.validate!(run["resources"], r["model"], r["settings"], r["setup"])
+  end
+
+  @doc false
+  def case_fixtures!(fixtures, ids) do
+    fields!(fixtures, ids, "Case fixture identities are required")
+
+    for files <- Map.values(fixtures) do
       require!(is_map(files) and map_size(files) > 0, "Missing fixture hashes")
 
       Enum.each(files, fn {name, digest} ->
@@ -217,21 +260,6 @@ defmodule Eab.Results.Schema do
         )
       end)
     end
-
-    require!(is_binary(r["note"]), "note must be text")
-
-    if not is_nil(r["evidence_url"]) do
-      url = r["evidence_url"]
-      uri = URI.parse(text!(url, "evidence_url"))
-
-      require!(
-        uri.scheme in ~w(https http) and is_binary(uri.host) and uri.host != "" and
-          is_nil(uri.userinfo),
-        "Evidence must be a public HTTP(S) link without embedded credentials"
-      )
-    end
-
-    r
   end
 
   defp weight_files!(nil), do: :ok
@@ -315,12 +343,13 @@ defmodule Eab.Results.Schema do
 
   defp text?(value), do: is_binary(value) and String.trim(value) != ""
 
-  defp harness!(%{"name" => "pi"} = harness) do
+  @doc false
+  def harness!(%{"name" => "pi"} = harness) do
     fields!(harness, ~w(name version), "Unexpected harness fields")
     text!(harness["version"], "harness version")
   end
 
-  defp harness!(%{"name" => "claude_code"} = harness) do
+  def harness!(%{"name" => "claude_code"} = harness) do
     fields!(
       harness,
       ~w(name version agent kit_sha256 preamble_sha256),
@@ -331,7 +360,7 @@ defmodule Eab.Results.Schema do
     for key <- ~w(kit_sha256 preamble_sha256), do: hex!(harness[key], "Invalid #{key}")
   end
 
-  defp harness!(_), do: raise(ArgumentError, "Unknown harness")
+  def harness!(_), do: raise(ArgumentError, "Unknown harness")
 
   defp hex?(value), do: is_binary(value) and Regex.match?(~r/^[a-f0-9]{64}$/, value)
   defp hex!(value, message), do: require!(hex?(value), message)

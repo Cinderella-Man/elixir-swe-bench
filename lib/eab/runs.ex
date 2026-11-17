@@ -24,6 +24,8 @@ defmodule Eab.Runs do
   Starts a full run. `validation: true` marks an unpublishable case-validation run
   (ADR 0012); `series: id` contributes to a published run series and must match its setup.
   `parallel_attempts: n` (1 to 8, default 1) runs up to n cases at once (ADR 0014).
+  `speed: true` runs only the benchmark's speed cases, one at a time, on a local model server:
+  a speed run is published for its times and machine and never scored (ADR 0020).
   """
   def start(endpoint, key, settings, opts \\ []),
     do: GenServer.call(__MODULE__, {:start, endpoint, key, settings, opts}, 30_000)
@@ -184,6 +186,12 @@ defmodule Eab.Runs do
 
         opts[:validation] ->
           Map.put(run, "validation", true)
+
+        opts[:speed] && opts[:series] ->
+          raise "A speed run joins no run series; cancel the contribution first"
+
+        opts[:speed] ->
+          speed(run, endpoint, settings, release)
 
         opts[:series] ->
           Eab.Series.contribution!(run, opts[:series])
@@ -637,6 +645,23 @@ defmodule Eab.Runs do
       "cases" => [id],
       "selection" => selection,
       "validation" => true,
+      "experiment_id" => Release.experiment(release["id"], endpoint, settings, selection)
+    })
+  end
+
+  # Speed runs time a local model server one case at a time (ADRs 0014 and 0020).
+  defp speed(run, endpoint, settings, release) do
+    unless endpoint["backend"] in ~w(llama_cpp strata),
+      do: raise("Speed runs are for a model served by llama.cpp or Strata")
+
+    cases = Eab.Inventory.speed_cases(release["protocol"]["inventory"])
+    selection = %{"kind" => "speed", "cases" => cases}
+
+    Map.merge(run, %{
+      "cases" => cases,
+      "selection" => selection,
+      "parallel_attempts" => 1,
+      "message" => "Starting the #{length(cases)} speed cases",
       "experiment_id" => Release.experiment(release["id"], endpoint, settings, selection)
     })
   end
