@@ -16,12 +16,22 @@ defmodule Eab.LogSectionsTest do
       )
   end
 
+  # Records as the grade formatter writes them. A failure in a setup callback is not a
+  # failure of the test's own body.
   defp tests(states) do
-    Enum.map_join(states, fn {state, count} ->
-      Enum.map_join(1..count//1, fn n ->
-        "\nEAB_TEST:#{state}:#{Base.encode64("#{state}#{n}")}\n"
-      end)
-    end)
+    records =
+      for {state, count} <- states, n <- 1..count//1 do
+        id = Base.encode64("#{state}#{n}")
+
+        case state do
+          :failed -> "\nEAB_TEST:failed:#{id}\n\nEAB_FAILURE_PHASE:#{id}:test\n"
+          :setup_failed -> "\nEAB_TEST:failed:#{id}\n\nEAB_FAILURE_PHASE:#{id}:setup\n"
+          state -> "\nEAB_TEST:#{state}:#{id}\n"
+        end
+      end
+
+    Enum.join(records) <>
+      if(records == [], do: "", else: "\nEAB_SUITE_FINISHED:#{length(records)}\n")
   end
 
   defp run(states, code, adapter \\ "exunit", test \\ @run) do
@@ -46,7 +56,7 @@ defmodule Eab.LogSectionsTest do
 
   defp section(log, label), do: log |> LogSections.split() |> Enum.find(&(&1.label == label))
 
-  test "a graded case splits into its stages, and coverage failures are expected" do
+  test "a graded case splits into its stages, and coverage counts the tests that catch the bug" do
     log =
       agent() <>
         note("Grading case-1") <>
@@ -78,7 +88,7 @@ defmodule Eab.LogSectionsTest do
     assert %{result: "3 tests, 0 failed, 1 excluded", tone: "passed"} =
              section(log, "Grading · Acceptance")
 
-    assert %{result: "5 tests, 3 failed", tone: "pending", expected_failures: true} =
+    assert %{result: "3 of 5 tests catch the bug", tone: "passed", expected_failures: true} =
              section(log, "Grading · Regression coverage")
 
     sections = LogSections.split(log)
@@ -128,14 +138,55 @@ defmodule Eab.LogSectionsTest do
         run([], 1, "exunit", "mix test test/a_test.exs") <>
         run([passed: 2, failed: 1], 1, "exunit", "mix test test/b_test.exs")
 
-    assert %{result: "Exited with code 1", tone: "pending"} =
+    assert %{result: "Tests could not run (exit code 1)", tone: "failed"} =
              section(log, "Grading · Regression coverage")
 
-    assert %{result: "Exited with code 1", tone: "pending", expected_failures: true} =
-             section(log, "Grading · Regression coverage: test/a_test.exs")
+    assert %{
+             result: "Tests could not run (exit code 1)",
+             tone: "failed",
+             expected_failures: true
+           } = section(log, "Grading · Regression coverage: test/a_test.exs")
 
-    assert %{result: "3 tests, 1 failed", tone: "pending", expected_failures: true} =
+    assert %{result: "1 of 3 tests catches the bug", tone: "passed", expected_failures: true} =
              section(log, "Grading · Regression coverage: test/b_test.exs")
+  end
+
+  defp coverage(states, code, kind \\ nil) do
+    log =
+      note("Grading case-1") <>
+        run([passed: 1], 0) <> run([passed: 1], 0) <> run([passed: 1], 0) <> run(states, code)
+
+    log |> LogSections.split(kind) |> List.last() |> Map.take([:result, :tone])
+  end
+
+  test "coverage is red when no test body fails on the original code" do
+    assert coverage([passed: 4], 0) == %{result: "No test catches the bug", tone: "failed"}
+
+    # A failing setup callback says nothing about the code under test.
+    assert coverage([passed: 3, setup_failed: 1], 2) ==
+             %{result: "No test catches the bug", tone: "failed"}
+
+    assert coverage([passed: 3, setup_failed: 1, failed: 1], 2) ==
+             %{result: "1 of 5 tests catches the bug", tone: "passed"}
+  end
+
+  test "coverage of a feature names the missing feature, and leaves excluded tests out" do
+    assert coverage([passed: 1, failed: 2, excluded: 6], 2, "feature") ==
+             %{result: "2 of 3 tests catch the missing feature", tone: "passed"}
+  end
+
+  test "a coverage run that stopped before the suite finished catches nothing" do
+    log =
+      note("Grading case-1") <>
+        run([passed: 1], 0) <>
+        run([passed: 1], 0) <>
+        run([passed: 1], 0) <>
+        note(command(TestAdapter.command("exunit", @run, []))) <>
+        String.replace(tests(passed: 1, failed: 1), ~r/\nEAB_SUITE_FINISHED:\d+\n/, "") <>
+        note("Process exited with code 137")
+
+    assert %{result: "Tests did not finish (exit code 137)", tone: "failed"} =
+             log |> LogSections.split() |> List.last()
   end
 
   test "node test runs are recognised, and a formatter install is not a test run" do

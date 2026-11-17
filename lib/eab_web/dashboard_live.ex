@@ -2224,7 +2224,7 @@ defmodule EabWeb.DashboardLive do
                         </button>
                       </h5>
                       <p :if={section.expected_failures} class="log-section-note">
-                        Runs the submitted tests on the original code, so failures here are expected.
+                        Runs the submitted tests on the original code. Here a failing test is good: it shows the test notices when the change is missing. At least one must fail.
                       </p>
                       <pre
                         :if={section.body}

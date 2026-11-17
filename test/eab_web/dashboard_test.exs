@@ -139,7 +139,13 @@ defmodule EabWeb.DashboardTest do
       )
 
     log_note("$ " <> command) <>
-      Enum.map_join(states, fn state -> "\nEAB_TEST:#{state}:#{Base.encode64(state)}\n" end) <>
+      Enum.map_join(states, fn state ->
+        id = Base.encode64(state)
+
+        "\nEAB_TEST:#{state}:#{id}\n" <>
+          if(state == "failed", do: "\nEAB_FAILURE_PHASE:#{id}:test\n", else: "")
+      end) <>
+      "\nEAB_SUITE_FINISHED:#{length(states)}\n" <>
       log_note("Process exited with code #{code}")
   end
 
@@ -192,8 +198,8 @@ defmodule EabWeb.DashboardTest do
     # Each outcome reads from the header, so nothing has to be opened to see it.
     assert has_element?(view, "#{panel} .case-status.passed", "1 test, 0 failed")
     assert has_element?(view, "#{panel} .case-status.failed", "2 tests, 1 failed")
-    assert has_element?(view, "#{panel} .case-status.pending", "2 tests, 1 failed")
-    assert has_element?(view, "#{panel} .log-section-note", "failures here are expected")
+    assert has_element?(view, "#{panel} .case-status.passed", "1 of 2 tests catches the bug")
+    assert has_element?(view, "#{panel} .log-section-note", "Here a failing test is good")
 
     refute has_element?(view, "#{panel} pre")
     refute render(view) =~ "build output"

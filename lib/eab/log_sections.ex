@@ -6,7 +6,11 @@ defmodule Eab.LogSections do
   existing logs should read the same way. Its test commands always run in the same order,
   so their position names them. This is a reading aid. Model output is in the log too, so a
   verdict only ever comes from `grade.json`.
+
+  A regression coverage run reads by the grader's own rule: a test that fails on the original
+  code inside its body catches the problem the submission fixes.
   """
+  alias Eab.Grader
 
   @tail 131_072
   @note ~r/^\[\d\d:\d\d:\d\d UTC\] (.*)$/m
@@ -25,7 +29,7 @@ defmodule Eab.LogSections do
     )
     |> Map.fetch!(:marks)
     |> Enum.reverse()
-    |> sections(log)
+    |> sections(log, kind)
   end
 
   def body(log, %{start: start, size: size}, limit \\ @tail) do
@@ -109,7 +113,7 @@ defmodule Eab.LogSections do
 
   defp mark(start, label), do: %{label: label, start: start, check: nil, exit: nil}
 
-  defp sections(marks, log) do
+  defp sections(marks, log, kind) do
     stops = Enum.map(tl(marks), & &1.start) ++ [byte_size(log)]
 
     marks
@@ -117,7 +121,7 @@ defmodule Eab.LogSections do
     |> Enum.map(fn {mark, stop} -> Map.put(mark, :size, stop - mark.start) end)
     |> Enum.filter(&Regex.match?(~r/\S/, binary_part(log, &1.start, &1.size)))
     |> Enum.with_index(fn section, index ->
-      {result, tone} = result(section, binary_part(log, section.start, section.size))
+      {result, tone} = result(section, binary_part(log, section.start, section.size), kind)
 
       section
       |> Map.take([:label, :start, :size])
@@ -130,25 +134,42 @@ defmodule Eab.LogSections do
     end)
   end
 
-  defp result(%{check: nil}, _), do: {nil, nil}
-  defp result(%{exit: nil}, _), do: {"Not finished", "pending"}
+  defp result(%{check: nil}, _, _), do: {nil, nil}
+  defp result(%{exit: nil}, _, _), do: {"Not finished", "pending"}
 
-  defp result(section, body) do
+  # Failures are the point here, so the count of tests that catch the problem is the result.
+  defp result(%{check: :expected_failures} = section, body, kind) do
+    probe = Grader.parse(%{"output" => body, "output_truncated" => false})
+    ran = Enum.count(probe["test_results"], fn {_, state} -> state != "excluded" end)
+    caught = length(Grader.behavioral_failures(probe))
+    problem = if kind == "feature", do: "the missing feature", else: "the bug"
+
+    cond do
+      probe["test_results"] == %{} ->
+        {"Tests could not run (exit code #{section.exit})", "failed"}
+
+      not probe["completed"] ->
+        {"Tests did not finish (exit code #{section.exit})", "failed"}
+
+      caught == 0 ->
+        {"No test catches #{problem}", "failed"}
+
+      caught == 1 ->
+        {"1 of #{test_count(ran)} catches #{problem}", "passed"}
+
+      true ->
+        {"#{caught} of #{test_count(ran)} catch #{problem}", "passed"}
+    end
+  end
+
+  defp result(section, body, _) do
     tests =
       Regex.scan(@test_record, body, capture: :all_but_first)
       |> List.flatten()
       |> Enum.frequencies()
 
     clean = section.exit == "0" and Enum.all?(Map.keys(tests), &(&1 in ~w(passed excluded)))
-
-    tone =
-      cond do
-        section.check == :expected_failures -> "pending"
-        clean -> "passed"
-        true -> "failed"
-      end
-
-    {summary(tests, section.exit), tone}
+    {summary(tests, section.exit), if(clean, do: "passed", else: "failed")}
   end
 
   defp summary(tests, code) when map_size(tests) == 0, do: "Exited with code #{code}"
@@ -157,7 +178,10 @@ defmodule Eab.LogSections do
     excluded = tests["excluded"] || 0
     ran = Enum.sum(Map.values(tests)) - excluded
 
-    "#{ran} #{if ran == 1, do: "test", else: "tests"}, #{tests["failed"] || 0} failed" <>
+    "#{test_count(ran)}, #{tests["failed"] || 0} failed" <>
       if(excluded > 0, do: ", #{excluded} excluded", else: "")
   end
+
+  defp test_count(1), do: "1 test"
+  defp test_count(count), do: "#{count} tests"
 end
