@@ -1,5 +1,7 @@
 # Give each case a token allowance
 
+Status: implemented and unused. [ADR 0022](0022-score-runs-at-context-sizes.md) made context size the benchmark's measure of economy, and no release declares allowances.
+
 Since [ADR 0016](0016-limit-local-attempts-by-the-context-window-only.md) only the context window limits a local attempt. The first three v6 series then scored 18, 17 and 16 of 20, and their differences are noise. The two Qwen3.8-27B runs pass 629 and 626 of the release's 633 hidden tests. On the 13 cases with short tickets, 38 of 39 attempts pass. An attempt may think for as long as the window lasts, so the score says a model gets there eventually. It does not say whether the model is usable for day-to-day work, where someone is waiting for the answer. See [the v6 first-results note](../research/v6-first-results-2026-11-17.md).
 
 The cases are not too easy for that question; the missing limit is. The same three runs were rescored on 2026-11-17, counting a pass only when the agent finished on its own and generated no more than a multiple of what Opus 5.5 needed on that case (the median of its three published runs, at least 16,384):

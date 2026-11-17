@@ -35,6 +35,8 @@ Every other file of both bundles is byte-identical to the released version. The 
 
 The [curation workflow](../../docs/case-curation-loop.md) asks for two reviewed Opus 5.5 passes through the Claude Code harness after a case changes. Those runs need the user's solver session and were not made. Until they are, livebook-pr-2800 and ash-pr-3031 are corrected and qualified, not validated. ash-pr-3031 in particular has one recorded pass ever (Astra, 2026-10-20, before the last strengthening); whether the clearer text makes it passable is what its validation attempts will show.
 
+**Done on 2026-11-17.** Both cases passed two Opus 5.5 attempts each on the corrected text, and all four patches were reviewed. The runs, their full logs and the reviews are in [the validation record](../opus-validation-2026-11-17/README.md).
+
 ## Left as they are
 
 - **accent-pr-183:** the hidden test uses the compound requirement `>= 1.1.0 and < 1.2.0`. The text says "a semantic version requirement such as `~> 1.1`" and never shows a compound one. Every pass used Elixir's own `Version`, which accepts it; every failure hand-rolled a parser. Naming the grammar would remove the residual doubt.

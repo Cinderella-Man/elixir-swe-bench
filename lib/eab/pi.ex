@@ -169,6 +169,8 @@ defmodule Eab.Pi do
       speed: nil,
       stop_reason: nil,
       reply_bound: nil,
+      # The largest prompt plus reply of any model call so far (ADR 0022).
+      peak_context: nil,
       error: nil,
       settled: false,
       assistant: false,
@@ -286,6 +288,7 @@ defmodule Eab.Pi do
     %{
       "calls" => state.calls,
       "generated_tokens" => state.generated_tokens,
+      "peak_context_tokens" => state.peak_context,
       "stop_reason" => reason,
       "measurement" => measurement
     }

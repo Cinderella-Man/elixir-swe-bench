@@ -70,7 +70,13 @@ _Avoid_: speed benchmark, speed series
 
 **Context budget**: The maximum combined input and response space for one model interaction, including a small safety allowance.
 
-**Token allowance**: The most tokens an attempt at one case may generate, including reasoning and tool syntax, in a benchmark release that sets one per case. It is twice the median the validator model generated on that case, with a floor, and the agent is told it. An attempt must finish inside it to pass.
+**Peak context**: The largest conversation any model call of an attempt held: the prompt that call was sent plus the reply it generated. History is never compacted, so it is the context the attempt needed.
+_Avoid_: context used, context usage, total tokens
+
+**Context size**: A number of context tokens at which a published result can be read, from 65,536 to 262,144. At a size a case counts only if the agent finished on its own, the attempt's peak context is within the size and its patch passes. It is read from a run as it was made; no run is made at a size.
+_Avoid_: context cap, context limit (a run's own limit is its context budget)
+
+**Token allowance**: The most tokens an attempt at one case may generate, including reasoning and tool syntax, in a benchmark release that sets one per case. It is twice the median the validator model generated on that case, with a floor, and the agent is told it. An attempt must finish inside it to pass. No release sets one: context size is the benchmark's measure of economy.
 _Avoid_: token cap, per-case budget, time limit
 
 **Generation budget**: The most tokens an attempt may generate in total, including reasoning and tool syntax. In a release with token allowances it is the case's allowance. Otherwise hosted models have one for the whole run, as a threshold checked between replies, and local attempts have none since 2026-11-13: only the context budget limits them.
@@ -99,4 +105,4 @@ _Avoid_: token cap, per-case budget, time limit
 
 **Case outcome**: A completed pass or fail. The grader's verdict on the patch decides it, and in a release with token allowances a pass also needs the agent to have finished on its own inside the case's allowance. Infrastructure and accounting errors remain errors.
 
-**Score**: The percentage of selected cases passed, with equal case weight. A final score requires a valid outcome for every selected case; missing, errored, cancelled and interrupted attempts prevent a final score.
+**Score**: The percentage of selected cases passed, with equal case weight. A published result also has a score at each context size, counting only the cases that count at that size. A final score requires a valid outcome for every selected case; missing, errored, cancelled and interrupted attempts prevent a final score.

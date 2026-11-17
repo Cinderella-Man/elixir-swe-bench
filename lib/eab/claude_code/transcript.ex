@@ -280,6 +280,11 @@ defmodule Eab.ClaudeCode.Transcript do
     %{
       "calls" => length(calls),
       "generated_tokens" => output,
+      # The largest prompt plus reply of any call (ADR 0022).
+      "peak_context_tokens" =>
+        calls
+        |> Enum.map(&Eab.ContextSize.of_call(get_in(&1, ["message", "usage"])))
+        |> Enum.max(fn -> 0 end),
       "usage" => %{
         "source" => "claude_code_transcript_best_effort",
         "uncached_input_tokens" => sum.("input_tokens"),

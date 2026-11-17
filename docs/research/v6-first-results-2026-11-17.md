@@ -1,6 +1,6 @@
 # v6 first results: why Qwen3.8-27B leads DeepSeek V4.1 Flash
 
-Date: **2026-11-17**. Status: **open**. This is a handoff note for the agent that continues this topic. Nothing in the benchmark, cases or published results was changed for it, and no runs were started.
+Date: **2026-11-17**. Status: **continued**. This was a handoff note for the agent that continued this topic; nothing in the benchmark, cases or published results was changed for it, and no runs were started. What followed on the same day is in [how scores at context sizes work](../context-size-scoring.md): the results page can now show each series at smaller context sizes ([ADR 0022](../adr/0022-score-runs-at-context-sizes.md)), and ash-pr-3031 and livebook-pr-2800 got their [Opus validation](../../verification/opus-validation-2026-11-17/README.md). Of its suggested next steps, seeds 102 and 103 were not run, at the user's choice; step 4, harder cases, still stands.
 
 ## The question
 

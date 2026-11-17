@@ -1,6 +1,6 @@
 defmodule Eab.PiGateway do
   @moduledoc "Forwards Pi's native model requests and enforces attempt budgets; never executes tools."
-  alias Eab.{Activity, Model, ModelSpeed, Store}
+  alias Eab.{Activity, ContextSize, Model, ModelSpeed, Store}
 
   def request(frame, state) do
     route =
@@ -50,7 +50,13 @@ defmodule Eab.PiGateway do
       Store.write_text("#{state.prefix}/response-#{step}.sse", body)
       usage = Eab.OpenAI.usage(response)
       Store.write("#{state.prefix}/usage-#{step}.json", usage)
-      state = %{state | generated_tokens: state.generated_tokens + usage["output_tokens"]}
+
+      state = %{
+        state
+        | generated_tokens: state.generated_tokens + usage["output_tokens"],
+          peak_context: ContextSize.peak(state.peak_context, usage)
+      }
+
       persist(state)
       stream = make_ref()
       Activity.model_chunk(stream, body)
@@ -88,7 +94,13 @@ defmodule Eab.PiGateway do
       Store.write_text("#{state.prefix}/response-#{step}.sse", body, state.key)
       usage = Eab.Anthropic.usage(body)
       Store.write("#{state.prefix}/usage-#{step}.json", usage, state.key)
-      state = %{state | generated_tokens: state.generated_tokens + usage["output_tokens"]}
+
+      state = %{
+        state
+        | generated_tokens: state.generated_tokens + usage["output_tokens"],
+          peak_context: ContextSize.peak(state.peak_context, usage)
+      }
+
       persist(state)
       state.emit.("Pi: call #{state.calls}, #{state.generated_tokens} generated tokens")
       {reply(frame, 200, "text/event-stream", body), state}
@@ -174,6 +186,7 @@ defmodule Eab.PiGateway do
         state = %{
           state
           | generated_tokens: state.generated_tokens + usage["output_tokens"],
+            peak_context: ContextSize.peak(state.peak_context, usage),
             speed: ModelSpeed.add(state.speed, speed)
         }
 
@@ -247,6 +260,7 @@ defmodule Eab.PiGateway do
       %{
         "calls" => state.calls,
         "generated_tokens" => state.generated_tokens,
+        "peak_context_tokens" => state.peak_context,
         "stop_reason" => state.stop_reason,
         "error" => state.error,
         "measurement" =>

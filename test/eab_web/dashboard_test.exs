@@ -50,7 +50,7 @@ defmodule EabWeb.DashboardTest do
 
     attempts = %{
       "full-case" => attempt.("context_budget", 148_366),
-      "done-case" => attempt.("agent_completed", 52_000)
+      "done-case" => Map.put(attempt.("agent_completed", 52_000), "peak_context_tokens", 118_400)
     }
 
     run = %{
@@ -76,6 +76,7 @@ defmodule EabWeb.DashboardTest do
 
     view |> element("#case-done-case") |> render_click()
     assert has_element?(view, "#case-token-outcome", "Did not run out.")
+    assert has_element?(view, "#case-peak-context", "Peak context: 118,400 tokens")
   end
 
   test "a retired case in a saved run still shows and follows its command output" do
@@ -1015,5 +1016,6 @@ defmodule EabWeb.DashboardTest do
     view |> element("#case-inside-case") |> render_click()
     assert has_element?(view, "#case-token-outcome", "Finished inside its token allowance.")
     assert has_element?(view, "#case-token-outcome", "9,000 of 20,000 allowed tokens")
+    refute has_element?(view, "#case-peak-context")
   end
 end

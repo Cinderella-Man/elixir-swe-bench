@@ -241,6 +241,7 @@ defmodule Eab.ClaudeCode.Attempt do
     Map.merge(escape, %{
       "calls" => summary["calls"],
       "generated_tokens" => summary["generated_tokens"],
+      "peak_context_tokens" => summary["peak_context_tokens"],
       "stop_reason" => stop_reason,
       "usage" => summary["usage"],
       "claude_code" =>

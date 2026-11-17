@@ -6,6 +6,7 @@ defmodule Eab.Results do
   earlier release's, kept as published. `releases.json` says which release the page shows first.
   """
   alias Eab.{
+    ContextSize,
     ModelIdentity,
     Results.Machine,
     Results.Schema,
@@ -245,6 +246,9 @@ defmodule Eab.Results do
           # passing patch still fails its case when the agent did not finish inside it.
           "patch_passed" => Map.get(attempt["grade"], "patch_passed", attempt["grade"]["passed"]),
           "generated_tokens" => attempt["generated_tokens"],
+          # The largest context any model call held; scores at smaller context sizes are
+          # read from it (ADR 0022).
+          "peak_context_tokens" => ContextSize.of_attempt(run["id"], id, attempt),
           "model_calls" => attempt["calls"],
           "cutoff" => cutoff(attempt, settings["max_tokens"], model["backend"]),
           "timing" => if(timed?, do: Timing.of_case(attempt))
@@ -431,14 +435,18 @@ defmodule Eab.Results do
   end
 
   # An older series takes the current schema when it takes another run. Its runs recorded
-  # what they recorded: timing before schema 9 and the machine before 10 are null. Before
-  # schema 11 a case's outcome was its patch's verdict.
-  defp upgrade(record) do
+  # what they recorded: timing before schema 9, the machine before 10 and peak context before
+  # 12 are null. Before schema 11 a case's outcome was its patch's verdict.
+  @doc false
+  def upgrade(record) do
     runs =
       Enum.map(record["runs"], fn run ->
         cases =
           Enum.map(run["cases"], fn c ->
-            c |> Map.put_new("timing", nil) |> Map.put_new("patch_passed", c["passed"])
+            c
+            |> Map.put_new("timing", nil)
+            |> Map.put_new("patch_passed", c["passed"])
+            |> Map.put_new("peak_context_tokens", nil)
           end)
 
         run
@@ -787,6 +795,8 @@ defmodule Eab.Results do
       "label" => id |> String.split("-") |> List.last(),
       "current" => current?,
       "note" => notes[id],
+      # The context sizes a series' score can be shown at (ADR 0022).
+      "context_sizes" => ContextSize.sizes(),
       "results" => Enum.map(records, &aggregate/1),
       "speed_cases" => speed_cases,
       "speed_runs" => speed
@@ -817,7 +827,9 @@ defmodule Eab.Results do
       "total" => length(hd(record["runs"])["cases"]),
       "case_passes" => summary["case_passes"],
       "missing_seeds" => if(record["seeds"], do: record["seeds"] -- filled, else: []),
-      "resources" => Series.peak_resources(Enum.map(record["runs"], & &1["resources"]))
+      "resources" => Series.peak_resources(Enum.map(record["runs"], & &1["resources"])),
+      # The score at each context size, for series whose attempts recorded their peak context.
+      "by_context" => ContextSize.scores(record)
     })
   end
 

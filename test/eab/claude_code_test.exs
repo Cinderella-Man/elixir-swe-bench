@@ -242,6 +242,8 @@ defmodule Eab.ClaudeCodeTest do
 
     assert summary["calls"] == 2
     assert summary["generated_tokens"] == 60
+    # The largest call: 3 + 1000 + 50 prompt tokens and its 40-token reply.
+    assert summary["peak_context_tokens"] == 1093
 
     assert summary["usage"] == %{
              "source" => "claude_code_transcript_best_effort",
@@ -826,6 +828,7 @@ defmodule Eab.ClaudeCodeTest do
     assert {:ok, result} = Task.await(task)
     assert result["stop_reason"] == "agent_completed"
     assert result["generated_tokens"] == 60 and result["calls"] == 2
+    assert result["peak_context_tokens"] == 1093
     assert result["claude_code"]["claude_code_version"] == "2.1.308"
     assert result["claude_code"]["tool_calls"] == 2
     assert result["claude_code"]["agent_id"] == "agent-1"

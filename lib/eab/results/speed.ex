@@ -13,9 +13,10 @@ defmodule Eab.Results.Speed do
   def validate!(s) do
     fields!(s, @fields, "Expected a public speed run; export the original run.json with add")
 
-    # Speed runs began with schema 10; 11 adds each case's patch verdict (ADR 0021).
+    # Speed runs began with schema 10; 11 adds each case's patch verdict (ADR 0021) and 12
+    # its peak context (ADR 0022).
     require!(
-      s["schema_version"] in [10, 11] and s["kind"] == "speed_run",
+      s["schema_version"] in [10, 11, 12] and s["kind"] == "speed_run",
       "Unsupported speed run schema"
     )
 

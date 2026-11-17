@@ -249,7 +249,7 @@ defmodule Eab.ResultsTest do
     end
 
     record = Results.export!(timed.(run()))
-    assert record["schema_version"] == 11
+    assert record["schema_version"] == 12
 
     published =
       record
@@ -259,7 +259,7 @@ defmodule Eab.ResultsTest do
           run
           |> Map.drop(["timing", "machine"])
           |> Map.update!("cases", fn cases ->
-            Enum.map(cases, &Map.drop(&1, ["timing", "patch_passed"]))
+            Enum.map(cases, &Map.drop(&1, ["timing", "patch_passed", "peak_context_tokens"]))
           end)
         ]
       end)
@@ -282,12 +282,13 @@ defmodule Eab.ResultsTest do
       |> Results.export!()
 
     merged = Results.merge!(published, second)
-    assert merged["schema_version"] == 11
+    assert merged["schema_version"] == 12
     [first, added] = merged["runs"]
     assert first["timing"] == nil and Enum.all?(first["cases"], &is_nil(&1["timing"]))
     assert first["machine"] == nil
-    # Before schema 11 a case's outcome was its patch's verdict.
+    # Before schema 11 a case's outcome was its patch's verdict; before 12 no peak was recorded.
     assert Enum.all?(first["cases"], &(&1["patch_passed"] == &1["passed"]))
+    assert Enum.all?(first["cases"], &is_nil(&1["peak_context_tokens"]))
     assert added["timing"]["time_ms"] == 120_000
 
     # A repeated click keeps the published file as it was.
@@ -440,7 +441,7 @@ defmodule Eab.ResultsTest do
 
   test "a speed run publishes its speed cases' times and its machine, apart from any series" do
     speed = Results.export_speed!(speed_run(), speed_cases: ["case-b"])
-    assert speed["kind"] == "speed_run" and speed["schema_version"] == 11
+    assert speed["kind"] == "speed_run" and speed["schema_version"] == 12
     assert speed["series_id"] == Eab.Series.id(with_machine(run()))
     assert speed["run"]["run_id"] == "test-run"
     assert Enum.map(speed["run"]["cases"], & &1["id"]) == ["case-b"]
@@ -505,7 +506,7 @@ defmodule Eab.ResultsTest do
     assert Path.wildcard(Path.join(page, "results/*.json")) == []
 
     payload = Results.read!(Path.join(page, "dist/results.json"))
-    assert payload["schema_version"] == 11
+    assert payload["schema_version"] == 12
     release = Enum.find(payload["releases"], & &1["current"])
     assert release["speed_cases"] == cases
     assert [%{"run" => %{"run_id" => "speed-run"}}] = release["speed_runs"]
@@ -1295,7 +1296,7 @@ defmodule Eab.ResultsTest do
       })
 
     record = Results.export!(source)
-    assert record["schema_version"] == 11
+    assert record["schema_version"] == 12
     assert record["setup"]["allowance"]["tokens"] == %{"case-a" => 80_000, "case-b" => 80_000}
     assert record["series_id"] != Results.export!(run())["series_id"]
 
@@ -1336,5 +1337,64 @@ defmodule Eab.ResultsTest do
     Results.build!([made_under], output, inventory: limited)
     [built] = built(Path.join(output, "results.json"))
     assert built["setup"]["allowance"]["tokens"][hd(inventory["cases"])] == 80_000
+  end
+
+  test "each case's peak context is published and gives the series a score at every context size",
+       %{dir: dir} do
+    inventory = Eab.Inventory.definition()
+    [first, second | _] = inventory["cases"]
+
+    source =
+      current()
+      |> Map.update!("attempts", fn attempts ->
+        Map.new(attempts, fn {id, attempt} ->
+          {id,
+           Map.put(attempt, "peak_context_tokens", if(id == first, do: 200_000, else: 50_000))}
+        end)
+      end)
+      # The window cut this attempt off; its patch passed, but it did not finish inside any size.
+      |> update_in(["attempts", second], &Map.put(&1, "stop_reason", "context_budget"))
+
+    record = Results.export!(source)
+    cases = Map.new(entry(record)["cases"], &{&1["id"], &1})
+    assert cases[first]["peak_context_tokens"] == 200_000
+    assert cases[second]["cutoff"] == "context_budget" and cases[second]["passed"]
+
+    assert_raise ArgumentError, ~r/peak_context_tokens/, fn ->
+      Results.validate!(
+        put_in(record, ["runs", Access.at(0), "cases", Access.at(0), "peak_context_tokens"], 0)
+      )
+    end
+
+    output = Path.join(dir, "dist")
+
+    # Another series of the same model, made without recording peaks.
+    unrecorded =
+      current()
+      |> Map.put("id", "no-peaks-run")
+      |> put_in(["settings", "max_tokens"], 100_000)
+      |> Results.export!()
+
+    Results.build!([record, unrecorded], output)
+    payload = Results.read!(Path.join(output, "results.json"))
+    release = Enum.find(payload["releases"], & &1["current"])
+    assert release["context_sizes"] == Eab.ContextSize.sizes()
+
+    [with_peaks] = Enum.filter(release["results"], & &1["by_context"])
+    total = length(inventory["cases"])
+    assert with_peaks["score_percent"] == 100.0
+    # Inside 65,536 tokens: everything but the large attempt and the one that was cut off.
+    assert with_peaks["by_context"]["65536"]["score_percent"] ==
+             Float.round(100 * (total - 2) / total, 2)
+
+    assert with_peaks["by_context"]["65536"]["case_passes"][first] == 0
+    # Inside 262,144: the large attempt fits; the cut-off one still does not count.
+    assert with_peaks["by_context"]["262144"]["case_passes"][first] == 1
+    assert with_peaks["by_context"]["262144"]["case_passes"][second] == 0
+
+    # A run that recorded no peaks has no score at a size.
+    assert Enum.find(release["results"], &(&1["series_id"] == unrecorded["series_id"]))[
+             "by_context"
+           ] == nil
   end
 end

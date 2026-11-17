@@ -137,6 +137,8 @@ defmodule Eab.PiTest do
       assert Pi.finish(result) == %{
                "calls" => 2,
                "generated_tokens" => 24,
+               # Each call: a 42-token prompt and a 12-token reply.
+               "peak_context_tokens" => 54,
                "stop_reason" => "agent_completed",
                "measurement" => %{"attempt_ms" => 0}
              }
@@ -438,6 +440,9 @@ defmodule Eab.PiTest do
     assert allowance == window - 42 - 8
     assert state.reply_bound == "context"
     assert state.generated_tokens == 5_000_000 + allowance
+    # The call's prompt and reply together are the attempt's peak context so far (ADR 0022).
+    assert state.peak_context == 42 + allowance
+    assert Store.read("#{prefix}/agent-progress.json")["peak_context_tokens"] == 42 + allowance
     assert Store.read("#{prefix}/request-0000.json")["max_tokens"] == allowance
 
     # A reply cut there ends the attempt as a context cutoff, never a generation one.

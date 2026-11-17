@@ -16,16 +16,18 @@ defmodule Eab.Results.Schema do
   }
 
   # Fields each schema version adds to a run and to its cases: timing in 9 (ADR 0019), the
-  # machine in 10 (ADR 0020), the patch's own verdict in 11 (ADR 0021). Series published
-  # earlier keep their files unchanged and are upgraded when they take another run.
+  # machine in 10 (ADR 0020), the patch's own verdict in 11 (ADR 0021), the attempt's peak
+  # context in 12 (ADR 0022). Series published earlier keep their files unchanged and are
+  # upgraded when they take another run.
   @versions %{
     8 => {[], []},
     9 => {["timing"], ["timing"]},
     10 => {["timing", "machine"], ["timing"]},
-    11 => {["timing", "machine"], ["timing", "patch_passed"]}
+    11 => {["timing", "machine"], ["timing", "patch_passed"]},
+    12 => {["timing", "machine"], ["timing", "patch_passed", "peak_context_tokens"]}
   }
   def versions, do: Map.keys(@versions)
-  def current_version, do: 11
+  def current_version, do: 12
 
   def validate!(r) do
     fields!(r, @fields, "Expected a public run series; export the original run.json with add")
@@ -239,6 +241,14 @@ defmodule Eab.Results.Schema do
               is_nil(c[key]) or nonnegative?(c[key]),
               "#{key} must be a nonnegative integer or null"
             )
+
+      # An attempt's largest context, or null where the run did not record it.
+      if "peak_context_tokens" in case_extra,
+        do:
+          require!(
+            is_nil(c["peak_context_tokens"]) or positive?(c["peak_context_tokens"]),
+            "peak_context_tokens must be a positive integer or null"
+          )
     end
 
     # Case times and model speed, when the run recorded them (ADR 0019).

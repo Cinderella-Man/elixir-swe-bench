@@ -34,6 +34,14 @@ If run G's review changes no case, runs F and G count as two of Opus 5.5's three
 
 Run G passed 17 of 20. Its review changed no case: its three failures, ash-pr-3031, livebook-pr-2800 and vutuv-pr-1759, are sound cases Opus missed, so all three stay. Runs F and G are admitted.
 
+## Amendment, 2026-11-17: Opus's v6 series is assembled from existing attempts
+
+v6 rewrote the tickets of ash-pr-3031 and livebook-pr-2800 and changed no other case file. On 2026-11-17 both cases passed two Opus 5.5 attempts each on the new text, which is the validation a changed case owes. The user then asked for Opus to appear in v6 from the attempts that exist instead of a new full run.
+
+Its v6 series therefore has two assembled runs. Each takes 18 cases from one of the first two runs of Opus's published v5 series, and the two rewritten cases from the single-case attempts of 2026-11-17. This sets aside two rules for this one series: a published run is one full run of the release, and single-case attempts are never published. The carried outcomes were made under v5's instructions, one sentence shorter than v6's, and on an older Claude Code version; none of them depends on what v6 changed in grading.
+
+The series says it is assembled in its note and in the release note. Its setup differs from a real run's, so a full Opus run on v6 starts a separate series, after which the assembled one should be removed. See the [validation record](../../verification/opus-validation-2026-11-17/README.md#the-assembled-v6-series) for which attempt supplies which case.
+
 ## Considered options
 
 - **Keep upstream pins under a recorded exception**: no fork work, but cases would keep two kinds of source and overlay handling.

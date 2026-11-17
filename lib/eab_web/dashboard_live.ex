@@ -2111,6 +2111,13 @@ defmodule EabWeb.DashboardLive do
                       {elem(token_outcome(@run, @log_case, @case_attempt), 1)}
                     </p>
                     <p
+                      :if={is_integer((@case_attempt || %{})["peak_context_tokens"])}
+                      id="case-peak-context"
+                      class="fine-print"
+                    >
+                      Peak context: {tokens(@case_attempt["peak_context_tokens"])} tokens, the largest prompt and reply any model call held. The results page counts this case at a context size only if that fits inside it.
+                    </p>
+                    <p
                       :if={
                         @case_attempt && @case_attempt["status"] in ["completed", "error"] &&
                           is_integer(@case_attempt["generated_tokens"]) &&

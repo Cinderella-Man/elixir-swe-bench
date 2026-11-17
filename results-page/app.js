@@ -9,8 +9,9 @@
     if (text !== undefined) e.textContent = text;
     return e;
   };
-  // An older controller's payload (schema 8 or 9) simply has no timing or machines; before 11, no patch verdicts.
-  if (!data || ![8, 9, 10, 11].includes(data.schema_version) || !Array.isArray(data.releases) || data.releases.length === 0) {
+  // An older controller's payload (schema 8 or 9) simply has no timing or machines; before 11, no patch verdicts;
+  // before 12, no context sizes.
+  if (!data || ![8, 9, 10, 11, 12].includes(data.schema_version) || !Array.isArray(data.releases) || data.releases.length === 0) {
     $("chart").append(node("p", "empty", "Results could not be loaded. Please reload."));
     return;
   }
@@ -32,7 +33,40 @@
     }
     if (release.note) bar.append(node("span", "release-note", release.note));
   }
-  const records = release.results;
+  // A context size narrows every score to the attempts that fit inside it (ADR 0022). A case then counts only
+  // if the agent finished on its own, its whole attempt stayed inside that many tokens of context, and its patch
+  // passes. One run at the largest window gives the score at every smaller size: nothing is run or graded again.
+  // Series whose runs did not record each attempt's peak context have no score at a size and are left out.
+  const sizes = release.context_sizes || [];
+  const size = sizes.find(s => String(s) === new URLSearchParams(location.search).get("context")) || null;
+  const sized = release.results.filter(r => r.by_context);
+  const tokensText = tokens => tokens.toLocaleString("en-US");
+  if (sizes.length && sized.length) {
+    const bar = $("contexts");
+    bar.append(node("span", "release-title", "Context size"));
+    const chip = (label, value, title) => {
+      const link = node("a", "chip" + (value === size ? " on" : ""), label), query = new URLSearchParams(location.search);
+      if (value) query.set("context", value); else query.delete("context");
+      link.href = query.toString() ? `?${query}` : location.pathname;
+      link.title = title;
+      if (value === size) link.setAttribute("aria-current", "page");
+      return link;
+    };
+    bar.append(chip("As run", null, "Every series as it was run and scored, within its own context window"));
+    for (const s of sizes) bar.append(chip(tokensText(s),
+      s, `Count a case only if the agent finished with its whole attempt inside ${tokensText(s)} tokens of context`));
+    const missing = release.results.length - sized.length;
+    bar.append(node("span", "release-note", size ?
+      `Showing what each model solved inside ${tokensText(size)} tokens of context: a case counts only if the agent finished on its own, ` +
+      "its largest prompt and reply together stayed inside that size, and its patch passes. It is read from the runs as they were made, " +
+      "so a model was not told about this size." +
+      (missing ? ` ${missing} series did not record ${missing === 1 ? "its" : "their"} context sizes and ${missing === 1 ? "is" : "are"} not shown.` : "") :
+      "Pick a size to see what each model solves with less context."));
+  }
+  // At a size, a series carries that size's score, interval and per-case pass counts in place of its own.
+  const records = size ? sized.map(r => ({...r, ...r.by_context[size], context_size: size})) : release.results;
+  const fits = (r, c) => r.context_size ? c.passed && !c.cutoff && Number.isInteger(c.peak_context_tokens) &&
+    c.peak_context_tokens <= r.context_size : c.passed;
   if (records.length === 0) {
     document.querySelector("footer").remove();
     $("chart").append(node("p", "empty", "No benchmark results yet."));
@@ -342,7 +376,8 @@
       const over = run.cases.filter(c => overBudget(r, c)).length, cut = run.cases.filter(c => c.cutoff);
       const late = run.cases.filter(outside).length;
       block.append(node("div", "run-block-head", `Run ${i + 1} · ${runName(run)}` + (run.seed != null ? ` · seed ${run.seed}` : "")));
-      const outcome = node("span", "", `${run.cases.filter(c => c.passed).length}/${run.cases.length} passed · ${cut.length} cut off · ` +
+      const outcome = node("span", "", `${run.cases.filter(c => fits(r, c)).length}/${run.cases.length} ` +
+        (r.context_size ? `finished inside ${tokensText(r.context_size)} tokens of context` : "passed") + ` · ${cut.length} cut off · ` +
         (allowed(r) ? `${late} with a passing patch outside the allowance · ` : "") +
         `${tokens == null ? "—" : fmt(tokens)} output tokens · ${calls == null ? "—" : fmt(calls)} model calls`);
       if (cut.length) outcome.title = Object.keys(cutoffs).map(kind => [kind, cut.filter(c => c.cutoff === kind).length])
@@ -403,7 +438,12 @@
       "Their patches at that point were graded; the tags say which limit."));
     const table = node("table", "case-table");
     const head = node("thead"), hr = node("tr");
-    for (const title of ["Case", "Runs passed", ...(allowed(r) ? ["Output tokens", "Allowance"] : []),
+    // Each attempt's peak context, where the series recorded it: the largest prompt and reply any model call held.
+    const peaks = Boolean(r.by_context);
+    if (r.context_size) outcomes.append(node("p", "detail-note", `At ${tokensText(r.context_size)} tokens of context: a case counts only if the agent ` +
+      "finished on its own and its peak context stayed inside that size. Peak context is the largest prompt and reply any model call held."));
+    for (const title of ["Case", r.context_size ? "Runs inside" : "Runs passed", ...(peaks ? ["Peak context"] : []),
+      ...(allowed(r) ? ["Output tokens", "Allowance"] : []),
       ...(timed(r) ? ["Time", "Generation tok/s"] : [])]) hr.append(node("th", "", title));
     head.append(hr); table.append(head);
     const tbody = node("tbody");
@@ -421,6 +461,13 @@
       if (late) name.append(outsideTag(late, r.run_count === 1 ? "In this run" : `In ${late} of ${r.run_count} runs`));
       row.append(name,
         node("td", count === r.run_count ? "passed" : count === 0 ? "failed" : "numeric", `${count}/${r.run_count}`));
+      if (peaks) {
+        // One value per run, in run order.
+        const peak = node("td", "numeric", tries.map(t => thousands(t.peak_context_tokens)).join(" · "));
+        peak.title = r.runs.map((run, i) => `${runName(run)}: ${fmt(tries[i].peak_context_tokens)} tokens` +
+          (tries[i].cutoff ? ", cut off before the agent finished" : tries[i].passed ? "" : ", patch did not pass")).join("\n");
+        row.append(peak);
+      }
       if (allowed(r)) {
         // One value per run, in run order, beside what the case allows.
         const used = node("td", "numeric", tries.map(t => Number.isInteger(t.generated_tokens) ? thousands(t.generated_tokens) : "—").join(" · "));
@@ -772,6 +819,7 @@
     const active = shown.find(r => r.series_id === selected);
     if (active) $("chart").append(details(active)); else selected = null;
     $("result-status").textContent = `${records.length} run series in ${families.size} families` +
+      (size ? ` · scored inside ${tokensText(size)} tokens of context` : "") +
       (chosen.size ? ` · showing ${[...chosen].join(", ")}` : "");
   }
   window.addEventListener("resize", placeLabels);
