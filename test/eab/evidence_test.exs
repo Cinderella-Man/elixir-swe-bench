@@ -74,4 +74,34 @@ defmodule Eab.EvidenceTest do
     assert Evidence.compact(compact) == compact
     assert Evidence.verdict(Map.put(compact, "status", "error")) == "Evaluation error"
   end
+
+  test "a token allowance explains itself in the verdict and keeps the patch's own verdict" do
+    stopped = "The attempt was stopped at its allowance of 16,384 generated tokens."
+
+    grade = %{
+      "passed" => false,
+      "patch_passed" => true,
+      "artifact" => "case-a/grade.json",
+      "artifact_hash" => "hash",
+      "checks" => [
+        %{"id" => "hidden", "label" => "Acceptance", "passed" => true},
+        %{
+          "id" => "allowance",
+          "label" => "Token allowance",
+          "passed" => false,
+          "reason" => stopped
+        }
+      ]
+    }
+
+    assert Evidence.verdict(%{"grade" => grade}) ==
+             stopped <> " Its patch passed every other check."
+
+    wrong = put_in(grade, ["checks", Access.at(0), "passed"], false)
+    assert Evidence.verdict(%{"grade" => wrong}) == "Acceptance did not pass. " <> stopped
+
+    compact = Evidence.compact(%{"case" => "case-a", "status" => "completed", "grade" => grade})
+    assert compact["grade"] == Map.delete(grade, "checks")
+    assert compact["verdict"] == stopped <> " Its patch passed every other check."
+  end
 end

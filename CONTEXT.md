@@ -70,11 +70,14 @@ _Avoid_: speed benchmark, speed series
 
 **Context budget**: The maximum combined input and response space for one model interaction, including a small safety allowance.
 
-**Generation budget**: The most tokens an attempt may generate in total, including reasoning and tool syntax. Hosted models have one, as a threshold checked between replies. Local attempts have none since 2026-11-13: only the context budget limits them.
+**Token allowance**: The most tokens an attempt at one case may generate, including reasoning and tool syntax, in a benchmark release that sets one per case. It is twice the median the validator model generated on that case, with a floor, and the agent is told it. An attempt must finish inside it to pass.
+_Avoid_: token cap, per-case budget, time limit
+
+**Generation budget**: The most tokens an attempt may generate in total, including reasoning and tool syntax. In a release with token allowances it is the case's allowance. Otherwise hosted models have one for the whole run, as a threshold checked between replies, and local attempts have none since 2026-11-13: only the context budget limits them.
 
 **Response budget**: The most tokens one model reply may generate. Only local series made before 2026-11-13 have one; since then a local reply is limited only by the context budget.
 
-**Cutoff**: The budget that ended an attempt before the agent finished: context, generation where a run has that budget or, in older local series, response. The patch at that point is graded, so a cut-off attempt may still pass.
+**Cutoff**: The budget that ended an attempt before the agent finished: context, generation where a run has that budget or, in older local series, response. The patch at that point is graded. Without token allowances a cut-off attempt may still pass; with them it fails, and its patch's verdict is kept beside the case outcome.
 
 **Harness**: The coding-agent program, tool set and fixed instructions through which a model makes attempts. Pi and Claude Code are harnesses. Each run uses one harness; comparing runs across harnesses confounds the model with the harness.
 
@@ -94,6 +97,6 @@ _Avoid_: speed benchmark, speed series
 
 **Validation run**: A run of the validator model whose outcomes decide which cases stay in a release. It is never published or scored, because its passes are what kept the cases.
 
-**Case outcome**: A completed pass or fail from the grader. Infrastructure and accounting errors remain errors.
+**Case outcome**: A completed pass or fail. The grader's verdict on the patch decides it, and in a release with token allowances a pass also needs the agent to have finished on its own inside the case's allowance. Infrastructure and accounting errors remain errors.
 
 **Score**: The percentage of selected cases passed, with equal case weight. A final score requires a valid outcome for every selected case; missing, errored, cancelled and interrupted attempts prevent a final score.

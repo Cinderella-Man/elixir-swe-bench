@@ -49,7 +49,13 @@ defmodule Eab.Series do
         Map.take(get_in(profile, ["default_generation_settings", "params"]) || %{}, @sampling),
       "settings" => Map.drop(run["settings"] || %{}, ~w(seed reasoning_effort_source))
     }
+    |> put_allowance(Eab.Allowance.table(protocol["inventory"], cases))
   end
+
+  # Runs made under different token allowances never join (ADR 0021). Series of a release
+  # without allowances keep their IDs.
+  defp put_allowance(setup, nil), do: setup
+  defp put_allowance(setup, allowance), do: Map.put(setup, "allowance", allowance)
 
   def id(run, opts \\ [])
 

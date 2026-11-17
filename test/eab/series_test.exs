@@ -439,4 +439,27 @@ defmodule Eab.SeriesTest do
       Results.publish!(moved, page_root: page)
     end
   end
+
+  test "runs made under different token allowances never join; without them IDs stay as they were" do
+    plain = run("one", 101, [])
+    refute Map.has_key?(Series.setup(plain), "allowance")
+
+    under = fn multiple ->
+      update_in(plain, ["protocol", "inventory"], fn inventory ->
+        Map.put(inventory, "allowance", %{
+          "validator" => "Fixture validator",
+          "multiple" => multiple,
+          "minimum_tokens" => 16_384,
+          "validator_tokens" => Map.new(inventory["cases"], &{&1, [10_000]})
+        })
+      end)
+    end
+
+    tokens = Series.setup(under.(2))["allowance"]["tokens"]
+    assert Map.keys(tokens) == Enum.sort(plain["cases"])
+    assert Enum.uniq(Map.values(tokens)) == [20_000]
+    assert Series.id(under.(2)) != Series.id(plain)
+    assert Series.id(under.(2)) != Series.id(under.(3))
+    assert Series.id(under.(2)) == Series.id(under.(2))
+  end
 end

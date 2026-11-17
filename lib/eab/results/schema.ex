@@ -16,15 +16,16 @@ defmodule Eab.Results.Schema do
   }
 
   # Fields each schema version adds to a run and to its cases: timing in 9 (ADR 0019), the
-  # machine in 10 (ADR 0020). Series published earlier keep their files unchanged and are
-  # upgraded when they take another run.
+  # machine in 10 (ADR 0020), the patch's own verdict in 11 (ADR 0021). Series published
+  # earlier keep their files unchanged and are upgraded when they take another run.
   @versions %{
     8 => {[], []},
     9 => {["timing"], ["timing"]},
-    10 => {["timing", "machine"], ["timing"]}
+    10 => {["timing", "machine"], ["timing"]},
+    11 => {["timing", "machine"], ["timing", "patch_passed"]}
   }
   def versions, do: Map.keys(@versions)
-  def current_version, do: 10
+  def current_version, do: 11
 
   def validate!(r) do
     fields!(r, @fields, "Expected a public run series; export the original run.json with add")
@@ -54,6 +55,7 @@ defmodule Eab.Results.Schema do
     require!(is_nil(r["seeds"]) or Enum.uniq(seeds) == seeds, "Each seed counts once")
     require!(Enum.sort_by(runs, & &1["created_at"]) == runs, "Runs are listed oldest first")
     case_fixtures!(r["case_fixtures"], ids)
+    allowance!(r["setup"]["allowance"], ids)
     require!(is_binary(r["note"]), "note must be text")
 
     if not is_nil(r["evidence_url"]) do
@@ -212,6 +214,14 @@ defmodule Eab.Results.Schema do
       fields!(c, @case_fields ++ case_extra, "Unexpected case fields")
       require!(is_boolean(c["passed"]), "Every case needs a final pass/fail outcome")
 
+      # A case passes only with a passing patch; a token allowance can fail one that has it.
+      if "patch_passed" in case_extra,
+        do:
+          require!(
+            is_boolean(c["patch_passed"]) and (c["patch_passed"] or not c["passed"]),
+            "patch_passed must be the patch's own verdict"
+          )
+
       require!(
         c["cutoff"] in [nil | @cutoffs],
         "cutoff must be generation_budget, context_budget, response_budget or null"
@@ -244,6 +254,33 @@ defmodule Eab.Results.Schema do
 
     if not is_nil(run["resources"]),
       do: Eab.Results.Resources.validate!(run["resources"], r["model"], r["settings"], r["setup"])
+  end
+
+  # The token allowances a series was made under, when its release has them (ADR 0021).
+  @doc false
+  def allowance!(nil, _ids), do: :ok
+
+  def allowance!(allowance, ids) do
+    fields!(
+      allowance,
+      ~w(validator multiple minimum_tokens tokens),
+      "Unexpected token allowance fields"
+    )
+
+    text!(allowance["validator"], "allowance validator")
+
+    require!(
+      is_number(allowance["multiple"]) and allowance["multiple"] >= 1 and
+        positive?(allowance["minimum_tokens"]),
+      "Invalid token allowance rule"
+    )
+
+    fields!(allowance["tokens"], ids, "Every case needs its token allowance")
+
+    require!(
+      Enum.all?(Map.values(allowance["tokens"]), &positive?/1),
+      "A token allowance is a positive integer"
+    )
   end
 
   @doc false

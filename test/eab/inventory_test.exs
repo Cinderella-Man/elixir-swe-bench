@@ -65,4 +65,43 @@ defmodule Eab.InventoryTest do
     File.write!(Inventory.path("cases_approved/parked-case/case.json"), "{}")
     assert Inventory.all() == []
   end
+
+  test "token allowances are part of a release, and every case needs one" do
+    for id <- ["existing-case", "new-case"] do
+      File.mkdir_p!(Inventory.path("cases/#{id}"))
+      File.write!(Inventory.case_path(id, "case.json"), Jason.encode!(%{"id" => id}))
+    end
+
+    earlier = Inventory.protocol()
+    release = %{"id" => Cache.key(earlier), "protocol" => earlier}
+    config = Inventory.read_json(Inventory.path("config/benchmark.json"))
+
+    declare = fn tokens ->
+      rule = %{
+        "validator" => "Fixture validator",
+        "multiple" => 2,
+        "minimum_tokens" => 16_384,
+        "validator_tokens" => tokens
+      }
+
+      File.write!(
+        Inventory.path("config/benchmark.json"),
+        Jason.encode!(Map.put(config, "allowance", rule))
+      )
+    end
+
+    declare.(%{"existing-case" => [10_000]})
+    assert_raise ArgumentError, ~r/Invalid token allowance/, fn -> Release.freeze() end
+
+    declare.(%{"existing-case" => [10_000], "new-case" => [30_000]})
+    inventory = Inventory.protocol()["inventory"]
+    assert Eab.Allowance.validate!(inventory) == :ok
+    assert Eab.Allowance.tokens(inventory, "new-case") == 60_000
+
+    # Declaring them makes another release; a run of the earlier one still verifies and,
+    # reading its own frozen inventory, keeps running without them.
+    assert Cache.key(Inventory.protocol()) != release["id"]
+    assert :ok = Release.verify!(release)
+    assert Eab.Allowance.tokens(release["protocol"]["inventory"], "new-case") == nil
+  end
 end

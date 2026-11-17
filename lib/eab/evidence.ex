@@ -81,12 +81,26 @@ defmodule Eab.Evidence do
 
   def verdict(%{"grade" => grade}) when is_map(grade) do
     grade = if grade["checks"], do: grade, else: summarize(grade)
-    failed = Enum.reject(grade["checks"], & &1["passed"])
+    # The token allowance (ADR 0021) explains itself; the other checks are named.
+    {allowance, failed} =
+      grade["checks"]
+      |> Enum.reject(& &1["passed"])
+      |> Enum.split_with(&(&1["id"] == "allowance"))
+
+    over = Enum.map(allowance, & &1["reason"])
 
     cond do
-      grade["reason"] -> "Submission rejected: #{grade["reason"]}"
-      failed != [] -> Enum.map_join(failed, ", ", & &1["label"]) <> " did not pass"
-      true -> "Required checks did not pass"
+      grade["reason"] ->
+        sentences(["Submission rejected: #{grade["reason"]}" | over])
+
+      failed != [] ->
+        sentences([Enum.map_join(failed, ", ", & &1["label"]) <> " did not pass" | over])
+
+      over != [] ->
+        sentences(over ++ ["Its patch passed every other check."])
+
+      true ->
+        "Required checks did not pass"
     end
   end
 
@@ -134,9 +148,20 @@ defmodule Eab.Evidence do
     summary = Map.put(summary, "verdict", verdict(record))
 
     if is_map(record["grade"]),
-      do: Map.put(summary, "grade", Map.take(record["grade"], ~w(passed artifact artifact_hash))),
+      do:
+        Map.put(
+          summary,
+          "grade",
+          Map.take(record["grade"], ~w(passed patch_passed artifact artifact_hash))
+        ),
       else: summary
   end
+
+  # One sentence stays as it always read; several are each closed with a full stop.
+  defp sentences([only]), do: only
+
+  defp sentences(parts),
+    do: Enum.map_join(parts, " ", &if(String.ends_with?(&1, "."), do: &1, else: &1 <> "."))
 
   defp excerpt(nil), do: nil
 

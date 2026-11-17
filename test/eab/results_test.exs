@@ -249,7 +249,7 @@ defmodule Eab.ResultsTest do
     end
 
     record = Results.export!(timed.(run()))
-    assert record["schema_version"] == 10
+    assert record["schema_version"] == 11
 
     published =
       record
@@ -258,7 +258,9 @@ defmodule Eab.ResultsTest do
         [
           run
           |> Map.drop(["timing", "machine"])
-          |> Map.update!("cases", fn cases -> Enum.map(cases, &Map.delete(&1, "timing")) end)
+          |> Map.update!("cases", fn cases ->
+            Enum.map(cases, &Map.drop(&1, ["timing", "patch_passed"]))
+          end)
         ]
       end)
 
@@ -280,10 +282,12 @@ defmodule Eab.ResultsTest do
       |> Results.export!()
 
     merged = Results.merge!(published, second)
-    assert merged["schema_version"] == 10
+    assert merged["schema_version"] == 11
     [first, added] = merged["runs"]
     assert first["timing"] == nil and Enum.all?(first["cases"], &is_nil(&1["timing"]))
     assert first["machine"] == nil
+    # Before schema 11 a case's outcome was its patch's verdict.
+    assert Enum.all?(first["cases"], &(&1["patch_passed"] == &1["passed"]))
     assert added["timing"]["time_ms"] == 120_000
 
     # A repeated click keeps the published file as it was.
@@ -436,7 +440,7 @@ defmodule Eab.ResultsTest do
 
   test "a speed run publishes its speed cases' times and its machine, apart from any series" do
     speed = Results.export_speed!(speed_run(), speed_cases: ["case-b"])
-    assert speed["kind"] == "speed_run" and speed["schema_version"] == 10
+    assert speed["kind"] == "speed_run" and speed["schema_version"] == 11
     assert speed["series_id"] == Eab.Series.id(with_machine(run()))
     assert speed["run"]["run_id"] == "test-run"
     assert Enum.map(speed["run"]["cases"], & &1["id"]) == ["case-b"]
@@ -501,7 +505,7 @@ defmodule Eab.ResultsTest do
     assert Path.wildcard(Path.join(page, "results/*.json")) == []
 
     payload = Results.read!(Path.join(page, "dist/results.json"))
-    assert payload["schema_version"] == 10
+    assert payload["schema_version"] == 11
     release = Enum.find(payload["releases"], & &1["current"])
     assert release["speed_cases"] == cases
     assert [%{"run" => %{"run_id" => "speed-run"}}] = release["speed_runs"]
@@ -1268,5 +1272,69 @@ defmodule Eab.ResultsTest do
   test "every current case has the summary page its name links to" do
     assert Results.missing_case_pages(Eab.Inventory.all()) == []
     assert Results.missing_case_pages(["no-such-case"]) == ["no-such-case"]
+  end
+
+  defp allowance(cases, tokens) do
+    %{
+      "validator" => "Fixture validator",
+      "multiple" => 2,
+      "minimum_tokens" => 16_384,
+      "validator_tokens" => Map.new(cases, &{&1, [tokens]})
+    }
+  end
+
+  test "under token allowances a series records them and each case's patch verdict" do
+    source =
+      run()
+      |> put_in(["protocol", "inventory", "allowance"], allowance(~w(case-a case-b), 40_000))
+      |> put_in(["attempts", "case-b"], %{
+        "status" => "completed",
+        "stop_reason" => "token_budget",
+        "generated_tokens" => 80_000,
+        "grade" => %{"passed" => false, "patch_passed" => true}
+      })
+
+    record = Results.export!(source)
+    assert record["schema_version"] == 11
+    assert record["setup"]["allowance"]["tokens"] == %{"case-a" => 80_000, "case-b" => 80_000}
+    assert record["series_id"] != Results.export!(run())["series_id"]
+
+    [inside, stopped] = entry(record)["cases"]
+    assert inside["passed"] and inside["patch_passed"]
+    refute stopped["passed"]
+    assert stopped["patch_passed"] and stopped["cutoff"] == "generation_budget"
+
+    # A case cannot pass on a failing patch, and every case needs its allowance.
+    assert_raise ArgumentError, ~r/patch_passed/, fn ->
+      Results.validate!(
+        put_in(record, ["runs", Access.at(0), "cases", Access.at(0), "patch_passed"], false)
+      )
+    end
+
+    assert_raise ArgumentError, ~r/token allowance/, fn ->
+      Results.validate!(
+        update_in(record, ["setup", "allowance", "tokens"], &Map.delete(&1, "case-b"))
+      )
+    end
+  end
+
+  test "a page takes only series made under the current release's token allowances", %{dir: dir} do
+    inventory = Eab.Inventory.definition()
+    limited = Map.put(inventory, "allowance", allowance(inventory["cases"], 40_000))
+    output = Path.join(dir, "dist")
+    made_without = Results.export!(current())
+    made_under = Results.export!(put_in(current(), ["protocol", "inventory"], limited))
+
+    assert_raise ArgumentError, ~r/other token allowances/, fn ->
+      Results.build!([made_under], output)
+    end
+
+    assert_raise ArgumentError, ~r/other token allowances/, fn ->
+      Results.build!([made_without], output, inventory: limited)
+    end
+
+    Results.build!([made_under], output, inventory: limited)
+    [built] = built(Path.join(output, "results.json"))
+    assert built["setup"]["allowance"]["tokens"][hd(inventory["cases"])] == 80_000
   end
 end

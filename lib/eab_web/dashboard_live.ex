@@ -136,10 +136,57 @@ defmodule EabWeb.DashboardLive do
 
   # Whether a budget ended the attempt before the agent finished, by the rule the results page
   # tags cut-off cases with (ADRs 0015 and 0016). Nil when the stop says neither.
-  defp token_outcome(run, attempt) do
+  defp token_outcome(run, id, attempt) do
     settings = run["settings"] || %{}
+    cutoff = Results.cutoff(attempt, settings["max_tokens"], get_in(run, ["model", "backend"]))
 
-    case Results.cutoff(attempt, settings["max_tokens"], get_in(run, ["model", "backend"])) do
+    case allowance(run, id) do
+      nil -> cutoff_outcome(cutoff, attempt, settings)
+      allowance -> allowance_outcome(cutoff, attempt, allowance, settings)
+    end
+  end
+
+  # The case's token allowance in the run's frozen release, or nil without one (ADR 0021).
+  defp allowance(run, id), do: Eab.Allowance.tokens(get_in(run, ["protocol", "inventory"]), id)
+
+  # Under an allowance an attempt that did not finish inside it fails; its patch is still graded.
+  defp allowance_outcome(cutoff, attempt, allowance, settings) do
+    graded =
+      "so the case counts as failed. The patch at that point was still graded; its checks are listed below."
+
+    used = attempt["generated_tokens"]
+
+    case cutoff do
+      "generation_budget" ->
+        {"Stopped at its token allowance.",
+         "The attempt generated its allowance of #{tokens(allowance)} tokens before the agent finished, #{graded}"}
+
+      "context_budget" ->
+        {"Ran out of context.",
+         "The conversation reached the #{limit(settings["window_tokens"])} context limit before the agent finished, #{graded}"}
+
+      "response_budget" ->
+        {"Ran out mid-reply.",
+         "One reply reached its length limit before the agent finished, #{graded}"}
+
+      nil ->
+        cond do
+          attempt["stop_reason"] != "agent_completed" ->
+            nil
+
+          is_integer(used) and used > allowance ->
+            {"Went over its token allowance.",
+             "The agent finished, but generated #{tokens(used)} tokens against an allowance of #{tokens(allowance)}, so the case counts as failed."}
+
+          true ->
+            {"Finished inside its token allowance.",
+             "The agent finished on its own after #{tokens(used)} of #{tokens(allowance)} allowed tokens."}
+        end
+    end
+  end
+
+  defp cutoff_outcome(cutoff, attempt, settings) do
+    case cutoff do
       "context_budget" ->
         {"Ran out of context.",
          "The conversation reached the #{limit(settings["window_tokens"])} context limit before the agent finished, so the patch at that point was graded."}
@@ -2055,19 +2102,20 @@ defmodule EabWeb.DashboardLive do
                     <p
                       :if={
                         @case_attempt && @case_attempt["status"] in ["completed", "error"] &&
-                          token_outcome(@run, @case_attempt)
+                          token_outcome(@run, @log_case, @case_attempt)
                       }
                       id="case-token-outcome"
                       class="fine-print"
                     >
-                      <strong>{elem(token_outcome(@run, @case_attempt), 0)}</strong>
-                      {elem(token_outcome(@run, @case_attempt), 1)}
+                      <strong>{elem(token_outcome(@run, @log_case, @case_attempt), 0)}</strong>
+                      {elem(token_outcome(@run, @log_case, @case_attempt), 1)}
                     </p>
                     <p
                       :if={
                         @case_attempt && @case_attempt["status"] in ["completed", "error"] &&
                           is_integer(@case_attempt["generated_tokens"]) &&
-                          is_integer(@run["settings"]["max_tokens"])
+                          is_integer(@run["settings"]["max_tokens"]) &&
+                          is_nil(allowance(@run, @log_case))
                       }
                       class="fine-print"
                     >
@@ -2085,7 +2133,8 @@ defmodule EabWeb.DashboardLive do
                         @case_attempt && @case_attempt["status"] in ["completed", "error"] &&
                           is_integer(@case_attempt["generated_tokens"]) &&
                           is_nil(@run["settings"]["max_tokens"]) &&
-                          is_integer(@run["settings"]["window_tokens"])
+                          is_integer(@run["settings"]["window_tokens"]) &&
+                          is_nil(allowance(@run, @log_case))
                       }
                       id="case-tokens"
                       class="fine-print"
@@ -2108,7 +2157,8 @@ defmodule EabWeb.DashboardLive do
                     </p>
                     <p
                       :if={
-                        get_in(@run, ["attempts", @log_case, "claude_code", "over_declared_budget"])
+                        get_in(@run, ["attempts", @log_case, "claude_code", "over_declared_budget"]) &&
+                          is_nil(allowance(@run, @log_case))
                       }
                       class="notice"
                     >

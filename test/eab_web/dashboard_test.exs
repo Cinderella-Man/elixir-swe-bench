@@ -951,4 +951,69 @@ defmodule EabWeb.DashboardTest do
 
     page
   end
+
+  test "under a token allowance a case says whether the agent finished inside it" do
+    id = "token-allowance-ui"
+
+    attempt = fn stop, tokens ->
+      %{
+        "status" => "completed",
+        "grade" => %{"passed" => false, "patch_passed" => true},
+        "stop_reason" => stop,
+        "generated_tokens" => tokens
+      }
+    end
+
+    attempts = %{
+      "stopped-case" => attempt.("token_budget", 20_000),
+      "over-case" => attempt.("agent_completed", 31_500),
+      "inside-case" => attempt.("agent_completed", 9000)
+    }
+
+    run = %{
+      "id" => id,
+      "created_at" => "9999-01-01T00:00:00Z",
+      "status" => "completed",
+      "cases" => Map.keys(attempts),
+      "attempts" => attempts,
+      "settings" => %{"window_tokens" => 262_144, "max_tokens" => nil},
+      "model" => %{"model" => "fixture", "backend" => "llama_cpp"},
+      "protocol" => %{
+        "inventory" => %{
+          "cases" => Map.keys(attempts),
+          "allowance" => %{
+            "validator" => "Fixture validator",
+            "multiple" => 2,
+            "minimum_tokens" => 16_384,
+            "validator_tokens" => Map.new(Map.keys(attempts), &{&1, [10_000]})
+          }
+        }
+      }
+    }
+
+    Eab.Store.write("runs/#{id}/run.json", run)
+    for {case_id, a} <- attempts, do: Eab.Store.write("runs/#{id}/#{case_id}/attempt.json", a)
+    Eab.Store.index_run(run)
+    on_exit(fn -> File.rm_rf!(Eab.Store.path("runs/#{id}")) end)
+    {:ok, view, _} = live(build_conn(), "/")
+
+    view |> element("#case-stopped-case") |> render_click()
+    assert has_element?(view, "#case-token-outcome", "Stopped at its token allowance.")
+    assert has_element?(view, "#case-token-outcome", "allowance of 20,000 tokens")
+    assert has_element?(view, "#case-token-outcome", "counts as failed")
+    refute has_element?(view, "#case-tokens")
+
+    view |> element("#case-over-case") |> render_click()
+    assert has_element?(view, "#case-token-outcome", "Went over its token allowance.")
+
+    assert has_element?(
+             view,
+             "#case-token-outcome",
+             "31,500 tokens against an allowance of 20,000"
+           )
+
+    view |> element("#case-inside-case") |> render_click()
+    assert has_element?(view, "#case-token-outcome", "Finished inside its token allowance.")
+    assert has_element?(view, "#case-token-outcome", "9,000 of 20,000 allowed tokens")
+  end
 end

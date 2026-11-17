@@ -9,8 +9,8 @@
     if (text !== undefined) e.textContent = text;
     return e;
   };
-  // An older controller's payload (schema 8 or 9) simply has no timing or machines.
-  if (!data || ![8, 9, 10].includes(data.schema_version) || !Array.isArray(data.releases) || data.releases.length === 0) {
+  // An older controller's payload (schema 8 or 9) simply has no timing or machines; before 11, no patch verdicts.
+  if (!data || ![8, 9, 10, 11].includes(data.schema_version) || !Array.isArray(data.releases) || data.releases.length === 0) {
     $("chart").append(node("p", "empty", "Results could not be loaded. Please reload."));
     return;
   }
@@ -59,20 +59,35 @@
   // A release label the operator declared follows it ("Unsloth UD-Q6_K_L v3.1"): makers re-upload files under the same name.
   const quant = r => [r.model.quantized_by, r.model.quantization, r.model.source?.release_label].filter(Boolean).join(" ");
   const chartName = r => [r.model.name, quant(r), effort(r)].filter(Boolean).join(" ");
+  // A release with token allowances gives each case one: the most its attempt may generate. A case then passes
+  // only if the agent finished on its own inside it (ADR 0021). Series of earlier releases have none.
+  const allowance = (r, id) => r.setup?.allowance?.tokens?.[id] ?? null;
+  const allowed = r => Boolean(r.setup?.allowance);
+  // The patch passed every check, but the attempt did not finish inside its allowance, so the case failed.
+  const outside = c => c && c.passed === false && c.patch_passed === true;
+  const outsideTag = (n, where) => {
+    const tag = node("span", "budget-tag", "patch passed" + (n > 1 ? ` ×${n}` : ""));
+    tag.title = `${where} the patch passed every check, but the agent did not finish inside the token allowance, so the case counts as failed.`;
+    return tag;
+  };
   // Claude Code cannot enforce the declared generation budget, so going over it is flagged, not failed (ADR 0010).
-  const overBudget = (r, c) => Number.isInteger(r.settings.max_tokens) && Number.isInteger(c?.generated_tokens) &&
+  // Under a token allowance, going over fails the case instead.
+  const overBudget = (r, c) => !allowed(r) && Number.isInteger(r.settings.max_tokens) && Number.isInteger(c?.generated_tokens) &&
     c.generated_tokens > r.settings.max_tokens;
   const budgetTag = (r, n, of) => {
     const tag = node("span", "budget-tag", `over ${Math.round(r.settings.max_tokens / 1000)}k` + (n > 1 ? ` ×${n}` : ""));
     tag.title = `Generated more than the declared ${fmt(r.settings.max_tokens)}-token budget ${of}. It is flagged, not failed.`;
     return tag;
   };
-  // A budget can end an attempt before the agent finishes. The patch at that point is graded, and may still pass.
+  // A budget can end an attempt before the agent finishes. The patch at that point is graded, and may still pass
+  // unless the series has token allowances: then an attempt that did not finish fails whatever its patch.
   const thousands = tokens => `${Math.floor(tokens / 1000)}k`;
   const cutoffs = {
     generation_budget: {
-      label: r => `stopped at ${thousands(r.settings.max_tokens)}`,
-      text: r => `the attempt used its whole ${fmt(r.settings.max_tokens)}-token generation budget`,
+      label: r => allowed(r) ? "stopped at allowance" : `stopped at ${thousands(r.settings.max_tokens)}`,
+      text: (r, id) => allowance(r, id) ? `the attempt used its whole allowance of ${fmt(allowance(r, id))} generated tokens` :
+        allowed(r) ? "the attempt used its whole token allowance" :
+        `the attempt used its whole ${fmt(r.settings.max_tokens)}-token generation budget`,
     },
     context_budget: {
       label: () => "context full",
@@ -98,9 +113,10 @@
     link.title = "What this case asks for, its ticket and its files";
     return link;
   };
-  const cutoffTag = (r, kind, n, where) => {
+  const cutoffTag = (r, kind, n, where, id) => {
     const tag = node("span", "cutoff-tag", cutoffs[kind].label(r) + (n > 1 ? ` ×${n}` : ""));
-    tag.title = `${where}, ${cutoffs[kind].text(r)}. The patch at that point was graded.`;
+    tag.title = `${where}, ${cutoffs[kind].text(r, id)}. ` +
+      (allowed(r) ? "The case counts as failed; the patch at that point was still graded." : "The patch at that point was graded.");
     return tag;
   };
   const vram = r => r.resources ? (r.resources.peak_vram_bytes ?? r.resources.gpus.reduce((sum, gpu) => sum + gpu.used_bytes, 0)) : null;
@@ -130,7 +146,9 @@
     `Not recorded: the run worked on ${run.deployment.parallel_attempts} cases at once` : "Not recorded";
   // A local run without a per-reply cap records none (ADR 0015); API runs leave it to the provider.
   // Local series cap neither a reply (ADR 0015) nor an attempt's generated tokens (ADR 0016).
+  // Under token allowances the budget is each case's own, whatever the run declared.
   const settingValue = (r, key, value) =>
+    key === "max_tokens" && allowed(r) ? "Each case's token allowance" :
     ["response_tokens", "max_tokens"].includes(key) && value == null && r.settings.window_tokens ? "No cap" : readable(value);
   const readable = value => value == null ? "Not recorded" : typeof value === "boolean" ? (value ? "Enabled" : "Disabled") :
     typeof value === "number" ? fmt(value) : value.replaceAll("_", " ");
@@ -322,8 +340,10 @@
       };
       const tokens = sum(run, "generated_tokens"), calls = sum(run, "model_calls");
       const over = run.cases.filter(c => overBudget(r, c)).length, cut = run.cases.filter(c => c.cutoff);
+      const late = run.cases.filter(outside).length;
       block.append(node("div", "run-block-head", `Run ${i + 1} · ${runName(run)}` + (run.seed != null ? ` · seed ${run.seed}` : "")));
       const outcome = node("span", "", `${run.cases.filter(c => c.passed).length}/${run.cases.length} passed · ${cut.length} cut off · ` +
+        (allowed(r) ? `${late} with a passing patch outside the allowance · ` : "") +
         `${tokens == null ? "—" : fmt(tokens)} output tokens · ${calls == null ? "—" : fmt(calls)} model calls`);
       if (cut.length) outcome.title = Object.keys(cutoffs).map(kind => [kind, cut.filter(c => c.cutoff === kind).length])
         .filter(([, n]) => n).map(([kind, n]) => `${cutoffs[kind].label(r)}: ${n}`).join(" · ");
@@ -374,11 +394,17 @@
     const outcomes = node("div");
     outcomes.append(node("h3", "", "Case outcomes"));
     const attempts = r.runs.flatMap(run => run.cases), cut = attempts.filter(c => c.cutoff).length;
-    if (cut) outcomes.append(node("p", "detail-note", `${cut} of ${attempts.length} attempts ran out of a budget before the agent had finished. ` +
+    if (allowed(r)) {
+      const rule = r.setup.allowance, late = attempts.filter(outside).length;
+      outcomes.append(node("p", "detail-note", `Each case has a token allowance: ${rule.multiple} times the median that ${rule.validator} generated on it, ` +
+        `and at least ${fmt(rule.minimum_tokens)}. A case passes only if the agent finishes on its own inside it. ` +
+        `${late} of ${attempts.length} attempts had a passing patch but did not, and count as failed.`));
+    } else if (cut) outcomes.append(node("p", "detail-note", `${cut} of ${attempts.length} attempts ran out of a budget before the agent had finished. ` +
       "Their patches at that point were graded; the tags say which limit."));
     const table = node("table", "case-table");
     const head = node("thead"), hr = node("tr");
-    for (const title of ["Case", "Runs passed", ...(timed(r) ? ["Time", "Generation tok/s"] : [])]) hr.append(node("th", "", title));
+    for (const title of ["Case", "Runs passed", ...(allowed(r) ? ["Output tokens", "Allowance"] : []),
+      ...(timed(r) ? ["Time", "Generation tok/s"] : [])]) hr.append(node("th", "", title));
     head.append(hr); table.append(head);
     const tbody = node("tbody");
     for (const c of r.runs[0].cases) {
@@ -389,10 +415,21 @@
       if (over) name.append(budgetTag(r, over, `in ${over} of ${r.run_count} runs`));
       for (const kind of Object.keys(cutoffs)) {
         const n = tries.filter(t => t.cutoff === kind).length;
-        if (n) name.append(cutoffTag(r, kind, n, r.run_count === 1 ? "In this run" : `In ${n} of ${r.run_count} runs`));
+        if (n) name.append(cutoffTag(r, kind, n, r.run_count === 1 ? "In this run" : `In ${n} of ${r.run_count} runs`, c.id));
       }
+      const late = tries.filter(outside).length;
+      if (late) name.append(outsideTag(late, r.run_count === 1 ? "In this run" : `In ${late} of ${r.run_count} runs`));
       row.append(name,
         node("td", count === r.run_count ? "passed" : count === 0 ? "failed" : "numeric", `${count}/${r.run_count}`));
+      if (allowed(r)) {
+        // One value per run, in run order, beside what the case allows.
+        const used = node("td", "numeric", tries.map(t => Number.isInteger(t.generated_tokens) ? thousands(t.generated_tokens) : "—").join(" · "));
+        used.title = r.runs.map((run, i) => `${runName(run)}: ` +
+          (Number.isInteger(tries[i].generated_tokens) ? `${fmt(tries[i].generated_tokens)} output tokens` : "Not recorded")).join("\n");
+        const limit = node("td", "numeric", allowance(r, c.id) == null ? "—" : thousands(allowance(r, c.id)));
+        if (allowance(r, c.id) != null) limit.title = `${fmt(allowance(r, c.id))} generated tokens`;
+        row.append(used, limit);
+      }
       if (timed(r)) {
         // One value per run, in run order.
         const time = node("td", "numeric", tries.map(t => t.timing ? duration(t.timing.time_ms) : "—").join(" · "));

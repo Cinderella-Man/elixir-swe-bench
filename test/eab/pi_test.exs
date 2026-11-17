@@ -461,6 +461,34 @@ defmodule Eab.PiTest do
     budgeted = Eab.Agent.instructions(spec, Model.settings(model, %{"max_tokens" => 65_536}))
     assert budgeted =~ "Limits: 65536 generated tokens total and #{window} context tokens."
     assert budgeted =~ "If a budget is exhausted, the current patch is graded."
+
+    # Under a case allowance (ADR 0021) the agent is told it, and that running out fails.
+    release = %{
+      "cases" => [spec["id"]],
+      "allowance" => %{
+        "validator" => "Fixture validator",
+        "multiple" => 2,
+        "minimum_tokens" => 16_384,
+        "validator_tokens" => %{spec["id"] => [19_000]}
+      }
+    }
+
+    allowed = Eab.Allowance.settings(settings, release, spec["id"])
+    limited = Eab.Agent.instructions(spec, allowed)
+    assert limited =~ "This task has an allowance of 38000 generated tokens in total"
+    assert limited =~ "The context window is #{window} tokens for the whole conversation"
+    assert limited =~ "counts as failed, whatever its patch"
+    refute limited =~ "the current patch is graded"
+
+    # The gateway stops the attempt there without calling the model.
+    Application.put_env(:eab, :http_request, fn _ ->
+      flunk("The allowance must prevent network access")
+    end)
+
+    spent = %{state | settings: allowed, generated_tokens: 38_000, stop_reason: nil}
+    {reply, stopped} = PiGateway.request(frame, spent)
+    assert reply["status"] == 429
+    assert stopped.stop_reason == "token_budget"
   end
 
   test "the bash watchdog kills a command that never exits and Pi continues", %{prefix: prefix} do

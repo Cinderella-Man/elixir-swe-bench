@@ -241,6 +241,9 @@ defmodule Eab.Results do
         %{
           "id" => id,
           "passed" => attempt["grade"]["passed"],
+          # The grader's verdict on the patch alone. Under a token allowance (ADR 0021) a
+          # passing patch still fails its case when the agent did not finish inside it.
+          "patch_passed" => Map.get(attempt["grade"], "patch_passed", attempt["grade"]["passed"]),
           "generated_tokens" => attempt["generated_tokens"],
           "model_calls" => attempt["calls"],
           "cutoff" => cutoff(attempt, settings["max_tokens"], model["backend"]),
@@ -428,11 +431,15 @@ defmodule Eab.Results do
   end
 
   # An older series takes the current schema when it takes another run. Its runs recorded
-  # what they recorded: timing before schema 9 and the machine before 10 are null.
+  # what they recorded: timing before schema 9 and the machine before 10 are null. Before
+  # schema 11 a case's outcome was its patch's verdict.
   defp upgrade(record) do
     runs =
       Enum.map(record["runs"], fn run ->
-        cases = Enum.map(run["cases"], &Map.put_new(&1, "timing", nil))
+        cases =
+          Enum.map(run["cases"], fn c ->
+            c |> Map.put_new("timing", nil) |> Map.put_new("patch_passed", c["passed"])
+          end)
 
         run
         |> Map.put("cases", cases)
@@ -652,6 +659,12 @@ defmodule Eab.Results do
           Enum.map(hd(record["runs"])["cases"], & &1["id"]) == inventory["cases"] and
           record["case_fixtures"] == expected,
         "#{record["series_id"]}: series does not match the current cases; start a new series"
+      )
+
+      # A series belongs to the release whose token allowances it was made under (ADR 0021).
+      require!(
+        record["setup"]["allowance"] == Eab.Allowance.table(inventory, inventory["cases"]),
+        "#{record["series_id"]}: series was made under other token allowances; start a new series"
       )
     end
 
