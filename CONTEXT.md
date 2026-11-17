@@ -29,14 +29,14 @@ _Avoid_: model source (the dashboard's choice of local server, ChatGPT or Claude
 
 **Deployment memory observation**: A dated sample of an identified inference process's GPU allocation, RAM and serving configuration. Process/service lifetime peaks do not establish the peak during a particular benchmark run or the minimum hardware required.
 
-**Attempt measurement**: A Pi attempt's elapsed time from startup through completion, with its **model speed**: the prompt tokens processed and tokens generated per second, summed over its model calls. llama.cpp reports its own timings; the controller times Strata's streamed tokens, network included. Both are recorded only when parallel attempts is 1, for a model served on another machine. Generated-token accounting remains available without timing.
+**Attempt measurement**: A Pi attempt's elapsed time from startup through completion, with its **model speed**: the prompt tokens processed and tokens generated per second, summed over its model calls. llama.cpp reports its own timings; the controller times Strata's streamed tokens, network included. Both are recorded only when parallel attempts is 1, for a model served on another machine. Generated-token accounting remains available without timing. A published run states its own case times and model speed; they are never averaged across a run series or scored.
 
 **Run**: An evaluation of one model profile through one harness across a frozen selection of cases, using fixed inputs and the budgets and seed that harness supports.
 
 **Run series**: Up to three runs of one model artifact and quantization through one harness on one benchmark release, with the same server type, chat template, sampling defaults and effective settings apart from seed. Runs differ in seed where the endpoint supports seeds and may come from different people, machines, server builds and benchmark code versions. Its score is the mean of its runs' final scores; it is complete once three runs have final scores.
 _Avoid_: repeats, trial set, epochs
 
-**Published result**: Outcomes for the current admitted cases from one run series, with matching case fixture hashes, model identity, harness and recorded evaluation conditions. Rejected cases are omitted. Each published result is one run series, not a single run: its score is the mean of the runs it has so far, it states how many of the three required runs that is, and each case shows how many of those runs passed. Rows may have different effective settings.
+**Published result**: Outcomes for the current admitted cases from one run series, with matching case fixture hashes, model identity, harness and recorded evaluation conditions. Rejected cases are omitted. Each published result is one run series, not a single run: its score is the mean of the runs it has so far, it states how many of the three required runs that is, and each case shows how many of those runs passed. Rows may have different effective settings. Each run also states the case times and model speed it recorded, which belong to that run alone.
 
 **Attempt**: One agent's investigation, edits, tool calls and submission for a case. A run records one scored attempt per case and retains interrupted work separately.
 

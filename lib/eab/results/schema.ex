@@ -2,6 +2,7 @@ defmodule Eab.Results.Schema do
   @moduledoc false
   @fields ~w(schema_version series_id benchmark model harness settings setup case_fixtures seeds required_runs runs evidence_url note)
   @run_fields ~w(run_id created_at seed source_release_id code_version deployment cases resources)
+  @case_fields ~w(id passed generated_tokens model_calls cutoff)
   @model_fields ~w(name backend quantization quantization_source size_bytes size_source parameter_count quantized_by quantized_by_source source weight_files gguf)
   # A local series made since ADR 0016 has no generation budget, so its max_tokens is null.
   @nullable_int ~w(window_tokens response_tokens max_tokens)
@@ -15,8 +16,11 @@ defmodule Eab.Results.Schema do
   }
 
   def validate!(r) do
-    fields!(r, @fields, "Expected a public v8 run series; export the original run.json with add")
-    require!(r["schema_version"] === 8, "Unsupported result schema")
+    fields!(r, @fields, "Expected a public run series; export the original run.json with add")
+    require!(r["schema_version"] in [8, 9], "Unsupported result schema")
+    # Schema 9 adds each run's and case's timing (ADR 0019). Series published as schema 8 keep
+    # their files unchanged and are upgraded when they take another run.
+    timing = if r["schema_version"] == 9, do: ["timing"], else: []
     hex!(r["series_id"], "A series ID is required")
     text!(r["benchmark"], "benchmark")
 
@@ -124,7 +128,7 @@ defmodule Eab.Results.Schema do
     require!(ids != [] and Enum.uniq(ids) == ids, "Invalid or duplicated case IDs")
 
     for run <- runs do
-      fields!(run, @run_fields, "Unexpected run fields")
+      fields!(run, @run_fields ++ timing, "Unexpected run fields")
 
       require!(
         Regex.match?(~r/^[A-Za-z0-9_-]+$/, text!(run["run_id"], "run_id")),
@@ -166,7 +170,7 @@ defmodule Eab.Results.Schema do
       require!(Enum.map(run["cases"], & &1["id"]) == ids, "Every run must list the same cases")
 
       for c <- run["cases"] do
-        fields!(c, ~w(id passed generated_tokens model_calls cutoff), "Unexpected case fields")
+        fields!(c, @case_fields ++ timing, "Unexpected case fields")
         require!(is_boolean(c["passed"]), "Every case needs a final pass/fail outcome")
 
         require!(
@@ -187,6 +191,9 @@ defmodule Eab.Results.Schema do
                 "#{key} must be a nonnegative integer or null"
               )
       end
+
+      # Case times and model speed, when the run recorded them (ADR 0019).
+      Eab.Results.Timing.validate!(run, r["harness"]["name"])
 
       if not is_nil(run["resources"]),
         do: Eab.Results.Resources.validate!(run["resources"], model, settings, r["setup"])

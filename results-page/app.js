@@ -9,7 +9,8 @@
     if (text !== undefined) e.textContent = text;
     return e;
   };
-  if (!data || data.schema_version !== 8 || !Array.isArray(data.releases) || data.releases.length === 0) {
+  // A schema 8 payload, built by a controller from before ADR 0019, simply has no timing.
+  if (!data || ![8, 9].includes(data.schema_version) ||!Array.isArray(data.releases) || data.releases.length === 0) {
     $("chart").append(node("p", "empty", "Results could not be loaded. Please reload."));
     return;
   }
@@ -105,6 +106,28 @@
   const vram = r => r.resources ? (r.resources.peak_vram_bytes ?? r.resources.gpus.reduce((sum, gpu) => sum + gpu.used_bytes, 0)) : null;
   const context = r => r.settings.window_tokens ? `${fmt(r.settings.window_tokens)} context` : "API";
   const sum = (run, key) => run.cases.every(c => Number.isInteger(c[key])) ? run.cases.reduce((n, c) => n + c[key], 0) : null;
+  // Case time and model speed, recorded only when a run worked on one case at a time (ADR 0019).
+  // Series published before schema 9 carry none.
+  const timed = r => r.runs.some(run => run.timing);
+  // No-break spaces keep one duration on one line; several runs' durations may still wrap between them.
+  const duration = ms => {
+    if (ms < 60000) return `${Math.round(ms / 1000)} s`;
+    const minutes = Math.round(ms / 60000);
+    return minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
+  };
+  const seconds = ms => `${fmt(Math.round(ms / 1000))} s`;
+  const rate = (tokens, ms) => ms > 0 && tokens > 0 ? (tokens * 1000 / ms).toFixed(1) : null;
+  const speedSource = {server_reported: "reported by llama.cpp, network excluded",
+    controller_timed: "timed by the benchmark, network included", mixed: "from mixed sources"};
+  const speedText = s => !s ? "No model speed recorded" : [
+    rate(s.generated_tokens, s.generation_ms) && `generation ${rate(s.generated_tokens, s.generation_ms)} tok/s`,
+    rate(s.prompt_tokens, s.prompt_ms) && `prompt ${rate(s.prompt_tokens, s.prompt_ms)} tok/s`,
+    s.draft_tokens ? `${Math.round(100 * s.draft_accepted / s.draft_tokens)}% of draft tokens accepted` : null,
+    `${fmt(s.calls)} model call${s.calls === 1 ? "" : "s"}, ${speedSource[s.source]}`,
+  ].filter(Boolean).join(" · ");
+  const runName = run => `${run.created_at.slice(0, 10)} · ${run.run_id}`;
+  const untimed = run => (run.deployment?.parallel_attempts ?? 1) > 1 ?
+    `Not recorded: the run worked on ${run.deployment.parallel_attempts} cases at once` : "Not recorded";
   // A local run without a per-reply cap records none (ADR 0015); API runs leave it to the provider.
   // Local series cap neither a reply (ADR 0015) nor an attempt's generated tokens (ADR 0016).
   const settingValue = (r, key, value) =>
@@ -181,6 +204,36 @@
     for (const [label, value] of entries) list.append(node("dt", "", label), node("dd", "", value));
     return list;
   }
+  // Each run's total case time and its model speed summed over the run's model calls.
+  function timing(r) {
+    const table = node("table", "case-table"), head = node("thead"), headRow = node("tr");
+    for (const title of ["Run", "Cases timed", "Case time", "Generation tok/s", "Prompt tok/s", "Draft accepted"]) headRow.append(node("th", "", title));
+    head.append(headRow); table.append(head);
+    const body = node("tbody");
+    for (const run of r.runs) {
+      const row = node("tr"), t = run.timing, s = t?.model_speed;
+      row.append(node("td", "case-id", runName(run)));
+      if (!t) {
+        const cell = node("td", "numeric", untimed(run));
+        cell.colSpan = 5; row.append(cell);
+      } else {
+        const time = node("td", "numeric", duration(t.time_ms));
+        time.title = `${seconds(t.time_ms)} over ${t.measured_cases} cases`;
+        row.append(node("td", "numeric", `${t.measured_cases}/${run.cases.length}`), time,
+          node("td", "numeric", (s && rate(s.generated_tokens, s.generation_ms)) || "—"),
+          node("td", "numeric", (s && rate(s.prompt_tokens, s.prompt_ms)) || "—"),
+          node("td", "numeric", s?.draft_tokens ? `${Math.round(100 * s.draft_accepted / s.draft_tokens)}%` : "—"));
+        row.title = speedText(s);
+      }
+      body.append(row);
+    }
+    table.append(body);
+    return [node("h3", "settings-heading", "Time & speed"), table, node("p", "detail-note",
+      "Case time runs from the agent's start to its finish, model and tool calls included, preparation and grading excluded; " +
+      "a run's time adds up its cases. Speeds are tokens over the time the model spent on them, summed over the run's model calls: " +
+      "llama.cpp reports its own timings, network excluded; other local servers are timed by the benchmark, network included. " +
+      "Times are recorded only when a run works on one case at a time. Runs may come from different machines and days, so speed is not scored.")];
+  }
   function details(r) {
     const body = node("section", "run-detail");
     body.id = "run-detail";
@@ -205,7 +258,7 @@
       "Their patches at that point were graded; the tags say which limit."));
     const table = node("table", "case-table");
     const head = node("thead"), hr = node("tr");
-    for (const title of ["Case", "Runs passed"]) hr.append(node("th", "", title));
+    for (const title of ["Case", "Runs passed", ...(timed(r) ? ["Time", "Generation tok/s"] : [])]) hr.append(node("th", "", title));
     head.append(hr); table.append(head);
     const tbody = node("tbody");
     for (const c of r.runs[0].cases) {
@@ -220,6 +273,17 @@
       }
       row.append(name,
         node("td", count === r.run_count ? "passed" : count === 0 ? "failed" : "numeric", `${count}/${r.run_count}`));
+      if (timed(r)) {
+        // One value per run, in run order.
+        const time = node("td", "numeric", tries.map(t => t.timing ? duration(t.timing.time_ms) : "—").join(" · "));
+        const speed = node("td", "numeric", tries.map(t => {
+          const s = t.timing?.model_speed;
+          return (s && rate(s.generated_tokens, s.generation_ms)) || "—";
+        }).join(" · "));
+        time.title = speed.title = r.runs.map((run, i) => `${runName(run)}: ` + (tries[i].timing ?
+          `${seconds(tries[i].timing.time_ms)} · ${speedText(tries[i].timing.model_speed)}` : untimed(run))).join("\n");
+        row.append(time, speed);
+      }
       tbody.append(row);
     }
     table.append(tbody); outcomes.append(table);
@@ -236,13 +300,14 @@
       const kinds = Object.keys(cutoffs).map(kind => [kind, run.cases.filter(c => c.cutoff === kind).length]).filter(([, n]) => n);
       const cutCell = node("td", "numeric", `${run.cases.filter(c => c.cutoff).length}/${run.cases.length}`);
       if (kinds.length) cutCell.title = kinds.map(([kind, n]) => `${cutoffs[kind].label(r)}: ${n}`).join(" · ");
-      row.append(node("td", "case-id", `${run.created_at.slice(0, 10)} · ${run.run_id}`), node("td", "numeric", run.seed ?? "—"),
+      row.append(node("td", "case-id", runName(run)), node("td", "numeric", run.seed ?? "—"),
         node("td", "numeric", run.deployment?.parallel_attempts ?? 1),
         node("td", "numeric", `${run.cases.filter(c => c.passed).length}/${run.cases.length}`),
         cutCell, tokenCell, node("td", "numeric", calls == null ? "—" : fmt(calls)));
       runBody.append(row);
     }
     runs.append(runBody); outcomes.append(runs);
+    if (timed(r)) outcomes.append(...timing(r));
     if (!r.complete) {
       outcomes.append(node("h3", "settings-heading", "Required setup for the missing runs"));
       outcomes.append(definitionList(Object.entries(r.setup).map(([key, value]) =>

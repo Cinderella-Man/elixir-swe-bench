@@ -5,7 +5,7 @@ defmodule Eab.Results do
   `results/` holds the current benchmark release's series; `releases/<name>/` holds an
   earlier release's, kept as published. `releases.json` says which release the page shows first.
   """
-  alias Eab.{ModelIdentity, Results.Schema, Series}
+  alias Eab.{ModelIdentity, Results.Schema, Results.Timing, Series}
 
   def root,
     do:
@@ -146,9 +146,25 @@ defmodule Eab.Results do
     settings = Map.delete(run["settings"] || %{}, "seed")
     seed = get_in(run, ["settings", "seed"])
     profile = model["profile"] || %{}
+    # Times are comparable only when the run worked on one case at a time (ADRs 0014 and 0019).
+    timed? = (run["parallel_attempts"] || 1) == 1 and not claude_code
+
+    cases =
+      Enum.map(selected_ids, fn id ->
+        attempt = run["attempts"][id]
+
+        %{
+          "id" => id,
+          "passed" => attempt["grade"]["passed"],
+          "generated_tokens" => attempt["generated_tokens"],
+          "model_calls" => attempt["calls"],
+          "cutoff" => cutoff(attempt, settings["max_tokens"], model["backend"]),
+          "timing" => if(timed?, do: Timing.of_case(attempt))
+        }
+      end)
 
     record = %{
-      "schema_version" => 8,
+      "schema_version" => 9,
       "series_id" => series,
       "benchmark" => selected["id"],
       "model" => %{
@@ -205,18 +221,8 @@ defmodule Eab.Results do
             "total_slots" => profile["total_slots"],
             "parallel_attempts" => run["parallel_attempts"] || 1
           },
-          "cases" =>
-            Enum.map(selected_ids, fn id ->
-              attempt = run["attempts"][id]
-
-              %{
-                "id" => id,
-                "passed" => attempt["grade"]["passed"],
-                "generated_tokens" => attempt["generated_tokens"],
-                "model_calls" => attempt["calls"],
-                "cutoff" => cutoff(attempt, settings["max_tokens"], model["backend"])
-              }
-            end),
+          "cases" => cases,
+          "timing" => Timing.of_run(cases),
           "resources" => resources
         }
       ],
@@ -338,10 +344,24 @@ defmodule Eab.Results do
         raise ArgumentError, "Seed #{run["seed"]} already has a run in this series"
 
       true ->
+        record = upgrade(record)
         runs = Enum.sort_by(record["runs"] ++ [run], & &1["created_at"])
         validate!(%{record | "runs" => runs})
     end
   end
+
+  # A schema 8 series published no timing; its runs say so with null when it takes another.
+  defp upgrade(%{"schema_version" => 8} = record) do
+    runs =
+      Enum.map(record["runs"], fn run ->
+        cases = Enum.map(run["cases"], &Map.put(&1, "timing", nil))
+        Map.merge(run, %{"cases" => cases, "timing" => nil})
+      end)
+
+    %{record | "schema_version" => 9, "runs" => runs}
+  end
+
+  defp upgrade(record), do: record
 
   def load!(directory \\ Path.join(root(), "results")) do
     records =
@@ -549,7 +569,7 @@ defmodule Eab.Results do
       "releases.json names #{primary} as primary, which is not a release on this page"
     )
 
-    payload = %{"schema_version" => 8, "primary" => primary, "releases" => releases}
+    payload = %{"schema_version" => 9, "primary" => primary, "releases" => releases}
 
     repository =
       opts[:repository] ||

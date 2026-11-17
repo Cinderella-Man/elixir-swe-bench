@@ -105,19 +105,188 @@ defmodule Eab.ResultsTest do
         do: refute(Jason.encode!(result) =~ private)
   end
 
-  test "preserves tokens and model calls but publishes no timing" do
+  # A llama.cpp attempt's measurement, as Eab.ModelSpeed sums it: fractional milliseconds.
+  defp llama_measurement do
+    %{
+      "attempt_ms" => 120_000,
+      "model_speed" => %{
+        "source" => "server_reported",
+        "calls" => 12,
+        "prompt_tokens" => 4000,
+        "prompt_ms" => 2000.4,
+        "generated_tokens" => 1000,
+        "generation_ms" => 20_000.6,
+        "draft_tokens" => 800,
+        "draft_accepted" => 600
+      }
+    }
+  end
+
+  defp strata_measurement do
+    %{
+      "attempt_ms" => 60_000,
+      "model_speed" => %{
+        "source" => "controller_timed",
+        "calls" => 3,
+        "prompt_tokens" => 1000,
+        "prompt_ms" => 500,
+        "generated_tokens" => 299,
+        "generation_ms" => 10_000
+      }
+    }
+  end
+
+  test "preserves tokens and model calls, and each run states its case times and model speed" do
     source =
       run()
       |> put_in(["attempts", "case-a", "generated_tokens"], 1234)
       |> put_in(["attempts", "case-a", "calls"], 12)
-      |> put_in(["attempts", "case-a", "measurement"], %{
-        "attempt_ms" => 120_000
-      })
+      |> put_in(["attempts", "case-a", "measurement"], llama_measurement())
+      |> put_in(["attempts", "case-b", "measurement"], strata_measurement())
 
-    [a, b] = entry(Results.export!(source))["cases"]
+    run = entry(Results.export!(source))
+    [a, b] = run["cases"]
     assert a["generated_tokens"] == 1234 and a["model_calls"] == 12
-    assert b["generated_tokens"] == nil
-    refute Jason.encode!(Results.export!(source)) =~ "attempt_ms"
+
+    assert a["timing"] == %{
+             "time_ms" => 120_000,
+             "model_speed" => %{
+               "source" => "server_reported",
+               "calls" => 12,
+               "prompt_tokens" => 4000,
+               "prompt_ms" => 2000,
+               "generated_tokens" => 1000,
+               "generation_ms" => 20_001,
+               "draft_tokens" => 800,
+               "draft_accepted" => 600
+             }
+           }
+
+    assert b["timing"]["model_speed"]["draft_tokens"] == nil
+
+    assert run["timing"] == %{
+             "measured_cases" => 2,
+             "time_ms" => 180_000,
+             "model_speed" => %{
+               "source" => "mixed",
+               "calls" => 15,
+               "prompt_tokens" => 5000,
+               "prompt_ms" => 2500,
+               "generated_tokens" => 1299,
+               "generation_ms" => 30_001,
+               "draft_tokens" => 800,
+               "draft_accepted" => 600
+             }
+           }
+
+    # Only measured cases count; a case timed without model speed adds its time alone.
+    partial =
+      source
+      |> put_in(["attempts", "case-a", "measurement"], %{"attempt_ms" => 5000})
+      |> put_in(["attempts", "case-b", "measurement"], %{"not_measured" => "parallel"})
+
+    partial = entry(Results.export!(partial))
+
+    assert Enum.map(partial["cases"], & &1["timing"]) == [
+             %{"time_ms" => 5000, "model_speed" => nil},
+             nil
+           ]
+
+    assert partial["timing"] == %{"measured_cases" => 1, "time_ms" => 5000, "model_speed" => nil}
+
+    # Concurrent attempts' times are not comparable, so none is published (ADR 0014).
+    parallel = entry(Results.export!(Map.put(source, "parallel_attempts", 2)))
+    assert parallel["timing"] == nil and Enum.all?(parallel["cases"], &is_nil(&1["timing"]))
+
+    untimed = entry(Results.export!(run()))
+    assert untimed["timing"] == nil and Enum.all?(untimed["cases"], &is_nil(&1["timing"]))
+  end
+
+  test "a published run's timing must add up, and only a one-case-at-a-time Pi run has any" do
+    record =
+      run()
+      |> put_in(["attempts", "case-a", "measurement"], llama_measurement())
+      |> Results.export!()
+
+    change = fn fun -> update_in(record, ["runs"], fn [run] -> [fun.(run)] end) end
+
+    set_case = fn key, value ->
+      change.(&put_in(&1, ["cases", Access.at(0), "timing", key], value))
+    end
+
+    for {message, bad} <- [
+          {~r/must sum/, change.(&put_in(&1, ["timing", "time_ms"], 1))},
+          {~r/must sum/, change.(&put_in(&1, ["timing"], nil))},
+          {~r/one case at a time/, change.(&put_in(&1, ["deployment", "parallel_attempts"], 2))},
+          {~r/nonnegative/, set_case.("time_ms", -1)},
+          {~r/Unexpected case timing/, set_case.("wall_ms", 1)},
+          {~r/Unexpected model speed/,
+           set_case.("model_speed", Map.delete(llama_measurement()["model_speed"], "calls"))},
+          {~r/Draft tokens/,
+           change.(
+             &put_in(&1, ["cases", Access.at(0), "timing", "model_speed", "draft_accepted"], 900)
+           )}
+        ] do
+      assert_raise ArgumentError, message, fn -> Results.validate!(bad) end
+    end
+
+    claude_code = %{
+      "name" => "claude_code",
+      "version" => "2.3.0",
+      "agent" => "solver",
+      "kit_sha256" => String.duplicate("c", 64),
+      "preamble_sha256" => String.duplicate("d", 64)
+    }
+
+    assert_raise ArgumentError, ~r/Only Pi/, fn ->
+      Results.validate!(Map.put(record, "harness", claude_code))
+    end
+  end
+
+  test "schema 8 series stay valid unchanged and are upgraded when they take another run" do
+    timed = fn source ->
+      put_in(source, ["attempts", "case-a", "measurement"], llama_measurement())
+    end
+
+    record = Results.export!(timed.(run()))
+    assert record["schema_version"] == 9
+
+    published =
+      record
+      |> Map.put("schema_version", 8)
+      |> update_in(["runs"], fn [run] ->
+        [
+          run
+          |> Map.delete("timing")
+          |> Map.update!("cases", fn cases -> Enum.map(cases, &Map.delete(&1, "timing")) end)
+        ]
+      end)
+
+    assert Results.validate!(published)
+
+    assert_raise ArgumentError, fn ->
+      Results.validate!(Map.put(published, "schema_version", 9))
+    end
+
+    assert_raise ArgumentError, fn ->
+      Results.validate!(put_in(published, ["runs", Access.at(0), "timing"], nil))
+    end
+
+    second =
+      run()
+      |> Map.merge(%{"id" => "test-run-2", "created_at" => "2026-10-18T12:00:00Z"})
+      |> put_in(["settings", "seed"], 102)
+      |> timed.()
+      |> Results.export!()
+
+    merged = Results.merge!(published, second)
+    assert merged["schema_version"] == 9
+    [first, added] = merged["runs"]
+    assert first["timing"] == nil and Enum.all?(first["cases"], &is_nil(&1["timing"]))
+    assert added["timing"]["time_ms"] == 120_000
+
+    # A repeated click keeps the published file as it was.
+    assert Results.merge!(published, record) == published
   end
 
   test "each case says which budget cut its attempt off, including older Pi runs" do
