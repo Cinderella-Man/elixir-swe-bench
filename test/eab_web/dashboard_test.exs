@@ -36,6 +36,48 @@ defmodule EabWeb.DashboardTest do
     assert has_element?(view, "#case-time", "Case time: 1.234 s")
   end
 
+  test "a case says plainly whether it ran out of tokens or finished on its own" do
+    id = "token-outcome-ui"
+
+    attempt = fn stop, tokens ->
+      %{
+        "status" => "completed",
+        "grade" => %{"passed" => false},
+        "stop_reason" => stop,
+        "generated_tokens" => tokens
+      }
+    end
+
+    attempts = %{
+      "full-case" => attempt.("context_budget", 148_366),
+      "done-case" => attempt.("agent_completed", 52_000)
+    }
+
+    run = %{
+      "id" => id,
+      "created_at" => "9999-01-01T00:00:00Z",
+      "status" => "completed",
+      "cases" => Map.keys(attempts),
+      "attempts" => attempts,
+      "settings" => %{"window_tokens" => 262_144, "max_tokens" => nil},
+      "model" => %{"model" => "fixture", "backend" => "llama_cpp"}
+    }
+
+    Eab.Store.write("runs/#{id}/run.json", run)
+    for {case_id, a} <- attempts, do: Eab.Store.write("runs/#{id}/#{case_id}/attempt.json", a)
+    Eab.Store.index_run(run)
+    on_exit(fn -> File.rm_rf!(Eab.Store.path("runs/#{id}")) end)
+    {:ok, view, _} = live(build_conn(), "/")
+
+    view |> element("#case-full-case") |> render_click()
+    assert has_element?(view, "#case-token-outcome", "Ran out of context.")
+    assert has_element?(view, "#case-token-outcome", "262,144-token context limit")
+    assert has_element?(view, "#case-tokens", "Generated tokens: 148,366")
+
+    view |> element("#case-done-case") |> render_click()
+    assert has_element?(view, "#case-token-outcome", "Did not run out.")
+  end
+
   test "a retired case in a saved run still shows and follows its command output" do
     id = "live-log-test"
     case_id = "plausible-pr-6300"

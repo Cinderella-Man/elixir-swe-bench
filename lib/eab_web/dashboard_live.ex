@@ -134,6 +134,38 @@ defmodule EabWeb.DashboardLive do
     _ -> 0
   end
 
+  # Whether a budget ended the attempt before the agent finished, by the rule the results page
+  # tags cut-off cases with (ADRs 0015 and 0016). Nil when the stop says neither.
+  defp token_outcome(run, attempt) do
+    settings = run["settings"] || %{}
+
+    case Results.cutoff(attempt, settings["max_tokens"], get_in(run, ["model", "backend"])) do
+      "context_budget" ->
+        {"Ran out of context.",
+         "The conversation reached the #{limit(settings["window_tokens"])} context limit before the agent finished, so the patch at that point was graded."}
+
+      "generation_budget" ->
+        {"Ran out of generation budget.",
+         "The attempt generated its #{limit(settings["max_tokens"])} budget before the agent finished, so the patch at that point was graded."}
+
+      "response_budget" ->
+        {"Ran out mid-reply.",
+         "One reply reached the per-reply limit before the agent finished, which ended the attempt; the patch at that point was graded."}
+
+      nil ->
+        if attempt["stop_reason"] == "agent_completed",
+          do: {"Did not run out.", "The agent finished on its own, within every token limit."}
+    end
+  end
+
+  defp limit(n) when is_integer(n), do: "#{tokens(n)}-token"
+  defp limit(_), do: "token"
+
+  defp tokens(n) when is_integer(n),
+    do: n |> Integer.to_string() |> String.replace(~r/\B(?=(\d{3})+(?!\d))/, ",")
+
+  defp tokens(n), do: n
+
   defp prefill_contribution(socket, series) do
     settings =
       series["settings"]
@@ -2023,14 +2055,25 @@ defmodule EabWeb.DashboardLive do
                     <p
                       :if={
                         @case_attempt && @case_attempt["status"] in ["completed", "error"] &&
+                          token_outcome(@run, @case_attempt)
+                      }
+                      id="case-token-outcome"
+                      class="fine-print"
+                    >
+                      <strong>{elem(token_outcome(@run, @case_attempt), 0)}</strong>
+                      {elem(token_outcome(@run, @case_attempt), 1)}
+                    </p>
+                    <p
+                      :if={
+                        @case_attempt && @case_attempt["status"] in ["completed", "error"] &&
                           is_integer(@case_attempt["generated_tokens"]) &&
                           is_integer(@run["settings"]["max_tokens"])
                       }
                       class="fine-print"
                     >
-                      Generated tokens: {@case_attempt["generated_tokens"]} / {@run["settings"][
-                        "max_tokens"
-                      ]}.
+                      Generated tokens: {tokens(@case_attempt["generated_tokens"])} / {tokens(
+                        @run["settings"]["max_tokens"]
+                      )}.
                       <span :if={@run["settings"]["budget_policy"] == "response_boundary_soft_limit"}>Soft threshold, checked between responses. Context is provider-enforced.</span>
                       <span :if={@run["settings"]["budget_policy"] != "response_boundary_soft_limit"}>Context limit: {@run[
                         "settings"
@@ -2047,8 +2090,8 @@ defmodule EabWeb.DashboardLive do
                       id="case-tokens"
                       class="fine-print"
                     >
-                      Generated tokens: {@case_attempt["generated_tokens"]}, with no budget of their own.
-                      Context limit: {@run["settings"]["window_tokens"]} tokens for the whole conversation.
+                      Generated tokens: {tokens(@case_attempt["generated_tokens"])}, with no budget of their own.
+                      Context limit: {tokens(@run["settings"]["window_tokens"])} tokens for the whole conversation.
                     </p>
                     <p
                       :if={get_in(@run, ["case_phases", @log_case]) == "qualifying"}
