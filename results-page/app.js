@@ -64,7 +64,7 @@
       "Pick a size to see what each model solves with less context."));
   }
   // At a size, a series carries that size's score, interval and per-case pass counts in place of its own.
-  const records = size ? sized.map(r => ({...r, ...r.by_context[size], context_size: size})) : release.results;
+  const records = size ? sized.map(r => ({...r, ...r.by_context[size], context_size: size, own: r})) : release.results;
   const fits = (r, c) => r.context_size ? c.passed && !c.cutoff && Number.isInteger(c.peak_context_tokens) &&
     c.peak_context_tokens <= r.context_size : c.passed;
   if (records.length === 0) {
@@ -547,17 +547,24 @@
   const family = r => r.model.family || r.model.name.replace(/-(GSQ-RCO|Gyro-[A-Z]+)(?=-|$)/, "");
   const memberName = r => [quant(r), effort(r)].filter(Boolean).join(" ") || chartName(r);
   // These five hues pass every pairwise colour check on white (the dataviz validator with --pairs all). In this fixed
-  // order they go to the families with more than one series, best family first; every other family is grey. Colours
-  // are decided once from all results, so the filter below never repaints a family.
+  // order they go to the families with more than one series, best family first; every other family is grey. Where
+  // the chart draws a line per series, a line needs its own colour to be followed, so there the hues go to the best
+  // five families whatever their size. Colours are decided once from all results, so the filter below never repaints
+  // a family.
   const HUES = ["#2a78d6", "#1baf7a", "#eda100", "#008300", "#e34948"], GREY = "#8a8494";
-  const families = (() => {
+  const grouped = list => {
     const groups = new Map();
-    for (const r of records) groups.set(family(r), [...(groups.get(family(r)) || []), r]);
+    for (const r of list) groups.set(family(r), [...(groups.get(family(r)) || []), r]);
     const top = members => Math.max(...members.map(r => r.score_percent));
+    return [...groups].sort(([an, a], [bn, b]) => top(b) - top(a) || an.localeCompare(bn));
+  };
+  // From the release's own scores, so a family keeps its colour whichever context size is shown.
+  const familyColors = (() => {
     let slot = 0;
-    return new Map([...groups].sort(([an, a], [bn, b]) => top(b) - top(a) || an.localeCompare(bn))
-      .map(([name, members]) => [name, {name, members, color: members.length > 1 && slot < HUES.length ? HUES[slot++] : GREY}]));
+    return new Map(grouped(release.results).map(([name, members]) =>
+      [name, (members.length > 1 || sized.length > 0) && slot < HUES.length ? HUES[slot++] : GREY]));
   })();
+  const families = new Map(grouped(records).map(([name, members]) => [name, {name, members, color: familyColors.get(name)}]));
   // A family's best series carries its name on the chart: most cases passed, then least memory.
   const anchors = new Set([...families.values()].map(f => [...f.members].sort((a, b) =>
     b.score_percent - a.score_percent || (required(a) ?? Infinity) - (required(b) ?? Infinity))[0]));
@@ -632,24 +639,28 @@
     if (withFrontier) item("line", "Most cases passed for its memory");
     return list;
   }
-  function point(r, x, best, number, nudge) {
+  // `view` overrides what the point shows (its score, interval and a tooltip line) where one series has two
+  // points; `kind` then keeps their ids apart.
+  function point(r, x, best, number, nudge, view = null, kind = "") {
+    const v = view ? {...r, ...view} : r;
     const lead = anchors.has(r), alone = families.get(family(r)).members.length === 1;
     const point = node("button", "scatter-point" + (r.harness.name === "claude_code" ? " diamond" : "") + (r.complete ? "" : " provisional") +
       (best ? " best" : "") + (lead ? " anchor" : "") + (faded(r) ? " faded" : "") + (selected === r.series_id ? " selected" : ""));
-    point.id = `point-${r.series_id}`;
+    point.id = `point-${r.series_id}${kind}`;
     point.dataset.number = number;
     point.style.left = `${x * 100}%`;
-    point.style.bottom = `${r.score_percent}%`;
+    point.style.bottom = `${v.score_percent}%`;
     point.style.setProperty("--dot", families.get(family(r)).color);
     if (nudge) point.style.setProperty("--nudge", `${nudge}px`);
-    point.setAttribute("aria-label", `${chartName(r)}, ${harness(r)}, ${casesText(r)} (${scoreText(r)}), ${memoryText(r)}, ${runsText(r)}. Show details`);
+    point.setAttribute("aria-label", `${chartName(r)}, ${harness(r)}, ${casesText(v)} (${scoreText(v)})` +
+      (v.tip_note ? ` ${v.tip_note}` : "") + `, ${memoryText(r)}, ${runsText(r)}. Show details`);
     point.setAttribute("aria-expanded", String(selected === r.series_id));
     if (selected === r.series_id) point.setAttribute("aria-controls", "run-detail");
-    if (r.interval_percent != null) {
-      const low = Math.max(0, r.score_percent - r.interval_percent), high = Math.min(100, r.score_percent + r.interval_percent);
+    if (v.interval_percent != null) {
+      const low = Math.max(0, v.score_percent - v.interval_percent), high = Math.min(100, v.score_percent + v.interval_percent);
       const bar = node("span", "interval");
       // One score point is 1cqh of the plot; the bar is measured from the dot's centre.
-      bar.style.bottom = `calc(50% + ${low - r.score_percent}cqh)`;
+      bar.style.bottom = `calc(50% + ${low - v.score_percent}cqh)`;
       bar.style.height = `${high - low}cqh`;
       point.append(bar);
     }
@@ -668,7 +679,7 @@
       render();
       document.getElementById(point.id)?.focus();
     });
-    for (const show of ["pointerenter", "focus"]) point.addEventListener(show, () => tip(r, point));
+    for (const show of ["pointerenter", "focus"]) point.addEventListener(show, () => tip(v, point));
     for (const hide of ["pointerleave", "blur"]) point.addEventListener(hide, () => tip(null));
     return point;
   }
@@ -677,7 +688,8 @@
     const box = document.querySelector(".chart-tip");
     if (!box) return;
     if (!r) { box.hidden = true; return; }
-    box.replaceChildren(node("strong", "", casesText(r) + (r.interval_percent == null ? "" : ` ± ${fmt(Math.round(r.interval_percent * r.total / 10) / 10)}`)),
+    box.replaceChildren(node("strong", "", casesText(r) + (r.interval_percent == null ? "" : ` ± ${fmt(Math.round(r.interval_percent * r.total / 10) / 10)}`) +
+        (r.tip_note ? ` ${r.tip_note}` : "")),
       node("span", "", chartName(r)), node("span", "tip-muted", memoryText(r)), node("span", "tip-muted", `${harness(r)} · ${runsText(r)}`));
     box.hidden = false;
     const figure = box.parentElement.getBoundingClientRect(), at = point.getBoundingClientRect(), size = box.getBoundingClientRect();
@@ -768,6 +780,76 @@
     if (speed) figure.append(speed);
     return figure;
   }
+  // The chart of a release whose series recorded their attempts' peak context (ADR 0022): cases solved against the
+  // context the whole attempt must fit in. Each series is one line that steps up at every case it solves, averaged
+  // over its runs, and ends at the largest size; a strip beside the plot holds every series' own score, as it was run.
+  // A series without recorded peaks has no line, only its place in the strip.
+  const largestSize = sizes.at(-1);
+  function steps(r) {
+    const counted = [];
+    for (const run of r.runs) for (const c of run.cases) if (fits({context_size: largestSize}, c)) counted.push(c.peak_context_tokens);
+    counted.sort((a, b) => a - b);
+    let solved = 0, d = "M0,100";
+    for (const tokens of counted) {
+      solved += 1 / r.runs.length;
+      d += ` H${tokens / largestSize * 100} V${100 - solved / r.total * 100}`;
+    }
+    return d + " H100";
+  }
+  function curves(shown) {
+    const figure = node("div", "scatter");
+    const lined = shown.filter(r => r.by_context);
+    const list = node("div", "scatter-legend");
+    const item = (mark, text) => { const entry = node("span", "legend-item"); entry.append(node("span", `legend-mark ${mark}`), text); list.append(entry); };
+    if (shown.some(r => r.harness.name === "pi")) item("circle", "Pi");
+    if (shown.some(r => r.harness.name === "claude_code")) item("diamond", "Claude Code");
+    if (shown.some(r => !r.complete)) item("circle hollow", "Provisional (fewer than 3 runs)");
+    item("ladder", "Cases solved with the whole attempt inside that much context");
+    figure.append(chips(), list, node("div", "y-caption", "Cases solved (mean of runs)"));
+    const body = node("div", "scatter-body"), area = node("div", "scatter-plot");
+    for (const value of ticks(release.benchmark.case_count)) {
+      const line = node("div", "grid-row");
+      line.style.bottom = `${value / release.benchmark.case_count * 100}%`;
+      line.append(node("span", "y-tick", value));
+      area.append(line);
+    }
+    for (const tokens of [0, ...sizes]) {
+      const line = node("div", "grid-col" + (tokens === size ? " chosen" : ""));
+      line.style.left = `${tokens / largestSize * 100}%`;
+      line.append(node("span", "x-tick" + (tokens === largestSize ? " end" : ""), tokens ? tokensText(tokens) : "0"));
+      area.append(line);
+    }
+    const layer = svg("svg", {class: "plot-lines", viewBox: "0 0 100 100", preserveAspectRatio: "none", "aria-hidden": "true"});
+    for (const r of lined) {
+      layer.append(svg("path", {class: "context-line" + (faded(r) ? " faded" : "") + (selected === r.series_id ? " selected" : ""),
+        stroke: families.get(family(r)).color, d: steps(r)}));
+    }
+    area.append(layer);
+    const number = r => shown.indexOf(r) + 1;
+    // Where a line ends: what the series solves inside the largest size.
+    for (const r of lined) {
+      const end = r.by_context[largestSize];
+      area.append(point(r, 1, false, number(r), 0, {score_percent: end.score_percent, interval_percent: end.interval_percent,
+        tip_note: `inside ${tokensText(largestSize)} tokens of context`}, "-end"));
+    }
+    body.append(area);
+    const strip = node("div", "asrun-strip");
+    strip.append(node("span", "strip-title", "As run"));
+    // Spread across the strip in score order; a series' own score has no context size to place it by.
+    shown.forEach((r, i) => {
+      const own = r.own || r;
+      strip.append(point(r, (i + 1) / (shown.length + 1), false, number(r), 0,
+        {score_percent: own.score_percent, interval_percent: own.interval_percent, tip_note: "as run"}));
+    });
+    body.append(strip);
+    const tipBox = node("div", "chart-tip");
+    tipBox.hidden = true;
+    tipBox.setAttribute("role", "tooltip");
+    figure.append(body, node("div", "axis-caption", "Context the whole attempt must fit in (tokens)"), node("ol", "point-key"), tipBox, table(shown));
+    const speed = speedView();
+    if (speed) figure.append(speed);
+    return figure;
+  }
   const overlaps = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
   // Names go right, left, above or below their dot, whichever is free and inside the chart. The selected series and
   // each family's best are placed first, then the frontier, then the other quants. A family name with no room is
@@ -814,7 +896,13 @@
   }
   function render() {
     const shown = [...records].sort((a, b) => b.score_percent - a.score_percent || a.model.name.localeCompare(b.model.name) || b.run_count - a.run_count);
-    $("chart").replaceChildren(scatter(shown));
+    $("chart").replaceChildren(sized.length ? curves(shown) : scatter(shown));
+    if (sized.length) {
+      $("chart").setAttribute("aria-label", "Cases solved against the context the whole attempt must fit in, by model");
+      $("chart-help").textContent = "One line per run series: its height at any point is how many cases the model solves when the whole attempt " +
+        "must fit in that much context (the mean of its runs). The strip on the right is each series' own score, as it was run. " +
+        "Hollow dots are provisional. Compare models within one harness. Click a dot for details.";
+    }
     placeLabels();
     const active = shown.find(r => r.series_id === selected);
     if (active) $("chart").append(details(active)); else selected = null;

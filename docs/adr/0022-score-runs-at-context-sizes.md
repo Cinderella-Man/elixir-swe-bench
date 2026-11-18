@@ -9,7 +9,7 @@ Every attempt now records its **peak context**: the largest prompt any of its mo
 - **The rule.** At a size, a case counts only if the agent finished on its own, its peak context is within that size, and its patch passes.
 - **The sizes.** 65,536, 98,304, 131,072, 196,608 and 262,144 tokens: from what a small local setup holds to the largest window local runs use.
 - **One run, every size.** Nothing is run or graded again. One run at the largest window gives the score at every smaller size, because each case's peak context is one recorded number.
-- **The results page.** A **Context size** selector shows every series at the chosen size. **As run** stays the default and is each series' score as it was run, unchanged.
+- **The results page.** A **Context size** selector shows every series at the chosen size. **As run** stays the default and is each series' score as it was run, unchanged. Since 2026-11-18 the chart of a release with recorded peaks plots cases solved against context, one line per series, in place of cases against peak memory: that memory is measured with the whole window reserved, whatever the work needed, and hosted models have none. Memory stays in the table and the details.
 - **What it measures.** How much room a model needs to do the work. Someone choosing hardware can read off what a model solves in the context they can afford.
 
 This replaces ADR 0021's allowance as the benchmark's measure of economy. The allowance stays implemented and no release declares it. It derived a number per case from the validator's usage; a context size is the same for every model and every case, and needs none.
