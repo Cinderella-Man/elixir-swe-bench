@@ -42,6 +42,14 @@ Its v6 series therefore has two assembled runs. Each takes 18 cases from one of 
 
 The series says it is assembled in its note and in the release note. Its setup differs from a real run's, so a full Opus run on v6 starts a separate series, after which the assembled one should be removed. See the [validation record](../../verification/opus-validation-2026-11-17/README.md#the-assembled-v6-series) for which attempt supplies which case.
 
+## Amendment, 2026-11-18: Sonnet's v6 series is assembled the same way
+
+The user asked for Sonnet 5.5 to be brought into v6 like Opus. Its v6 series has two assembled runs: 18 cases from each of the two runs of its published v5 series, and the two rewritten cases from four single-case attempts made on 2026-11-17 and 18, all of which passed. The same two rules are set aside for this series, on the same terms.
+
+One carried case was graded again. v5 rejected both of Sonnet's guardian-pr-748 patches untested for a `README.md` edit outside the edit area, which v6 discards ([ADR 0017](0017-discard-changes-outside-the-edit-area.md)); graded under v6, both pass. See the [record](../../verification/sonnet-series-2026-11-17/README.md#the-assembled-v6-series).
+
+Haiku 5.5's v6 series is not assembled. It is two ordinary full runs made the same night.
+
 ## Considered options
 
 - **Keep upstream pins under a recorded exception**: no fork work, but cases would keep two kinds of source and overlay handling.

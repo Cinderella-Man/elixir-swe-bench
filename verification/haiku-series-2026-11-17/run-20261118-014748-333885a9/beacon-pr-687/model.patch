@@ -1,0 +1,693 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1eb5d25..9a1116a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,8 @@
+ ### Enhancements
+   - Added support for user-defined JS Hooks
+   - Added `--host` option for `mix beacon.gen.site` to serve your site at an alternative domain
++  - Added `sitemap.xml` and `robots.txt` to every site mounted with `beacon_site`, listing the published pages of the site
++  - Added `beacon_sitemap_index/1` to `Beacon.Router` to serve a sitemap index listing the sitemap of every site mounted in the router
+ 
+ ### Fixes
+   - Fixed a bug where MediaLibrary could check for file contents on the wrong node in multi-node deployments
+diff --git a/lib/beacon/router.ex b/lib/beacon/router.ex
+index 9fe845c..2ec4ec0 100644
+--- a/lib/beacon/router.ex
++++ b/lib/beacon/router.ex
+@@ -80,6 +80,23 @@ defmodule Beacon.Router do
+ 
+   As a rule of thumb, put all specific routes first.
+ 
++  ## Sitemap and robots.txt
++
++  Every site mounted with `beacon_site` also serves its own `sitemap.xml` and `robots.txt`,
++  relative to the site path, for example `https://yourapp.com/blog/sitemap.xml` and `https://yourapp.com/blog/robots.txt`.
++
++  The sitemap lists the published pages of the site and `robots.txt` advertises that sitemap.
++  Note that a page with the exact path `/sitemap.xml` or `/robots.txt` is not reachable since the site routes take precedence.
++
++  Use `beacon_sitemap_index/1` to serve a sitemap index listing the `sitemap.xml` of every site mounted in the router:
++
++      scope "/", MyAppWeb do
++        pipe_through :browser
++        beacon_sitemap_index "/sitemap_index.xml"
++        beacon_site "/blog", site: :blog
++        beacon_site "/", site: :my_site
++      end
++
+   """
+ 
+   defmacro __using__(_opts) do
+@@ -91,7 +108,7 @@ defmodule Beacon.Router do
+   defp prelude do
+     quote do
+       Module.register_attribute(__MODULE__, :beacon_sites, accumulate: true)
+-      import Beacon.Router, only: [beacon_site: 2]
++      import Beacon.Router, only: [beacon_site: 2, beacon_sitemap_index: 1]
+       @before_compile unquote(__MODULE__)
+     end
+   end
+@@ -117,6 +134,8 @@ defmodule Beacon.Router do
+   @doc """
+   Mounts a site in the `prefix` in your host application router.
+ 
++  The site also serves `sitemap.xml` and `robots.txt` under the mount path, see the module doc for more info.
++
+   ## Options
+ 
+     * `:site` (required) `t:Beacon.Types.Site.t/0` - register your site with a unique name.
+@@ -148,6 +167,9 @@ defmodule Beacon.Router do
+           # simulate a beacon page inside site prefix so we can check this site is reachable?/2
+           get "/__beacon_check__", Beacon.Web.CheckController, :check, metadata: %{site: opts[:site]}
+ 
++          get "/sitemap.xml", Beacon.Web.SitemapController, :sitemap, assigns: %{site: opts[:site]}
++          get "/robots.txt", Beacon.Web.RobotsController, :robots, assigns: %{site: opts[:site]}
++
+           live "/*path", Beacon.Web.PageLive, :path
+         end
+       end
+@@ -156,6 +178,31 @@ defmodule Beacon.Router do
+     end
+   end
+ 
++  @doc """
++  Serves the sitemap index at `path`, relative to the enclosing scope.
++
++  The index is an XML `sitemapindex` listing the `sitemap.xml` of every running site that its configured router mounts,
++  sorted by URL. Sites that are not mounted by their router are left out.
++
++  It may be declared more than once and in any scope, including the top level of the router.
++  Like any specific route, it must be declared before a `beacon_site` mounted at a path that would otherwise catch the same path.
++
++  ## Example
++
++      scope "/seo" do
++        pipe_through :browser
++        beacon_sitemap_index "/all.xml"
++      end
++
++  """
++  defmacro beacon_sitemap_index(path) do
++    quote location: :keep do
++      import Phoenix.Router, only: [get: 4]
++
++      get unquote(path), Beacon.Web.SitemapController, :index, alias: false, as: nil
++    end
++  end
++
+   @doc false
+   @spec __options__(keyword()) :: {atom(), atom(), keyword()}
+   def __options__(opts) do
+diff --git a/lib/beacon/sitemap.ex b/lib/beacon/sitemap.ex
+new file mode 100644
+index 0000000..7683a02
+--- /dev/null
++++ b/lib/beacon/sitemap.ex
+@@ -0,0 +1,155 @@
++defmodule Beacon.Sitemap do
++  @moduledoc false
++
++  # Builds the documents served for every site mounted with `Beacon.Router.beacon_site/2`
++  # (`sitemap.xml` and `robots.txt`) and the sitemap index declared with `Beacon.Router.beacon_sitemap_index/1`.
++  #
++  # Every URL is built from the endpoint URL of the site and the path where the site is mounted in its router.
++
++  alias Beacon.Config
++  alias Beacon.Content
++  alias Beacon.Content.Page
++
++  @namespace "http://www.sitemaps.org/schemas/sitemap/0.9"
++
++  # ASCII characters that are not allowed in a URL path and must be percent-encoded.
++  # The characters reserved by XML are not listed here, they are entity-escaped by `xml_escape/1`.
++  @unsafe_chars [?\s, ?#, ?%, ??, ?[, ?\\, ?], ?^, ?`, ?{, ?|, ?}]
++
++  @doc """
++  Returns the `sitemap.xml` document with the published pages of `site`, which is mounted at `prefix` in its router.
++  """
++  def urlset(site, prefix) when is_atom(site) and is_binary(prefix) do
++    %Config{endpoint: endpoint} = Config.fetch!(site)
++    base = endpoint.url()
++
++    entries =
++      for %Page{} = page <- Content.list_published_pages(site, per_page: :infinity, sort: :path) do
++        url_entry(base, prefix, page)
++      end
++
++    IO.iodata_to_binary([
++      ~s(<?xml version="1.0" encoding="UTF-8"?>\n),
++      ~s(<urlset xmlns="#{@namespace}">\n),
++      entries,
++      "</urlset>\n"
++    ])
++  end
++
++  @doc """
++  Returns the `robots.txt` document for `site`, which is mounted at `prefix` in its router.
++  """
++  def robots_txt(site, prefix) when is_atom(site) and is_binary(prefix) do
++    sitemap = sitemap_url(Config.fetch!(site), prefix)
++
++    """
++    # http://www.robotstxt.org
++    User-agent: *
++    Sitemap: #{sitemap}
++    """
++  end
++
++  @doc """
++  Returns the absolute URL of the `sitemap.xml` of a site with `config` mounted at `prefix` in its router.
++  """
++  def sitemap_url(%Config{endpoint: endpoint}, prefix) when is_binary(prefix) do
++    endpoint.url() <> encode_path(join_path(prefix, "/sitemap.xml"))
++  end
++
++  @doc """
++  Returns the `sitemapindex` document listing the `sitemap.xml` of every running site that its configured router mounts.
++  """
++  def sitemap_index do
++    urls =
++      Beacon.Registry.running_sites()
++      |> Enum.flat_map(&List.wrap(mounted_sitemap_url(&1)))
++      |> Enum.sort()
++
++    IO.iodata_to_binary([
++      ~s(<?xml version="1.0" encoding="UTF-8"?>\n),
++      ~s(<sitemapindex xmlns="#{@namespace}">\n),
++      for(url <- urls, do: ["  <sitemap>\n    <loc>", xml_escape(url), "</loc>\n  </sitemap>\n"]),
++      "</sitemapindex>\n"
++    ])
++  end
++
++  defp mounted_sitemap_url(site) do
++    case Beacon.Registry.lookup({site, Config}) do
++      {_pid, %Config{router: router} = config} ->
++        if mounted?(router, site) do
++          sitemap_url(config, router.__beacon_scoped_prefix_for_site__(site))
++        end
++
++      _ ->
++        nil
++    end
++  end
++
++  # routers that do not `use Beacon.Router` do not export these functions
++  defp mounted?(router, site) when is_atom(router) do
++    Code.ensure_loaded?(router) and function_exported?(router, :__beacon_sites__, 0) and
++      Enum.any?(router.__beacon_sites__(), fn {mounted_site, _prefix} -> mounted_site == site end)
++  end
++
++  defp mounted?(_router, _site), do: false
++
++  defp url_entry(base, prefix, page) do
++    loc = xml_escape(base <> encode_path(join_path(prefix, page.path)))
++
++    [
++      "  <url>\n    <loc>",
++      loc,
++      "</loc>\n",
++      lastmod(page.updated_at),
++      "  </url>\n"
++    ]
++  end
++
++  defp lastmod(nil), do: []
++
++  defp lastmod(%NaiveDateTime{} = updated_at) do
++    updated_at
++    |> DateTime.from_naive!("Etc/UTC")
++    |> lastmod()
++  end
++
++  defp lastmod(%DateTime{} = updated_at) do
++    ["    <lastmod>", DateTime.to_iso8601(updated_at), "</lastmod>\n"]
++  end
++
++  # `prefix` is the path where a site is mounted, eg: "/" or "/blog", and `path` is a path inside the site, eg: "/" or "/hello"
++  defp join_path(prefix, path) do
++    case {String.trim_trailing(prefix, "/"), String.trim_leading(path, "/")} do
++      {"", ""} -> "/"
++      {mount, ""} -> mount
++      {mount, rest} -> mount <> "/" <> rest
++    end
++  end
++
++  # Percent-encodes the characters that can't be part of a URL path, including the ones XML can't represent at all.
++  # Non-ASCII characters are kept as they are, the result must still be escaped with `xml_escape/1` to be used in XML.
++  defp encode_path(path), do: encode_path(path, [])
++
++  defp encode_path(<<char::utf8, rest::binary>>, acc), do: encode_path(rest, [acc, encode_char(char)])
++  defp encode_path(<<byte, rest::binary>>, acc), do: encode_path(rest, [acc, percent_encode(<<byte>>)])
++  defp encode_path(<<>>, acc), do: IO.iodata_to_binary(acc)
++
++  defp encode_char(char) when char in @unsafe_chars, do: percent_encode(<<char>>)
++  defp encode_char(char) when char < 0x20 or char == 0x7F, do: percent_encode(<<char>>)
++  defp encode_char(char) when char in [0xFFFE, 0xFFFF], do: percent_encode(<<char::utf8>>)
++  defp encode_char(char), do: <<char::utf8>>
++
++  defp percent_encode(bytes) do
++    for <<byte <- bytes>>, into: "", do: "%" <> Base.encode16(<<byte>>)
++  end
++
++  defp xml_escape(string) do
++    String.replace(string, ["&", "<", ">", "\"", "'"], fn
++      "&" -> "&amp;"
++      "<" -> "&lt;"
++      ">" -> "&gt;"
++      "\"" -> "&quot;"
++      "'" -> "&apos;"
++    end)
++  end
++end
+diff --git a/lib/beacon/web/controllers/robots_controller.ex b/lib/beacon/web/controllers/robots_controller.ex
+new file mode 100644
+index 0000000..e0a0407
+--- /dev/null
++++ b/lib/beacon/web/controllers/robots_controller.ex
+@@ -0,0 +1,17 @@
++defmodule Beacon.Web.RobotsController do
++  @moduledoc false
++
++  use Beacon.Web, :controller
++
++  alias Beacon.Sitemap
++
++  # `<mount path>/robots.txt` of a site mounted with `beacon_site`
++  def robots(%{assigns: %{site: site}, private: %{phoenix_router: router}} = conn, _params) do
++    prefix = router.__beacon_scoped_prefix_for_site__(site)
++
++    conn
++    |> put_resp_content_type("text/plain", "utf-8")
++    |> send_resp(200, Sitemap.robots_txt(site, prefix))
++    |> halt()
++  end
++end
+diff --git a/lib/beacon/web/controllers/sitemap_controller.ex b/lib/beacon/web/controllers/sitemap_controller.ex
+new file mode 100644
+index 0000000..4641f7c
+--- /dev/null
++++ b/lib/beacon/web/controllers/sitemap_controller.ex
+@@ -0,0 +1,25 @@
++defmodule Beacon.Web.SitemapController do
++  @moduledoc false
++
++  use Beacon.Web, :controller
++
++  alias Beacon.Sitemap
++
++  # `<mount path>/sitemap.xml` of a site mounted with `beacon_site`
++  def sitemap(%{assigns: %{site: site}, private: %{phoenix_router: router}} = conn, _params) do
++    prefix = router.__beacon_scoped_prefix_for_site__(site)
++    send_xml(conn, Sitemap.urlset(site, prefix))
++  end
++
++  # the path declared with `beacon_sitemap_index`
++  def index(conn, _params) do
++    send_xml(conn, Sitemap.sitemap_index())
++  end
++
++  defp send_xml(conn, body) do
++    conn
++    |> put_resp_content_type("application/xml", "utf-8")
++    |> send_resp(200, body)
++    |> halt()
++  end
++end
+diff --git a/test/beacon/router_test.exs b/test/beacon/router_test.exs
+index 8e5c253..b0b89f0 100644
+--- a/test/beacon/router_test.exs
++++ b/test/beacon/router_test.exs
+@@ -95,4 +95,133 @@ defmodule Beacon.RouterTest do
+       refute Router.reachable?(config)
+     end
+   end
++
++  describe "sitemap and robots.txt of a site" do
++    test "are served only for the host where the site is mounted" do
++      router =
++        eval_router("""
++        scope "/", host: "shop.example.com" do
++          pipe_through :browser
++          beacon_site "/", site: :my_site
++        end
++        """)
++
++      conn = %{Plug.Test.conn(:get, "/robots.txt") | host: "shop.example.com"} |> router.call(router.init([]))
++
++      assert conn.status == 200
++      assert conn.resp_body =~ "Sitemap: http://localhost:4000/sitemap.xml"
++
++      assert_raise Phoenix.Router.NoRouteError, fn ->
++        Plug.Test.conn(:get, "/robots.txt") |> router.call(router.init([]))
++      end
++    end
++  end
++
++  describe "beacon_sitemap_index" do
++    # sites running in the test env that are mounted by their configured router, `Beacon.BeaconTest.Router`
++    @index_locs [
++      "http://localhost:4000/nested/media/sitemap.xml",
++      "http://localhost:4000/nested/site/sitemap.xml",
++      "http://localhost:4000/other/sitemap.xml",
++      "http://localhost:4000/sitemap.xml"
++    ]
++
++    test "lists the sitemap of every running site mounted by its configured router, sorted by url" do
++      router =
++        eval_router("""
++        scope "/" do
++          pipe_through :browser
++          beacon_sitemap_index "/sitemap_index.xml"
++        end
++        """)
++
++      conn = call(router, "/sitemap_index.xml")
++
++      assert conn.status == 200
++      assert ["application/xml; charset=utf-8"] = Plug.Conn.get_resp_header(conn, "content-type")
++      assert sitemap_locs(conn.resp_body) == @index_locs
++    end
++
++    test "is declared at the top level of the router" do
++      router = eval_router(~S|beacon_sitemap_index "/sitemap_index.xml"|)
++
++      assert sitemap_locs(call(router, "/sitemap_index.xml").resp_body) == @index_locs
++    end
++
++    test "is declared in any scope, including scopes that set an alias" do
++      router =
++        eval_router("""
++        scope "/seo", alias: Seo do
++          beacon_sitemap_index "/all.xml"
++        end
++
++        scope "/", Foo do
++          pipe_through :browser
++          beacon_sitemap_index "/sitemap_index.xml"
++        end
++        """)
++
++      assert %{status: 200} = seo = call(router, "/seo/all.xml")
++      assert sitemap_locs(seo.resp_body) == @index_locs
++
++      # every declaration serves the same list
++      assert call(router, "/sitemap_index.xml").resp_body == seo.resp_body
++    end
++
++    test "pipelines and routes declared after the index work as they would without it" do
++      router =
++        eval_router("""
++        scope "/" do
++          pipe_through :browser
++          beacon_sitemap_index "/sitemap_index.xml"
++          beacon_site "/blog", site: :my_site
++        end
++
++        scope "/" do
++          pipe_through :browser
++          beacon_site "/", site: :booted
++        end
++        """)
++
++      assert sitemap_locs(call(router, "/sitemap_index.xml").resp_body) == @index_locs
++
++      # the routes declared after the index are still served
++      assert ["text/plain; charset=utf-8"] = Plug.Conn.get_resp_header(call(router, "/robots.txt"), "content-type")
++      assert call(router, "/blog/robots.txt").status == 200
++    end
++  end
++
++  # Routers are compiled at runtime so the declaration of the index is only needed by these tests.
++  defp eval_router(body) do
++    name = "Beacon.RouterTest.SitemapIndex#{System.unique_integer([:positive])}"
++
++    {{:module, router, _bytecode, _result}, _binding} =
++      Code.eval_string("""
++      defmodule #{name} do
++        use Phoenix.Router
++        use Beacon.Router
++
++        pipeline :browser do
++          plug :accepts, ["html"]
++        end
++
++        #{body}
++      end
++      """)
++
++    router
++  end
++
++  defp call(router, path) do
++    Plug.Test.conn(:get, path) |> router.call(router.init([]))
++  end
++
++  defp sitemap_locs(xml) do
++    {document, _rest} = :xmerl_scan.string(:binary.bin_to_list(xml), namespace_conformant: true, quiet: true)
++
++    for loc <- :xmerl_xpath.string(~c"//*[local-name()='loc']", document) do
++      [{:xmlText, _parents, _pos, _language, value, _type}] = :xmerl_xpath.string(~c"./text()", loc)
++      List.to_string(value)
++    end
++  end
+ end
+diff --git a/test/beacon_web/controllers/robots_controller_test.exs b/test/beacon_web/controllers/robots_controller_test.exs
+new file mode 100644
+index 0000000..8403d45
+--- /dev/null
++++ b/test/beacon_web/controllers/robots_controller_test.exs
+@@ -0,0 +1,36 @@
++defmodule Beacon.Web.Controllers.RobotsControllerTest do
++  use Beacon.Web.ConnCase, async: false
++  use Beacon.Test
++
++  test "serves robots.txt that allows everything and advertises the sitemap of the site", %{conn: conn} do
++    conn = get(conn, "/robots.txt")
++
++    assert ["text/plain; charset=utf-8"] = get_resp_header(conn, "content-type")
++
++    assert response(conn, 200) == """
++           # http://www.robotstxt.org
++           User-agent: *
++           Sitemap: http://localhost:4000/sitemap.xml
++           """
++  end
++
++  test "advertises the sitemap under the mount path of the site", %{conn: conn} do
++    body = conn |> get("/other/robots.txt") |> response(200)
++
++    assert body =~ "User-agent: *"
++    assert body =~ "Sitemap: http://localhost:4000/other/sitemap.xml"
++    assert sitemap_lines(body) == ["Sitemap: http://localhost:4000/other/sitemap.xml"]
++    refute body =~ "Disallow"
++  end
++
++  test "each site serves its own robots.txt", %{conn: conn} do
++    assert conn |> get("/nested/site/robots.txt") |> response(200) =~ "Sitemap: http://localhost:4000/nested/site/sitemap.xml"
++    assert build_conn() |> get("/nested/media/robots.txt") |> response(200) =~ "Sitemap: http://localhost:4000/nested/media/sitemap.xml"
++  end
++
++  defp sitemap_lines(body) do
++    body
++    |> String.split("\n", trim: true)
++    |> Enum.filter(&String.starts_with?(&1, "Sitemap:"))
++  end
++end
+diff --git a/test/beacon_web/controllers/sitemap_controller_test.exs b/test/beacon_web/controllers/sitemap_controller_test.exs
+new file mode 100644
+index 0000000..5b4fd61
+--- /dev/null
++++ b/test/beacon_web/controllers/sitemap_controller_test.exs
+@@ -0,0 +1,191 @@
++defmodule Beacon.Web.Controllers.SitemapControllerTest do
++  use Beacon.Web.ConnCase, async: false
++  use Beacon.Test
++
++  alias Beacon.BeaconTest.Repo
++  alias Beacon.Content
++
++  @namespace "http://www.sitemaps.org/schemas/sitemap/0.9"
++
++  setup do
++    layout = beacon_published_layout_fixture()
++    [layout: layout]
++  end
++
++  test "serves a sitemaps.org urlset with the published pages of the site", %{conn: conn, layout: layout} do
++    publish(layout, "/hello-world")
++    publish(layout, "/")
++
++    conn = get(conn, "/sitemap.xml")
++    body = response(conn, 200)
++
++    assert ["application/xml; charset=utf-8"] = get_resp_header(conn, "content-type")
++    assert body =~ ~s(<?xml version="1.0" encoding="UTF-8"?>)
++    assert body =~ ~s(<urlset xmlns="#{@namespace}">)
++
++    assert ["http://localhost:4000/", "http://localhost:4000/hello-world"] ==
++             body |> url_entries() |> Enum.map(fn {loc, _lastmod} -> loc end)
++  end
++
++  test "lastmod is the updated_at of the published page as an ISO 8601 date-time with offset", %{conn: conn, layout: layout} do
++    page = create_page(layout, "/news")
++    page = set_updated_at(page, ~U[2025-01-30 14:05:00.000000Z])
++    {:ok, _page} = Content.publish_page(page)
++
++    body = conn |> get("/sitemap.xml") |> response(200)
++
++    assert [{"http://localhost:4000/news", lastmod}] = url_entries(body)
++    assert lastmod == "2025-01-30T14:05:00.000000Z"
++    assert {:ok, _datetime, 0} = DateTime.from_iso8601(lastmod)
++  end
++
++  test "lists the published version of a page, not its unpublished draft changes", %{conn: conn, layout: layout} do
++    page = create_page(layout, "/news")
++    page = set_updated_at(page, ~U[2025-01-30 14:05:00.000000Z])
++    {:ok, page} = Content.publish_page(page)
++
++    # the draft is renamed and updated later, but it is not published
++    {:ok, _page} = Content.update_page(page, %{"path" => "/news-2025", "title" => "draft"})
++
++    assert [{"http://localhost:4000/news", "2025-01-30T14:05:00.000000Z"}] ==
++             conn |> get("/sitemap.xml") |> response(200) |> url_entries()
++  end
++
++  test "leaves out pages never published, unpublished pages and drafts", %{conn: conn, layout: layout} do
++    publish(layout, "/published")
++    create_page(layout, "/draft")
++
++    unpublished = publish(layout, "/unpublished")
++    {:ok, _event} = Content.unpublish_page(unpublished)
++
++    republished = publish(layout, "/republished")
++    {:ok, _event} = Content.unpublish_page(republished)
++    {:ok, _page} = Content.publish_page(republished)
++
++    locs = conn |> get("/sitemap.xml") |> response(200) |> url_entries() |> Enum.map(fn {loc, _} -> loc end)
++
++    assert locs == ["http://localhost:4000/published", "http://localhost:4000/republished"]
++  end
++
++  test "lists every published page, not only the first page of results", %{conn: conn, layout: layout} do
++    paths = for i <- 1..25, do: "/page-#{String.pad_leading(Integer.to_string(i), 2, "0")}"
++    Enum.each(paths, &publish(layout, &1))
++
++    locs = conn |> get("/sitemap.xml") |> response(200) |> url_entries() |> Enum.map(fn {loc, _} -> loc end)
++
++    assert length(locs) == 25
++    assert Enum.sort(locs) == Enum.sort(Enum.map(paths, &("http://localhost:4000" <> &1)))
++  end
++
++  test "escapes XML reserved characters and percent-encodes control characters", %{conn: conn, layout: layout} do
++    publish(layout, "/q&a")
++    publish(layout, "/a<b")
++    publish(layout, "/a\x01b")
++    publish(layout, "/quote\"s")
++    publish(layout, "/it's")
++    publish(layout, "/100%")
++    publish(layout, "/c#sharp")
++    publish(layout, "/café")
++    publish(layout, "/tab\there")
++    publish(layout, "/del\x7F")
++    publish(layout, "/noncharacter\uFFFE")
++
++    body = conn |> get("/sitemap.xml") |> response(200)
++
++    # well-formed XML, parsed back to the expected locations
++    assert "http://localhost:4000/q&a" in locs(body)
++    assert "http://localhost:4000/a<b" in locs(body)
++    assert "http://localhost:4000/a%01b" in locs(body)
++    assert "http://localhost:4000/quote\"s" in locs(body)
++    assert "http://localhost:4000/it's" in locs(body)
++    assert "http://localhost:4000/100%25" in locs(body)
++    assert "http://localhost:4000/c%23sharp" in locs(body)
++    assert "http://localhost:4000/café" in locs(body)
++    assert "http://localhost:4000/tab%09here" in locs(body)
++    assert "http://localhost:4000/del%7F" in locs(body)
++    assert "http://localhost:4000/noncharacter%EF%BF%BE" in locs(body)
++
++    # the reserved characters are escaped in the document itself
++    assert body =~ "<loc>http://localhost:4000/q&amp;a</loc>"
++    assert body =~ "<loc>http://localhost:4000/a&lt;b</loc>"
++    assert body =~ "<loc>http://localhost:4000/a%01b</loc>"
++  end
++
++  test "a site without published pages serves an empty urlset", %{conn: conn, layout: layout} do
++    create_page(layout, "/draft")
++
++    body = conn |> get("/sitemap.xml") |> response(200)
++
++    assert body =~ ~s(<urlset xmlns="#{@namespace}">)
++    assert url_entries(body) == []
++  end
++
++  test "lists only the pages of the site, under the mount path of the site", %{conn: conn, layout: layout} do
++    other_layout = beacon_published_layout_fixture(site: :not_booted)
++
++    publish(layout, "/mine")
++    publish_for(:not_booted, other_layout, "/theirs")
++
++    assert [{"http://localhost:4000/mine", _}] = conn |> get("/sitemap.xml") |> response(200) |> url_entries()
++    assert [{"http://localhost:4000/other/theirs", _}] = build_conn() |> get("/other/sitemap.xml") |> response(200) |> url_entries()
++  end
++
++  test "pages whose paths are /sitemap and /robots keep rendering as pages", %{conn: conn, layout: layout} do
++    beacon_published_page_fixture(
++      layout_id: layout.id,
++      path: "/sitemap",
++      title: "sitemap page",
++      template: "<main>sitemap page content</main>"
++    )
++
++    beacon_published_page_fixture(
++      layout_id: layout.id,
++      path: "/robots",
++      title: "robots page",
++      template: "<main>robots page content</main>"
++    )
++
++    assert conn |> get("/sitemap") |> html_response(200) =~ "sitemap page content"
++    assert build_conn() |> get("/robots") |> html_response(200) =~ "robots page content"
++  end
++
++  defp create_page(layout, path) do
++    beacon_page_fixture(layout_id: layout.id, path: path, title: path)
++  end
++
++  defp publish(layout, path) do
++    beacon_published_page_fixture(layout_id: layout.id, path: path, title: path)
++  end
++
++  defp publish_for(site, layout, path) do
++    beacon_published_page_fixture(site: site, layout_id: layout.id, path: path, title: path)
++  end
++
++  # `updated_at` is set before publishing so the published version keeps this value
++  defp set_updated_at(page, updated_at) do
++    page
++    |> Ecto.Changeset.change(updated_at: updated_at)
++    |> Repo.update!()
++  end
++
++  defp url_entries(xml) do
++    xml
++    |> parse_xml()
++    |> then(&:xmerl_xpath.string(~c"//*[local-name()='url']", &1))
++    |> Enum.map(fn url -> {text(url, "loc"), text(url, "lastmod")} end)
++  end
++
++  defp locs(xml), do: Enum.map(url_entries(xml), fn {loc, _lastmod} -> loc end)
++
++  defp parse_xml(xml) do
++    {document, _rest} = :xmerl_scan.string(:binary.bin_to_list(xml), namespace_conformant: true, quiet: true)
++    document
++  end
++
++  defp text(node, name) do
++    case :xmerl_xpath.string(String.to_charlist("./*[local-name()='#{name}']/text()"), node) do
++      [{:xmlText, _parents, _pos, _language, value, _type} | _] -> List.to_string(value)
++      [] -> nil
++    end
++  end
++end

@@ -35,16 +35,22 @@ Cases solved, of 20, in the v6 series.
 
 | Series | 65,536 | 98,304 | 131,072 | 196,608 | 262,144 | As run |
 |---|---|---|---|---|---|---|
-| Opus 5.5, assembled run 1 | 7 | 12 | 13 | 16 | 18 | 20 |
-| Opus 5.5, assembled run 2 | 7 | 12 | 13 | 16 | 17 | 19 |
+| Opus 5.5 at xhigh, assembled run 1 | 7 | 12 | 13 | 16 | 18 | 20 |
+| Opus 5.5 at xhigh, assembled run 2 | 7 | 12 | 13 | 16 | 17 | 19 |
+| Sonnet 5.5 at max, assembled run 1 | 0 | 0 | 2 | 2 | 9 | 20 |
+| Sonnet 5.5 at max, assembled run 2 | 0 | 0 | 1 | 3 | 7 | 20 |
+| Haiku 5.5 at max, run 1 | 0 | 0 | 2 | 5 | 10 | 19 |
+| Haiku 5.5 at max, run 2 | 0 | 0 | 2 | 5 | 10 | 19 |
 | Qwen3.8-27B UD-Q4_K_XL | 5 | 9 | 13 | 16 | 16 | 18 |
 | Qwen3.8-27B UD-Q6_K_L | 2 | 7 | 11 | 14 | 15 | 16 |
 
-- **Small sizes spread the models out.** At 65,536 the range is 2 to 7.
+- **As run, every series scores 16 to 20.** That column alone says every model is good enough.
+- **A size tells them apart.** At 131,072 Opus and Qwen Q4 solve 13, Qwen Q6 11, and Sonnet and Haiku at most 2.
+- **Sonnet and Haiku at max effort need a great deal of room.** Haiku's median attempt peaks near 280,000 tokens and its largest at 570,000, so half its passes disappear at 262,144.
 - **Opus fails like any other model.** It never fits absinthe-pr-1176 or ash-pr-3031 in 262,144, so it solves 19 or 20 as run and 17 or 18 at that size.
-- **At 262,144 they still cluster.** See [what this does not fix](#what-this-does-not-fix).
+- **The economical models still cluster.** See [what this does not fix](#what-this-does-not-fix).
 
-Opus's v6 series is assembled from attempts that already existed, not run as one. See [Opus on v6](#opus-on-v6).
+Haiku's series is two ordinary full runs on v6. Opus's and Sonnet's are assembled from attempts that already existed, not run as one. See [Opus and Sonnet on v6](#opus-and-sonnet-on-v6).
 
 The DeepSeek V4.1 Flash v6 series has no row. Its run was recorded on another machine, and only its published summary is here. An estimate from that summary puts it at about 4, 10, 15, 16 and 17, but the estimate can run 20% high per case, so it is not published.
 
@@ -90,7 +96,7 @@ The user proposed holding every model to the same context, Opus included, and sh
 
 ## What this does not fix
 
-A context size shows economy. It does not make good models differ at full size: at 262,144 the series above sit between 15 and 18 of 20.
+A context size shows economy. It does not tell economical models apart: at 262,144 Opus and the two Qwen series sit between 15 and 18 of 20, and as run all eight rows above sit between 16 and 20.
 
 Models separate at full size only on cases they get wrong, and the release has few of those. The ones it has are subtle, not large:
 
@@ -112,18 +118,25 @@ New cases should be chosen for that kind of difficulty, and sized so that Opus's
 
 A run made before peaks were recorded can still supply them while its logs exist: a Pi run saved one usage record per model call, and a Claude Code run saved its transcript. That is how the two Qwen v6 series got theirs.
 
-## Opus on v6
+## Opus and Sonnet on v6
 
-Opus 5.5 has not made a full run on v6. At the user's request its v6 series is assembled from attempts that exist:
+Neither Opus 5.5 nor Sonnet 5.5 has made a full run on v6. At the user's request their v6 series are assembled from attempts that exist:
 
-- **18 cases** have identical files in v5 and v6. Their outcomes come from the first two runs of Opus's published v5 series.
-- **ash-pr-3031 and livebook-pr-2800** had their tickets rewritten for v6. Their outcomes come from two single-case attempts each, made on 2026-11-17.
+- **18 cases** have identical files in v5 and v6. Their outcomes come from the model's published v5 series: its first two runs for Opus, its only two for Sonnet.
+- **ash-pr-3031 and livebook-pr-2800** had their tickets rewritten for v6. Their outcomes come from two single-case attempts each, made on 2026-11-17 and 18.
 
-So each of its two runs is 18 October outcomes and 2 November ones. The October runs were made under v5's instructions, one sentence shorter than v6's, and on an older Claude Code version. No carried outcome depends on what v6 changed in grading. The series says "assembled" in its note and in the release note, and it never takes a real run: a full Opus run on v6 starts a separate series, after which the assembled one should be removed. [The validation record](../verification/opus-validation-2026-11-17/README.md#the-assembled-v6-series) lists exactly which attempt supplies which case, with the script that builds it.
+So each run is 18 October outcomes and 2 November ones. The October runs were made under v5's instructions, one sentence shorter than v6's, and on an older Claude Code version.
+
+One carried case needed grading again. v5 rejected both of Sonnet's guardian-pr-748 patches untested, because each also edited `README.md` outside the edit area. v6 discards such edits, and graded under v6 both patches pass. No other carried outcome depends on what v6 changed in grading.
+
+Each series says "assembled" in its note, and the release note says so too. Neither ever takes a real run: a full run on v6 starts a separate series, after which the assembled one should be removed. The records list exactly which attempt supplies which case, with the script that builds each series: [Opus](../verification/opus-validation-2026-11-17/README.md#the-assembled-v6-series) and [Sonnet](../verification/sonnet-series-2026-11-17/README.md#the-assembled-v6-series).
+
+Haiku 5.5 needed none of this. Its series is [two full runs on v6](../verification/haiku-series-2026-11-17/README.md).
 
 ## Still open
 
-- **A full Opus run on v6.** It would replace the assembled series with a real one.
+- **Full Opus and Sonnet runs on v6.** They would replace the assembled series with real ones.
+- **Haiku's third run.** Its series has two of three.
 - **DeepSeek's peaks.** They need its run's logs from the machine that recorded it, or a new run.
 - **The other v6 seeds.** Each local series still has one run of three.
 - **Harder cases.** See above.

@@ -1,0 +1,200 @@
+diff --git a/lib/livebook/runtime/evaluator.ex b/lib/livebook/runtime/evaluator.ex
+index 518e90c..12df0df 100644
+--- a/lib/livebook/runtime/evaluator.ex
++++ b/lib/livebook/runtime/evaluator.ex
+@@ -749,9 +749,7 @@ defmodule Livebook.Runtime.Evaluator do
+   defp process_erlang_error(env, code, location, module, description) do
+     line = :erl_anno.line(location)
+ 
+-    formatted =
+-      module.format_error(description)
+-      |> :erlang.list_to_binary()
++    formatted = erlang_error_message(module, description)
+ 
+     code_marker = %{
+       line: line,
+@@ -784,30 +782,35 @@ defmodule Livebook.Runtime.Evaluator do
+     {{:error, :error, error, []}, filter_erlang_code_markers([code_marker])}
+   end
+ 
+-  defp make_snippet(code, location) do
+-    start_line = 1
+-    start_column = 1
+-    line = :erl_anno.line(location)
+-
+-    case :erl_anno.column(location) do
+-      :undefined ->
+-        nil
++  # Erlang messages are charlists which may contain code points outside
++  # of the latin1 range (for example, quoted non-ASCII atoms), so they
++  # have to be encoded as UTF-8 instead of being converted to bytes
++  defp erlang_error_message(module, description) do
++    message = module.format_error(description)
+ 
+-      column ->
+-        lines = :string.split(code, "\n", :all)
+-        snippet = :lists.nth(line - start_line + 1, lines)
++    case :unicode.characters_to_binary(message) do
++      binary when is_binary(binary) -> binary
++      _ -> inspect(description)
++    end
++  end
+ 
+-        offset =
+-          if line == start_line do
+-            column - start_column
+-          else
+-            column - 1
+-          end
++  # The snippet is the offending line alone, which is the form expected
++  # by Elixir's SyntaxError and TokenMissingError. The location reported
++  # by Erlang is relative to that line, so the column is counted from its
++  # start. Like Elixir, we skip blank lines, in which case there is no
++  # snippet to show
++  defp make_snippet(code, location) do
++    line = :erl_anno.line(location)
+ 
+-        case :string.trim(code, :leading) do
+-          [] -> nil
+-          _ -> %{content: snippet, offset: offset}
+-        end
++    with true <- :erl_anno.column(location) != :undefined and line >= 1,
++         snippet when is_binary(snippet) <- Enum.at(String.split(code, "\n"), line - 1),
++         snippet = String.trim_trailing(snippet, "\r"),
++         true <- String.trim(snippet) != "" do
++      # Erlang counts a tab as a single column, so we show it as a single
++      # space, which keeps the highlighted column aligned with the snippet
++      String.replace(snippet, "\t", " ")
++    else
++      _ -> nil
+     end
+   end
+ 
+diff --git a/test/livebook/runtime/evaluator_test.exs b/test/livebook/runtime/evaluator_test.exs
+index e3541c7..882a97d 100644
+--- a/test/livebook/runtime/evaluator_test.exs
++++ b/test/livebook/runtime/evaluator_test.exs
+@@ -1390,6 +1390,123 @@ defmodule Livebook.Runtime.EvaluatorTest do
+       assert_receive {:runtime_evaluation_response, :code_4, error(message), metadata()}
+       assert "\e[31mexception error: bad argument" <> _ = message
+     end
++
++    test "reports incomplete input as a token missing error", %{evaluator: evaluator} do
++      Evaluator.evaluate_code(evaluator, :erlang, "X =", :code_1, [])
++
++      assert_receive {:runtime_evaluation_response, :code_1, error(message),
++                      metadata() = metadata}
++
++      assert "\e[31m** (TokenMissingError)" <> _ = message
++      assert message =~ "syntax error before:"
++      assert message =~ "nofile:1:4"
++      assert message =~ "X ="
++      refute message =~ "ArgumentError"
++      assert metadata.errored
++      assert [%{line: 1, severity: :error}] = metadata.code_markers
++    end
++
++    test "reports invalid syntax as a syntax error with its location", %{evaluator: evaluator} do
++      Evaluator.evaluate_code(evaluator, :erlang, "X ==/== a.", :code_1, [])
++
++      assert_receive {:runtime_evaluation_response, :code_1, error(message),
++                      metadata() = metadata}
++
++      assert "\e[31m** (SyntaxError)" <> _ = message
++      assert message =~ "syntax error before: /="
++      assert message =~ "nofile:1:5"
++      assert message =~ "X ==/== a."
++      refute message =~ "ArgumentError"
++      assert metadata.errored
++      assert [%{line: 1, severity: :error}] = metadata.code_markers
++    end
++
++    test "reports tokenizer errors as a syntax error with its location", %{evaluator: evaluator} do
++      Evaluator.evaluate_code(evaluator, :erlang, "$a$", :code_1, [])
++
++      assert_receive {:runtime_evaluation_response, :code_1, error(message),
++                      metadata() = metadata}
++
++      assert "\e[31m** (SyntaxError)" <> _ = message
++      assert message =~ "unterminated character"
++      assert message =~ "nofile:1:3"
++      assert message =~ "$a$"
++      refute message =~ "ArgumentError"
++      assert metadata.errored
++      assert [%{line: 1, severity: :error}] = metadata.code_markers
++    end
++
++    test "reports errors on later lines with the column counted from that line",
++         %{evaluator: evaluator} do
++      code = "Y = 1,\n  X ==/== a."
++      Evaluator.evaluate_code(evaluator, :erlang, code, :code_1, [], file: "file.erl")
++
++      assert_receive {:runtime_evaluation_response, :code_1, error(message),
++                      metadata() = metadata}
++
++      assert message =~ "file.erl:2:7"
++      assert message =~ "  X ==/== a."
++      refute message =~ "Y = 1"
++      assert [%{line: 2, severity: :error}] = metadata.code_markers
++
++      Evaluator.evaluate_code(evaluator, :erlang, "\n\n  X =", :code_2, [])
++
++      assert_receive {:runtime_evaluation_response, :code_2, error(message),
++                      metadata() = metadata}
++
++      assert "\e[31m** (TokenMissingError)" <> _ = message
++      assert message =~ "nofile:3:6"
++      assert message =~ "  X ="
++      assert [%{line: 3, severity: :error}] = metadata.code_markers
++    end
++
++    test "reports syntax errors with non-ASCII characters", %{evaluator: evaluator} do
++      Evaluator.evaluate_code(evaluator, :erlang, "X = 'ö' 'ü'.", :code_1, [])
++
++      assert_receive {:runtime_evaluation_response, :code_1, error(message),
++                      metadata() = metadata}
++
++      assert "\e[31m** (SyntaxError)" <> _ = message
++      assert message =~ "syntax error before: 'ü'"
++      assert message =~ "nofile:1:9"
++      assert message =~ "X = 'ö' 'ü'."
++      refute message =~ "ArgumentError"
++
++      assert [%{line: 1, description: "erl_parse: syntax error before: 'ü'"}] =
++               metadata.code_markers
++
++      Evaluator.evaluate_code(evaluator, :erlang, "X = 'ł' 'ł'.", :code_2, [])
++
++      assert_receive {:runtime_evaluation_response, :code_2, error(message), metadata()}
++
++      assert "\e[31m** (SyntaxError)" <> _ = message
++      assert message =~ "syntax error before: 'ł'"
++      assert message =~ "nofile:1:9"
++      refute message =~ "ArgumentError"
++    end
++
++    test "reports unterminated non-ASCII atoms as a syntax error", %{evaluator: evaluator} do
++      Evaluator.evaluate_code(evaluator, :erlang, "X = 'ł", :code_1, [])
++
++      assert_receive {:runtime_evaluation_response, :code_1, error(message), metadata()}
++
++      assert "\e[31m** (SyntaxError)" <> _ = message
++      assert message =~ "unterminated atom starting with 'ł'"
++      assert message =~ "nofile:1:6"
++      refute message =~ "ArgumentError"
++    end
++
++    test "keeps reporting erlang runtime errors", %{evaluator: evaluator} do
++      Evaluator.evaluate_code(evaluator, :erlang, "list_to_binary(1).", :code_1, [])
++
++      assert_receive {:runtime_evaluation_response, :code_1, error(message),
++                      metadata() = metadata}
++
++      assert "\e[31mexception error: bad argument" <> _ = message
++      assert message =~ "list_to_binary/1"
++      assert message =~ "called as list_to_binary(1)"
++      assert metadata.errored
++    end
+   end
+ 
+   describe "formatting" do

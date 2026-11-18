@@ -20,6 +20,8 @@ Read from the runs that exist (cases solved, of 20):
 |---|---|---|---|---|---|---|
 | Opus 5.5, its three v5 runs | 7, 7, 6 | 11, 11, 11 | 12, 12, 12 | 15, 15, 15 | 17, 16, 17 | 18, 17, 18 |
 | Opus 5.5, its two assembled v6 runs | 7, 7 | 12, 12 | 13, 13 | 16, 16 | 18, 17 | 20, 19 |
+| Sonnet 5.5 at max, its two assembled v6 runs | 0, 0 | 0, 0 | 2, 1 | 2, 3 | 9, 7 | 20, 20 |
+| Haiku 5.5 at max, its two v6 runs | 0, 0 | 0, 0 | 2, 2 | 5, 5 | 10, 10 | 19, 19 |
 | Qwen3.8-27B UD-Q4_K_XL, v6 | 5 | 9 | 13 | 16 | 16 | 18 |
 | Qwen3.8-27B UD-Q6_K_L, v6 | 2 | 7 | 11 | 14 | 15 | 16 |
 
@@ -33,8 +35,8 @@ Read from the runs that exist (cases solved, of 20):
 - **Reasoning a chat template drops costs no context.** Such a model fits more work into a size than one that keeps its reasoning in the conversation. Output tokens stay published beside the score.
 - **Public schema 12.** Each case adds `peak_context_tokens`, null where the run did not record it. A series whose attempts all recorded it gets a score at every size; any other series is left out of a size's view. Series published earlier keep their files and are upgraded when they take another run.
 - **Series already published.** The two Qwen3.8-27B v6 series had their peaks read from the per-call usage records their runs saved, and took schema 12. The DeepSeek v6 series' run logs are not on the controller's machine, so it has no scores at a size. The v5 series are left as published.
-- **Opus on v6.** Opus 5.5 has no full run on v6. At the user's request its v6 series is assembled from its v5 runs and four single-case attempts, with its peaks read from their transcripts ([ADR 0012](0012-rebuild-release-and-validate-with-unpublished-opus-runs.md), amendment of 2026-11-17).
-- **It does not separate models at the largest size.** At 262,144 the series above still sit between 15 and 18. That needs cases that good models get wrong, which is a matter of what the cases ask, not of how they are scored.
+- **Opus and Sonnet on v6.** Neither has a full run on v6. At the user's request each has a v6 series assembled from its v5 runs and four single-case attempts, with its peaks read from their transcripts ([ADR 0012](0012-rebuild-release-and-validate-with-unpublished-opus-runs.md), amendments of 2026-11-17 and 18). Haiku 5.5's v6 series is two ordinary full runs, the first to record their peaks as they ran.
+- **It does not separate economical models.** As run, every series above scores 16 to 20, and a size pulls the heavy users of context far below the rest: at 262,144 Sonnet and Haiku at max effort solve 7 to 10. But Opus and the two Qwen series still sit between 15 and 18 there. That needs cases that good models get wrong, which is a matter of what the cases ask, not of how they are scored.
 
 ## Considered options
 

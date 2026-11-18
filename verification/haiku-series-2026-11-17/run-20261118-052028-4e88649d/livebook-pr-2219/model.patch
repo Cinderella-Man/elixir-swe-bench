@@ -1,0 +1,734 @@
+diff --git a/lib/livebook/session/data.ex b/lib/livebook/session/data.ex
+index 001b957..b18014f 100644
+--- a/lib/livebook/session/data.ex
++++ b/lib/livebook/session/data.ex
+@@ -1248,11 +1248,9 @@ defmodule Livebook.Session.Data do
+   end
+ 
+   defp add_cell_output({data, _} = data_actions, cell, output) do
+-    {[indexed_output], _counter} = Notebook.index_outputs([output], 0)
+-
+     new_input_infos =
+-      indexed_output
+-      |> Cell.find_inputs_in_output()
++      output
++      |> find_inputs_in_new_output()
+       |> Map.new(fn input -> {input.id, input_info(input.attrs.default)} end)
+ 
+     {data, _} =
+@@ -1277,6 +1275,18 @@ defmodule Livebook.Session.Data do
+     end
+   end
+ 
++  # Frame updates keep their outputs in the update payload until they are
++  # applied to the target frame, so we look for inputs in the payload
++  defp find_inputs_in_new_output(%{type: :frame_update, update: {_update_type, outputs}}) do
++    {indexed_outputs, _counter} = Notebook.index_outputs(outputs, 0)
++    Enum.flat_map(indexed_outputs, &Cell.find_inputs_in_output/1)
++  end
++
++  defp find_inputs_in_new_output(output) do
++    {[indexed_output], _counter} = Notebook.index_outputs([output], 0)
++    Cell.find_inputs_in_output(indexed_output)
++  end
++
+   defp finish_cell_evaluation(data_actions, cell, section, metadata) do
+     data_actions =
+       data_actions
+diff --git a/lib/livebook_web/live/app_session_live.ex b/lib/livebook_web/live/app_session_live.ex
+index 65007b1..fbac636 100644
+--- a/lib/livebook_web/live/app_session_live.ex
++++ b/lib/livebook_web/live/app_session_live.ex
+@@ -386,12 +386,15 @@ defmodule LivebookWeb.AppSessionLive do
+       # See LivebookWeb.SessionLive for more details
+       {:add_cell_evaluation_output, _client_id, _cell_id, %{type: :frame_update} = output} ->
+         %{ref: ref, update: {update_type, _}} = output
++        changed_input_ids = Session.Data.changed_input_ids(data)
+ 
+         for {idx, frame} <- Notebook.find_frame_outputs(data.notebook, ref) do
++          # The frame may contain new inputs, so we pass their views along
+           send_update(LivebookWeb.Output.FrameComponent,
+             id: "output-#{idx}",
+             outputs: frame.outputs,
+-            update_type: update_type
++            update_type: update_type,
++            input_views: input_views_for_output({idx, frame}, data, changed_input_ids)
+           )
+         end
+ 
+diff --git a/lib/livebook_web/live/session_live.ex b/lib/livebook_web/live/session_live.ex
+index 328f903..639b6cd 100644
+--- a/lib/livebook_web/live/session_live.ex
++++ b/lib/livebook_web/live/session_live.ex
+@@ -2751,8 +2751,12 @@ defmodule LivebookWeb.SessionLive do
+   end
+ 
+   defp input_views_for_cell(cell, data, changed_input_ids) do
++    input_views_for_outputs(cell.outputs, data, changed_input_ids)
++  end
++
++  defp input_views_for_outputs(outputs, data, changed_input_ids) do
+     input_ids =
+-      for output <- cell.outputs,
++      for output <- outputs,
+           input <- Cell.find_inputs_in_output(output),
+           do: input.id
+ 
+@@ -2785,12 +2789,15 @@ defmodule LivebookWeb.SessionLive do
+       # This is important for intensive output updates
+       {:add_cell_evaluation_output, _client_id, _cell_id, %{type: :frame_update} = output} ->
+         %{ref: ref, update: {update_type, _}} = output
++        changed_input_ids = Session.Data.changed_input_ids(data)
+ 
+         for {idx, frame} <- Notebook.find_frame_outputs(data.notebook, ref) do
++          # The frame may contain new inputs, so we pass their views along
+           send_update(LivebookWeb.Output.FrameComponent,
+             id: "output-#{idx}",
+             outputs: frame.outputs,
+-            update_type: update_type
++            update_type: update_type,
++            input_views: input_views_for_outputs(frame.outputs, data, changed_input_ids)
+           )
+         end
+ 
+diff --git a/test/livebook/session/data_test.exs b/test/livebook/session/data_test.exs
+index 717a5ea..3cc24d1 100644
+--- a/test/livebook/session/data_test.exs
++++ b/test/livebook/session/data_test.exs
+@@ -21,6 +21,26 @@ defmodule Livebook.Session.DataTest do
+     attrs: %{type: :text, default: "hey", label: "Text"}
+   }
+ 
++  @frame %{type: :frame, ref: "f1", outputs: [], placeholder: true}
++
++  @frame_update_replace %{type: :frame_update, ref: "f1", update: {:replace, [@input]}}
++
++  @frame_update_append %{
++    type: :frame_update,
++    ref: "f1",
++    update:
++      {:append,
++       [
++         %{
++           type: :input,
++           ref: "ref2",
++           id: "i2",
++           destination: nil,
++           attrs: %{type: :number, default: 1, label: "Age"}
++         }
++       ]}
++  }
++
+   defp eval_meta(opts \\ []) do
+     uses = opts[:uses] || []
+     defines = opts[:defines] || %{}
+@@ -1945,6 +1965,121 @@ defmodule Livebook.Session.DataTest do
+                 }
+               }, _} = Data.apply_operation(data, operation)
+     end
++
++    test "stores default values for inputs added by frame updates" do
++      data =
++        data_after_operations!([
++          {:insert_section, @cid, 0, "s1"},
++          {:insert_cell, @cid, "s1", 0, :code, "c1", %{}},
++          {:set_runtime, @cid, connected_noop_runtime()},
++          evaluate_cells_operations(["setup"]),
++          {:queue_cells_evaluation, @cid, ["c1"]},
++          {:add_cell_evaluation_output, @cid, "c1", @frame}
++        ])
++
++      operation = {:add_cell_evaluation_output, @cid, "c1", @frame_update_replace}
++
++      assert {:ok, %{input_infos: %{"i1" => %{value: "hey"}}}, _} =
++               Data.apply_operation(data, operation)
++    end
++
++    test "stores default values for nested inputs added by frame updates" do
++      nested_frame_update = %{
++        type: :frame_update,
++        ref: "f1",
++        update: {:append, [%{type: :frame, ref: "f2", outputs: [@input], placeholder: true}]}
++      }
++
++      data =
++        data_after_operations!([
++          {:insert_section, @cid, 0, "s1"},
++          {:insert_cell, @cid, "s1", 0, :code, "c1", %{}},
++          {:set_runtime, @cid, connected_noop_runtime()},
++          evaluate_cells_operations(["setup"]),
++          {:queue_cells_evaluation, @cid, ["c1"]},
++          {:add_cell_evaluation_output, @cid, "c1", @frame}
++        ])
++
++      operation = {:add_cell_evaluation_output, @cid, "c1", nested_frame_update}
++
++      assert {:ok, %{input_infos: %{"i1" => %{value: "hey"}}}, _} =
++               Data.apply_operation(data, operation)
++    end
++
++    test "stores default values for inputs added by frame updates in the pre-evaluation data" do
++      data =
++        data_after_operations!([
++          {:insert_section, @cid, 0, "s1"},
++          {:insert_cell, @cid, "s1", 0, :code, "c1", %{}},
++          {:set_runtime, @cid, connected_noop_runtime()},
++          evaluate_cells_operations(["setup"]),
++          {:queue_cells_evaluation, @cid, ["c1"]},
++          {:add_cell_evaluation_output, @cid, "c1", @frame}
++        ])
++
++      operation = {:add_cell_evaluation_output, @cid, "c1", @frame_update_replace}
++
++      assert {:ok,
++              %{
++                cell_infos: %{
++                  "c1" => %{
++                    eval: %{data: %{input_infos: %{"i1" => %{value: "hey"}}}}
++                  }
++                }
++              }, _} = Data.apply_operation(data, operation)
++    end
++
++    test "garbage collects input values of inputs removed by frame updates" do
++      data =
++        data_after_operations!([
++          {:insert_section, @cid, 0, "s1"},
++          {:insert_cell, @cid, "s1", 0, :code, "c1", %{}},
++          {:set_runtime, @cid, connected_noop_runtime()},
++          evaluate_cells_operations(["setup"]),
++          {:queue_cells_evaluation, @cid, ["c1"]},
++          {:add_cell_evaluation_response, @cid, "c1", @frame, eval_meta()},
++          {:add_cell_evaluation_output, @cid, "c1", @frame_update_replace}
++        ])
++
++      frame_update = %{
++        type: :frame_update,
++        ref: "f1",
++        update: {:replace, [%{type: :plain_text, text: "No inputs", chunk: false}]}
++      }
++
++      operation = {:add_cell_evaluation_output, @cid, "c1", frame_update}
++
++      empty_map = %{}
++
++      assert {:ok, %{input_infos: ^empty_map},
++              [{:clean_up_input_values, %{"i1" => %{value: "hey"}}}]} =
++               Data.apply_operation(data, operation)
++    end
++
++    test "keeps edited values of inputs added by frame updates when more are appended" do
++      data =
++        data_after_operations!([
++          {:insert_section, @cid, 0, "s1"},
++          {:insert_cell, @cid, "s1", 0, :code, "c1", %{}},
++          {:set_runtime, @cid, connected_noop_runtime()},
++          evaluate_cells_operations(["setup"]),
++          {:queue_cells_evaluation, @cid, ["c1"]},
++          {:add_cell_evaluation_output, @cid, "c1", @frame},
++          {:add_cell_evaluation_output, @cid, "c1", @frame_update_replace}
++        ])
++
++      assert {:ok, data, _} = Data.apply_operation(data, {:set_input_value, @cid, "i1", "edited"})
++
++      operation = {:add_cell_evaluation_output, @cid, "c1", @frame_update_append}
++
++      assert {:ok,
++              %{
++                input_infos: %{
++                  "i1" => %{value: "edited"},
++                  "i2" => %{value: 1}
++                }
++              }, _} = Data.apply_operation(data, operation)
++    end
+   end
+ 
+   describe "apply_operation/2 given :add_cell_evaluation_response" do
+diff --git a/test/livebook_web/live/app_session_live_test.exs b/test/livebook_web/live/app_session_live_test.exs
+index f3a6df8..30eed68 100644
+--- a/test/livebook_web/live/app_session_live_test.exs
++++ b/test/livebook_web/live/app_session_live_test.exs
+@@ -257,4 +257,79 @@ defmodule LivebookWeb.AppSessionLiveTest do
+ 
+     Livebook.App.close(app.pid)
+   end
++
++  test "frame update adds inputs that are rendered on the page", %{conn: conn} do
++    slug = Utils.random_short_id()
++    app_settings = %{Notebook.AppSettings.new() | slug: slug}
++    cell = Notebook.Cell.new(:code)
++
++    notebook = %{
++      Notebook.new()
++      | app_settings: app_settings,
++        sections: [%{Notebook.Section.new() | cells: [cell]}]
++    }
++
++    Apps.subscribe()
++    {:ok, app_pid} = Apps.deploy(notebook)
++
++    assert_receive {:app_created, %{pid: ^app_pid}}
++
++    assert_receive {:app_updated,
++                    %{
++                      pid: ^app_pid,
++                      sessions: [%{app_status: %{execution: :executed}, pid: session_pid}]
++                    }}
++
++    frame = %{
++      type: :frame,
++      ref: "1",
++      outputs: [%{type: :terminal_text, text: "In frame", chunk: false}],
++      placeholder: true
++    }
++
++    send(session_pid, {:runtime_evaluation_output, cell.id, frame})
++    _ = Livebook.Session.get_data(session_pid)
++
++    {:ok, view, _} = conn |> live(~p"/apps/#{slug}") |> follow_redirect(conn)
++    assert render(view) =~ "In frame"
++
++    frame_update = %{
++      type: :frame_update,
++      ref: "1",
++      update:
++        {:replace,
++         [
++           %{
++             type: :input,
++             ref: "ref1",
++             id: "input1",
++             destination: nil,
++             attrs: %{type: :text, default: "hey", label: "Name"}
++           },
++           %{
++             type: :input,
++             ref: "ref2",
++             id: "input2",
++             destination: nil,
++             attrs: %{type: :number, default: 1, label: "Age"}
++           }
++         ]}
++    }
++
++    send(session_pid, {:runtime_evaluation_output, cell.id, frame_update})
++
++    # Synchronize with the session before rendering
++    _ = Livebook.Session.get_data(session_pid)
++    # Render once, so that frame send_update is processed
++    _ = render(view)
++
++    content = render(view)
++    assert content =~ "Name"
++    assert content =~ ~s(value="hey")
++    assert content =~ "Age"
++    assert content =~ ~s(value="1")
++    refute content =~ "In frame"
++
++    App.close(app_pid)
++  end
+ end
+diff --git a/test/livebook_web/live/session_live_test.exs b/test/livebook_web/live/session_live_test.exs
+index 241aa53..d79237f 100644
+--- a/test/livebook_web/live/session_live_test.exs
++++ b/test/livebook_web/live/session_live_test.exs
+@@ -680,6 +680,399 @@ defmodule LivebookWeb.SessionLiveTest do
+       refute content =~ "In frame"
+     end
+ 
++    test "frame update adds inputs that are rendered on the page",
++         %{conn: conn, session: session, test: test} do
++      Session.subscribe(session.id)
++      evaluate_setup(session.pid)
++
++      section_id = insert_section(session.pid)
++      cell_id = insert_text_cell(session.pid, section_id, :code)
++
++      Session.queue_cell_evaluation(session.pid, cell_id)
++
++      frame = %{type: :frame, ref: "1", outputs: [terminal_text("In frame")], placeholder: true}
++      send(session.pid, {:runtime_evaluation_output, cell_id, frame})
++
++      {:ok, view, _} = live(conn, ~p"/sessions/#{session.id}")
++      assert render(view) =~ "In frame"
++
++      frame_update = %{
++        type: :frame_update,
++        ref: "1",
++        update:
++          {:replace,
++           [
++             %{
++               type: :input,
++               ref: "ref1",
++               id: "input1",
++               destination: test,
++               attrs: %{type: :text, default: "hey", label: "Name"}
++             },
++             %{
++               type: :input,
++               ref: "ref2",
++               id: "input2",
++               destination: test,
++               attrs: %{type: :number, default: 1, label: "Age"}
++             }
++           ]}
++      }
++
++      send(session.pid, {:runtime_evaluation_output, cell_id, frame_update})
++
++      wait_for_session_update(session.pid)
++
++      # Render once, so that frame send_update is processed
++      _ = render(view)
++
++      content = render(view)
++      assert content =~ "Name"
++      assert content =~ ~s(value="hey")
++      assert content =~ "Age"
++      assert content =~ ~s(value="1")
++      refute content =~ "In frame"
++    end
++
++    test "frame update adds inputs to a nested frame and keeps sibling outputs",
++         %{conn: conn, session: session, test: test} do
++      Session.subscribe(session.id)
++      evaluate_setup(session.pid)
++
++      section_id = insert_section(session.pid)
++      cell_id = insert_text_cell(session.pid, section_id, :code)
++
++      Session.queue_cell_evaluation(session.pid, cell_id)
++
++      frame = %{
++        type: :frame,
++        ref: "outer",
++        outputs: [
++          terminal_text("Sibling output"),
++          %{
++            type: :frame,
++            ref: "inner",
++            outputs: [terminal_text("In inner frame")],
++            placeholder: true
++          }
++        ],
++        placeholder: true
++      }
++
++      send(session.pid, {:runtime_evaluation_output, cell_id, frame})
++
++      {:ok, view, _} = live(conn, ~p"/sessions/#{session.id}")
++      assert render(view) =~ "In inner frame"
++
++      frame_update = %{
++        type: :frame_update,
++        ref: "inner",
++        update:
++          {:replace,
++           [
++             %{
++               type: :input,
++               ref: "ref1",
++               id: "input1",
++               destination: test,
++               attrs: %{type: :text, default: "hey", label: "Name"}
++             },
++             %{
++               type: :input,
++               ref: "ref2",
++               id: "input2",
++               destination: test,
++               attrs: %{type: :number, default: 1, label: "Age"}
++             }
++           ]}
++      }
++
++      send(session.pid, {:runtime_evaluation_output, cell_id, frame_update})
++
++      wait_for_session_update(session.pid)
++
++      # Render once, so that frame send_update is processed
++      _ = render(view)
++
++      content = render(view)
++      assert content =~ "Sibling output"
++      assert content =~ "Name"
++      assert content =~ ~s(value="hey")
++      assert content =~ "Age"
++      assert content =~ ~s(value="1")
++      refute content =~ "In inner frame"
++    end
++
++    test "page opened after a frame update renders the inputs added to the frame",
++         %{conn: conn, session: session, test: test} do
++      Session.subscribe(session.id)
++      evaluate_setup(session.pid)
++
++      section_id = insert_section(session.pid)
++      cell_id = insert_text_cell(session.pid, section_id, :code)
++
++      Session.queue_cell_evaluation(session.pid, cell_id)
++
++      frame = %{type: :frame, ref: "1", outputs: [terminal_text("In frame")], placeholder: true}
++      send(session.pid, {:runtime_evaluation_output, cell_id, frame})
++
++      frame_update = %{
++        type: :frame_update,
++        ref: "1",
++        update:
++          {:append,
++           [
++             %{
++               type: :input,
++               ref: "ref1",
++               id: "input1",
++               destination: test,
++               attrs: %{type: :text, default: "hey", label: "Name"}
++             }
++           ]}
++      }
++
++      send(session.pid, {:runtime_evaluation_output, cell_id, frame_update})
++
++      wait_for_session_update(session.pid)
++
++      {:ok, view, _} = live(conn, ~p"/sessions/#{session.id}")
++
++      content = render(view)
++      assert content =~ "In frame"
++      assert content =~ "Name"
++      assert content =~ ~s(value="hey")
++    end
++
++    test "editing an input added by a frame update sends the change event",
++         %{conn: conn, session: session, test: test} do
++      Process.register(self(), test)
++
++      Session.subscribe(session.id)
++      evaluate_setup(session.pid)
++
++      section_id = insert_section(session.pid)
++      cell_id = insert_text_cell(session.pid, section_id, :code)
++
++      Session.queue_cell_evaluation(session.pid, cell_id)
++
++      frame = %{type: :frame, ref: "1", outputs: [terminal_text("In frame")], placeholder: true}
++      send(session.pid, {:runtime_evaluation_output, cell_id, frame})
++
++      {:ok, view, _} = live(conn, ~p"/sessions/#{session.id}")
++
++      frame_update = %{
++        type: :frame_update,
++        ref: "1",
++        update:
++          {:replace,
++           [
++             %{
++               type: :input,
++               ref: "ref1",
++               id: "input1",
++               destination: test,
++               attrs: %{type: :number, default: 1, label: "Age"}
++             }
++           ]}
++      }
++
++      send(session.pid, {:runtime_evaluation_output, cell_id, frame_update})
++
++      wait_for_session_update(session.pid)
++
++      # Render once, so that frame send_update is processed
++      _ = render(view)
++
++      assert %{input_infos: %{"input1" => %{value: 1}}} = Session.get_data(session.pid)
++
++      view
++      |> element(~s/[data-el-outputs-container] form/)
++      |> render_change(%{"html_value" => "10"})
++
++      assert %{input_infos: %{"input1" => %{value: 10}}} = Session.get_data(session.pid)
++
++      assert_receive {:event, "ref1", %{value: 10, type: :change}}
++    end
++
++    test "keeps edited value of frame update input when more inputs are appended",
++         %{conn: conn, session: session, test: test} do
++      Process.register(self(), test)
++
++      Session.subscribe(session.id)
++      evaluate_setup(session.pid)
++
++      section_id = insert_section(session.pid)
++      cell_id = insert_text_cell(session.pid, section_id, :code)
++
++      Session.queue_cell_evaluation(session.pid, cell_id)
++
++      frame = %{type: :frame, ref: "1", outputs: [terminal_text("In frame")], placeholder: true}
++      send(session.pid, {:runtime_evaluation_output, cell_id, frame})
++
++      {:ok, view, _} = live(conn, ~p"/sessions/#{session.id}")
++
++      frame_update = %{
++        type: :frame_update,
++        ref: "1",
++        update:
++          {:replace,
++           [
++             %{
++               type: :input,
++               ref: "ref1",
++               id: "input1",
++               destination: test,
++               attrs: %{type: :text, default: "hey", label: "Name"}
++             }
++           ]}
++      }
++
++      send(session.pid, {:runtime_evaluation_output, cell_id, frame_update})
++
++      wait_for_session_update(session.pid)
++      _ = render(view)
++
++      view
++      |> element(~s/[data-el-outputs-container] form/)
++      |> render_change(%{"html_value" => "sherlock"})
++
++      assert %{input_infos: %{"input1" => %{value: "sherlock"}}} = Session.get_data(session.pid)
++
++      append_update = %{
++        type: :frame_update,
++        ref: "1",
++        update:
++          {:append,
++           [
++             %{
++               type: :input,
++               ref: "ref2",
++               id: "input2",
++               destination: test,
++               attrs: %{type: :number, default: 1, label: "Age"}
++             }
++           ]}
++      }
++
++      send(session.pid, {:runtime_evaluation_output, cell_id, append_update})
++
++      wait_for_session_update(session.pid)
++
++      # Render once, so that frame send_update is processed
++      _ = render(view)
++
++      content = render(view)
++      assert content =~ ~s(value="sherlock")
++      assert content =~ "Age"
++      assert content =~ ~s(value="1")
++
++      assert %{
++               input_infos: %{
++                 "input1" => %{value: "sherlock"},
++                 "input2" => %{value: 1}
++               }
++             } = Session.get_data(session.pid)
++    end
++
++    test "keeps edited value of input in a nested frame when more inputs are appended",
++         %{conn: conn, session: session, test: test} do
++      Process.register(self(), test)
++
++      Session.subscribe(session.id)
++      evaluate_setup(session.pid)
++
++      section_id = insert_section(session.pid)
++      cell_id = insert_text_cell(session.pid, section_id, :code)
++
++      Session.queue_cell_evaluation(session.pid, cell_id)
++
++      frame = %{
++        type: :frame,
++        ref: "outer",
++        outputs: [
++          terminal_text("Sibling output"),
++          %{
++            type: :frame,
++            ref: "inner",
++            outputs: [terminal_text("In inner frame")],
++            placeholder: true
++          }
++        ],
++        placeholder: true
++      }
++
++      send(session.pid, {:runtime_evaluation_output, cell_id, frame})
++
++      {:ok, view, _} = live(conn, ~p"/sessions/#{session.id}")
++
++      frame_update = %{
++        type: :frame_update,
++        ref: "inner",
++        update:
++          {:replace,
++           [
++             %{
++               type: :input,
++               ref: "ref1",
++               id: "input1",
++               destination: test,
++               attrs: %{type: :text, default: "hey", label: "Name"}
++             }
++           ]}
++      }
++
++      send(session.pid, {:runtime_evaluation_output, cell_id, frame_update})
++
++      wait_for_session_update(session.pid)
++      _ = render(view)
++      _ = render(view)
++
++      view
++      |> element(~s/[data-el-outputs-container] form/)
++      |> render_change(%{"html_value" => "sherlock"})
++
++      assert %{input_infos: %{"input1" => %{value: "sherlock"}}} = Session.get_data(session.pid)
++      assert_receive {:event, "ref1", %{value: "sherlock", type: :change}}
++
++      append_update = %{
++        type: :frame_update,
++        ref: "inner",
++        update:
++          {:append,
++           [
++             %{
++               type: :input,
++               ref: "ref2",
++               id: "input2",
++               destination: test,
++               attrs: %{type: :number, default: 1, label: "Age"}
++             }
++           ]}
++      }
++
++      send(session.pid, {:runtime_evaluation_output, cell_id, append_update})
++
++      wait_for_session_update(session.pid)
++
++      # Render once, so that frame send_update is processed
++      _ = render(view)
++
++      content = render(view)
++      assert content =~ "Sibling output"
++      assert content =~ ~s(value="sherlock")
++      assert content =~ "Age"
++      assert content =~ ~s(value="1")
++      refute content =~ "In inner frame"
++
++      assert %{
++               input_infos: %{
++                 "input1" => %{value: "sherlock"},
++                 "input2" => %{value: 1}
++               }
++             } = Session.get_data(session.pid)
++    end
++
+     test "client-specific output is sent only to one target", %{conn: conn, session: session} do
+       user1 = build(:user, name: "Jake Peralta")
+       {_, client_id} = Session.register_client(session.pid, self(), user1)
