@@ -22,12 +22,12 @@ The sizes are 65,536, 98,304, 131,072, 196,608 and 262,144 tokens. One run at th
 
 ## Reading the page
 
-- **The chart** of a release with recorded peaks plots cases solved against context. Each series is a line; its height at any point is how many cases the model solves when the whole attempt must fit in that much context. Higher and further left is better. A strip at the right holds each series' own score.
+- **The chart** of a release with recorded peaks plots cases solved against context. Each series is a line; its height at any point is how many cases the model solves when the whole attempt must fit in that much context. Higher and further left is better. Each line is named beside the plot, where it ends, with what it solves inside 262,144 tokens. Pointing at the plot reads every model at that much context.
 - **Memory is not an axis there.** A model's peak VRAM + RAM is measured with the whole 262,144-token window reserved, so it says how large the window was, not how much room the work needed. It stays in the table and in each series' details.
-- **As run** is each series' score exactly as it was run: for a local model, inside its own context window. It is the strip beside the chart, the **Cases passed** column of the table view and the score in a series' details.
+- **As run** is each series' score exactly as it was run: for a local model, inside its own context window. It is the **Cases passed** column of the table view and the score in a series' details. The chart does not show it: a model reached through an API was held to no window, so its own score can be far above where its line ends.
 - **The table view** has one column per size, holding the cases the series solves inside it. A series' details list each attempt's peak context beside its case.
 - **A size is stricter than the run.** A local attempt that filled its window is cut off and its patch is still graded, so it can pass in the run's own score. At a size it never counts, because the agent did not finish. That is why Qwen3.8-27B UD-Q4_K_XL scores 18 as run and 16 at 262,144.
-- **Series without recorded peaks have no line.** They keep their dot in the strip and show a dash in the size columns.
+- **Series without recorded peaks have no line.** They are still named beside the chart, and show a dash in the size columns.
 - **These are "would have fit" scores.** The runs were made with a 262,144-token window, and the model was told that window. A model told it has 65,536 tokens might behave differently.
 - **Token units differ a little.** Claude's tokens and a local model's are not the same unit, so a case near a size's edge can fall either side.
 

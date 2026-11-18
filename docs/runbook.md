@@ -182,6 +182,21 @@ Before the first scored run, run the two harness checks from ADR 0010 with Opus 
 
 Case evidence adds `harness-prompt.md`, `claude-transcript.jsonl` (timestamps and durations removed), `claude-tool-calls.jsonl` and the attempt's best-effort usage. Claude Code attempts store no elapsed time.
 
+## Runs in a row
+
+**Runs in a row**, above **Run benchmark**, makes up to three full runs one after another, never at once. It is for leaving a model to fill its run series overnight.
+
+- **Each run takes the next seed** of a run series: 101, then 102, then 103. Start from the first seed still needed; a row that would run past 103 is refused before anything starts. An endpoint that takes no seed repeats its settings.
+- **A pause separates the runs**, one minute unless changed, counted from the end of a run. The next run also waits for the last one's containers to be removed.
+- **The row goes on after a run that ended with evaluation errors.** It ends early if a run is stopped, if a run finished no case at all (a model server that is gone would fail every following run the same way), or if the next run cannot start. The dashboard says why, and **Cancel remaining runs** drops the rest without touching the run in progress.
+- **Nothing else starts between two runs of a row.** Cancel the rest first.
+- **The runs not yet started live in memory.** Restarting the controller forgets them; the run in progress can be resumed as usual.
+- **A contribution is checked whole.** With **Contribute a run** chosen, every seed of the row must still be missing from that series.
+- **Claude Code runs:** the solver session keeps waiting between two runs of a row and does not have to be started again.
+- Dry attempts, escape tests, validation runs and speed runs are made one at a time.
+
+From a shell, `Eab.Runs.start(endpoint, key, settings, runs: 3, pause_seconds: 60)` does the same. No run is added to the results page by itself.
+
 ## Run series and contributions
 
 Published results are three-run series ([ADR 0011](adr/0011-publish-three-run-series.md)). **Load run series** groups local runs with final scores by their setup and shows each series' mean, ±1.96·SE interval and missing seeds. **Add to results page** adds a completed run to its series file in `results-page/results/<series-id>.json`, creating it if needed. A seed already filled, a fourth run or a validation run is refused, unless `priv/admitted_validation_runs.json` lists that validation run with its release: a recorded decision that its outcome could not change the release ([ADR 0012](adr/0012-rebuild-release-and-validate-with-unpublished-opus-runs.md)). Provisional series list their required setup with **Contribute a run**: it fills in the settings and the first missing seed, and starting the run fails unless the connected endpoint matches that setup. Contributors on other installations export `run.json` and add it with `mix eab.results add`.

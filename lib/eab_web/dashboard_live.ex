@@ -67,6 +67,8 @@ defmodule EabWeb.DashboardLive do
         host_key: nil,
         trusted_hosts: [],
         parallel: 1,
+        runs_in_row: 1,
+        pause_seconds: 60,
         confirm_stop: false,
         check_kind: "",
         check_case: "",
@@ -375,6 +377,27 @@ defmodule EabWeb.DashboardLive do
     {:noreply, assign(socket, parallel: parallel)}
   end
 
+  # Runs in a row: how many full runs to make one after another, and the pause between them.
+  def handle_event("runs_in_row", params, socket) do
+    whole = fn value, range, current ->
+      case Integer.parse(to_string(value)) do
+        {n, ""} -> if n in range, do: n, else: current
+        _ -> current
+      end
+    end
+
+    {:noreply,
+     assign(socket,
+       runs_in_row: whole.(params["runs"], 1..Eab.Series.required(), socket.assigns.runs_in_row),
+       pause_seconds: whole.(params["pause"], 0..3600, socket.assigns.pause_seconds)
+     )}
+  end
+
+  def handle_event("cancel_queue", _, socket) do
+    Runs.cancel_queue()
+    {:noreply, refresh(socket)}
+  end
+
   def handle_event("validation", params, socket),
     do: {:noreply, assign(socket, validation: params["validation"] == "true")}
 
@@ -508,6 +531,8 @@ defmodule EabWeb.DashboardLive do
     claude_code = socket.assigns.provider == "claude_code"
 
     opts = [
+      runs: socket.assigns.runs_in_row,
+      pause_seconds: socket.assigns.pause_seconds,
       parallel_attempts: socket.assigns.parallel,
       validation: socket.assigns.validation and claude_code,
       speed: socket.assigns.speed and socket.assigns.provider == "local",
@@ -1012,6 +1037,39 @@ defmodule EabWeb.DashboardLive do
     )
     |> load_log()
   end
+
+  # Where a row of runs stands: which one is running, and when the next starts.
+  defp queue_status(%{queue: queue, active: active, cleaning: cleaning}) do
+    position = "#{queue["started"]} of #{queue["total"]}"
+
+    seeds =
+      if queue["seeds"] != [], do: " (seed #{Enum.join(queue["seeds"], ", then ")})", else: ""
+
+    cond do
+      active && queue["remaining"] == 0 ->
+        "Runs in a row: run #{position} is running. It is the last."
+
+      active ->
+        "Runs in a row: run #{position} is running. " <>
+          "The next#{seeds} starts #{pause_text(queue["pause_seconds"])} after it ends."
+
+      queue["next_at"] ->
+        "Runs in a row: run #{position} has ended. The next#{seeds} starts at " <>
+          String.slice(queue["next_at"], 11, 8) <>
+          " UTC" <> if(cleaning, do: ", once the last run's containers are removed.", else: ".")
+
+      true ->
+        "Runs in a row: run #{position} has ended. The next#{seeds} is starting."
+    end
+  end
+
+  defp pause_text(0), do: "right"
+  defp pause_text(1), do: "1 second"
+
+  defp pause_text(seconds) when rem(seconds, 60) == 0 and seconds >= 60,
+    do: "#{div(seconds, 60)} minute#{if seconds == 60, do: "", else: "s"}"
+
+  defp pause_text(seconds), do: "#{seconds} seconds"
 
   defp comparison_selection(socket, params) do
     visible = Enum.map(socket.assigns.history_page.items, & &1["id"])
@@ -1788,6 +1846,31 @@ defmodule EabWeb.DashboardLive do
                 Cases worked on at once. Keep 1 for a model on a single local server; above 1, no elapsed times are recorded.
               </p>
             </form>
+            <form id="runs-in-row-form" phx-change="runs_in_row">
+              <label for="runs-in-row">
+                Runs in a row<input
+                  id="runs-in-row"
+                  type="number"
+                  min="1"
+                  max={Eab.Series.required()}
+                  name="runs"
+                  value={@runs_in_row}
+                />
+              </label>
+              <label :if={@runs_in_row > 1} for="runs-pause">
+                Pause between runs, seconds<input
+                  id="runs-pause"
+                  type="number"
+                  min="0"
+                  max="3600"
+                  name="pause"
+                  value={@pause_seconds}
+                />
+              </label>
+              <p class="fine-print">
+                Full runs made one after another, never at once. Each takes the next seed of its run series (101, 102, 103), so start from the first seed you still need. The runs not yet started are forgotten if the controller restarts.
+              </p>
+            </form>
             <form
               :if={@provider == "local" and @speed_case_count > 0}
               id="speed-form"
@@ -1809,10 +1892,28 @@ defmodule EabWeb.DashboardLive do
             phx-click="run"
             disabled={
               is_nil(@endpoint) or @detecting or @cache_busy or busy?(@snapshot) or
-                @snapshot.cleaning or
+                @snapshot.cleaning or not is_nil(@snapshot.queue) or
                 not is_nil(@snapshot.cleanup_error)
             }
-          >Run benchmark <span>↗</span></button>
+          >{if @runs_in_row > 1, do: "Run benchmark #{@runs_in_row} times", else: "Run benchmark"}
+          <span>↗</span></button>
+          <div :if={@snapshot.queue} id="run-queue" class="notice" role="status">
+            {queue_status(@snapshot)}
+            <button
+              :if={@snapshot.queue["remaining"] > 0}
+              id="cancel-queue"
+              class="secondary"
+              phx-click="cancel_queue"
+            >Cancel remaining runs</button>
+          </div>
+          <p
+            :if={@snapshot.queue_note && is_nil(@snapshot.queue)}
+            id="run-queue-note"
+            class="notice"
+            role="status"
+          >
+            Runs in a row ended early. {@snapshot.queue_note}
+          </p>
           <div :if={@contribution} id="contribution" class="notice" role="status">
             Contributing to run series <code>{String.slice(@contribution["series_id"], 0, 12)}</code>
             ({@contribution["model"]["name"]}, {@contribution["run_count"]}/{@contribution[

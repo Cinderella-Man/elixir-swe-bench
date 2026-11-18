@@ -563,6 +563,176 @@ defmodule Eab.RunsTest do
     assert File.read!(Store.path("runs/#{saved["id"]}/#{id}/model.patch")) == "saved work"
   end
 
+  # A runner that reports its start and waits to be told how the run ends, after reporting
+  # the given case results.
+  defp stub_runner do
+    parent = self()
+
+    Application.put_env(:eab, :runner, fn run, _, progress ->
+      send(parent, {:started, self(), run})
+
+      receive do
+        {:finish, result, events} ->
+          Enum.each(events, progress)
+          result
+      end
+    end)
+  end
+
+  defp finished(run),
+    do: %{
+      "case_result" =>
+        {hd(run["cases"]), %{"status" => "completed", "grade" => %{"passed" => true}}}
+    }
+
+  defp await_queue(condition, attempts \\ 300) do
+    snapshot = Runs.snapshot()
+
+    cond do
+      condition.(snapshot) ->
+        snapshot
+
+      attempts == 0 ->
+        flunk("The row of runs did not reach the expected state: #{inspect(snapshot.queue)}")
+
+      true ->
+        Process.sleep(10) && await_queue(condition, attempts - 1)
+    end
+  end
+
+  test "runs in a row start one after another, each with the next seed" do
+    stub_runner()
+    Runs.subscribe()
+
+    assert {:ok, first} =
+             Runs.start(endpoint(), "", %{"seed" => "101"}, runs: 3, pause_seconds: 0)
+
+    assert_receive {:started, worker, run}, 3000
+    assert run["id"] == first and run["settings"]["seed"] == 101
+
+    assert Runs.snapshot().queue == %{
+             "total" => 3,
+             "started" => 1,
+             "remaining" => 2,
+             "seeds" => [102, 103],
+             "pause_seconds" => 0,
+             "next_at" => nil,
+             "backend" => nil
+           }
+
+    # Never at once: the run in progress excludes another start.
+    assert {:error, "A run is already active"} = Runs.start(endpoint(), "", %{})
+
+    send(worker, {:finish, :ok, [finished(run)]})
+    assert_receive {:started, worker, run}, 3000
+    assert run["id"] != first and run["settings"]["seed"] == 102
+    assert %{"started" => 2, "remaining" => 1, "seeds" => [103]} = Runs.snapshot().queue
+
+    # A run that ended with an evaluation error still measured a case: the row goes on.
+    send(worker, {:finish, {:error, "One case could not be evaluated"}, [finished(run)]})
+    assert_receive {:started, worker, run}, 3000
+    assert run["settings"]["seed"] == 103
+    assert %{"started" => 3, "remaining" => 0, "seeds" => []} = Runs.snapshot().queue
+
+    send(worker, {:finish, :ok, [finished(run)]})
+    snapshot = await_queue(&(is_nil(&1.queue) and is_nil(&1.active)))
+    assert snapshot.queue_note == nil
+    refute_receive {:started, _, _}, 100
+    await_cleanup()
+
+    assert Store.runs() |> Enum.map(&{&1["settings"]["seed"], &1["status"]}) |> Enum.sort() ==
+             [{101, "completed"}, {102, "error"}, {103, "completed"}]
+  end
+
+  test "a pause separates runs in a row, nothing else starts in it, and the rest can be cancelled" do
+    stub_runner()
+    stub_preparation()
+    Runs.subscribe()
+
+    assert {:ok, _} = Runs.start(endpoint(), "", %{}, runs: 2, pause_seconds: 3600)
+    assert_receive {:started, worker, run}, 3000
+    assert Runs.snapshot().queue["next_at"] == nil
+    send(worker, {:finish, :ok, [finished(run)]})
+
+    snapshot = await_queue(&((is_nil(&1.active) and &1.queue) && &1.queue["next_at"]))
+    {:ok, next_at, 0} = DateTime.from_iso8601(snapshot.queue["next_at"])
+    assert DateTime.diff(next_at, DateTime.utc_now()) in 3500..3600
+    await_cleanup()
+    refute_receive {:started, _, _}, 100
+
+    waiting = "Runs in a row are waiting for their next start. Cancel the remaining runs first."
+    assert {:error, ^waiting} = Runs.start(endpoint(), "", %{})
+    assert {:error, ^waiting} = Runs.prepare_all()
+
+    assert :ok = Runs.cancel_queue()
+    snapshot = Runs.snapshot()
+    assert snapshot.queue == nil
+    assert snapshot.queue_note == "Cancelled. The 1 remaining run was not started."
+
+    # A new start clears the note.
+    assert {:ok, _} = Runs.start(endpoint(), "", %{})
+    assert_receive {:started, worker, run}, 3000
+    assert Runs.snapshot().queue_note == nil
+    send(worker, {:finish, :ok, [finished(run)]})
+  end
+
+  test "stopping a run, or a run that finished no case, ends the row" do
+    stub_runner()
+    Runs.subscribe()
+
+    assert {:ok, _} = Runs.start(endpoint(), "", %{}, runs: 3, pause_seconds: 0)
+    assert_receive {:started, _, _}, 3000
+    assert :ok = Runs.stop()
+    snapshot = Runs.snapshot()
+    assert snapshot.queue == nil
+    assert snapshot.queue_note == "The run was stopped. The 2 remaining runs were not started."
+    await_cleanup()
+    refute_receive {:started, _, _}, 100
+
+    # The model server was gone: nothing was measured, and its successors would fare no better.
+    assert {:ok, _} = Runs.start(endpoint(), "", %{}, runs: 3, pause_seconds: 0)
+    assert_receive {:started, worker, _}, 3000
+    send(worker, {:finish, {:error, "The model endpoint did not answer"}, []})
+    snapshot = await_queue(&(is_nil(&1.active) and is_nil(&1.queue)))
+
+    assert snapshot.queue_note ==
+             "Run 1 of 3 finished no case. The 2 remaining runs were not started."
+
+    await_cleanup()
+    refute_receive {:started, _, _}, 100
+  end
+
+  test "a row of runs is checked whole before its first run starts" do
+    stub_runner()
+
+    for {settings, opts, message} <- [
+          {%{"seed" => "103"}, [runs: 2], "seed 103 leaves room for 1, not 2"},
+          {%{"seed" => "102"}, [runs: 3], "seed 102 leaves room for 2, not 3"},
+          {%{"seed" => "7"}, [runs: 2], "take the seeds 101, 102, 103 in turn"},
+          {%{}, [runs: 4], "Runs in a row must be a whole number from 1 to 3"},
+          {%{}, [runs: 0], "Runs in a row must be a whole number from 1 to 3"},
+          {%{}, [runs: 2, pause_seconds: -1], "The pause between runs must be"},
+          {%{}, [runs: 2, validation: true], "Runs in a row are for full runs"},
+          {%{}, [runs: 2, speed: true], "Runs in a row are for full runs"}
+        ] do
+      assert {:error, error} = Runs.start(endpoint(), "", settings, opts)
+      assert error =~ message
+    end
+
+    refute_receive {:started, _, _}, 100
+    assert Store.runs() == []
+    assert Runs.snapshot().queue == nil
+
+    # An endpoint without seeds repeats its settings.
+    claude = Eab.ClaudeCode.endpoint("claude-haiku-5-5")
+    assert {:ok, _} = Runs.start(claude, "", %{}, runs: 2, pause_seconds: 0)
+    assert_receive {:started, _, run}, 3000
+    assert run["settings"]["seed"] == nil
+
+    assert %{"remaining" => 1, "seeds" => [], "backend" => "claude_code"} =
+             Runs.snapshot().queue
+  end
+
   test "restart marks persisted active work interrupted without resuming" do
     Store.write("runs/old/run.json", %{
       "id" => "old",

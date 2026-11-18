@@ -49,6 +49,8 @@ defmodule EabWeb.ClaudeCodeController do
   end
 
   defp pre_tool_use(event, kit) do
+    # One claim wait bounds the whole call, whatever it ends up waiting for.
+    deadline = System.monotonic_time(:millisecond) + wait()
     active = Eab.Runs.snapshot().active
 
     claude_run? =
@@ -83,18 +85,53 @@ defmodule EabWeb.ClaudeCodeController do
 
       :waiting ->
         # The run may have ended while this call waited for a workspace.
-        if claude_run? and is_map(Eab.Runs.snapshot().active),
-          do:
+        cond do
+          claude_run? and is_map(Eab.Runs.snapshot().active) ->
             decision(
               "deny",
               "No workspace is ready yet (#{active["message"] || "the controller is preparing the next case"}). " <>
                 "Call the Agent tool again the same way to keep waiting."
-            ),
-          else:
+            )
+
+          # Between two runs in a row no run is active, yet the next one is already due.
+          # Hold the call until it starts, so the session neither stops nor spins.
+          await_queued_run(deadline) ->
+            decision(
+              "deny",
+              "The next run of this row of benchmark runs is about to start or has just started. " <>
+                "Call the Agent tool again the same way to keep waiting."
+            )
+
+          true ->
             decision(
               "deny",
               "No Claude Code run is active on the benchmark website: it has finished, was stopped, or has not started. Tell the user and stop."
             )
+        end
+    end
+  end
+
+  # Whether another Claude Code run is queued to start or has started, waiting until the
+  # deadline for it while it is queued.
+  defp await_queued_run(deadline) do
+    snapshot = Eab.Runs.snapshot()
+    claude? = &(&1 == Eab.ClaudeCode.backend())
+
+    cond do
+      is_map(snapshot.active) ->
+        claude?.(get_in(snapshot.active, ["model", "backend"]))
+
+      is_map(snapshot.queue) and snapshot.queue["remaining"] > 0 and
+          claude?.(snapshot.queue["backend"]) ->
+        if System.monotonic_time(:millisecond) < deadline do
+          Process.sleep(min(1000, wait()))
+          await_queued_run(deadline)
+        else
+          true
+        end
+
+      true ->
+        false
     end
   end
 

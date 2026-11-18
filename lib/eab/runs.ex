@@ -26,6 +26,10 @@ defmodule Eab.Runs do
   `parallel_attempts: n` (1 to 8, default 1) runs up to n cases at once (ADR 0014).
   `speed: true` runs only the benchmark's speed cases, one at a time, on a local model server:
   a speed run is published for its times and machine and never scored (ADR 0020).
+
+  `runs: n` (1 to 3, default 1) makes n full runs in a row: each starts `pause_seconds`
+  (default 60) after the one before ends, with the next seed of a run series where the
+  endpoint takes seeds. The runs still to start are held in memory only.
   """
   def start(endpoint, key, settings, opts \\ []),
     do: GenServer.call(__MODULE__, {:start, endpoint, key, settings, opts}, 30_000)
@@ -51,6 +55,9 @@ defmodule Eab.Runs do
     do: GenServer.call(__MODULE__, {:rerun_case, source, case_id, endpoint, key}, 30_000)
 
   def stop, do: GenServer.call(__MODULE__, :stop, 10_000)
+
+  @doc "Drops the runs in a row that have not started; the run in progress carries on."
+  def cancel_queue, do: GenServer.call(__MODULE__, :cancel_queue)
   def retry_cleanup, do: GenServer.call(__MODULE__, :retry_cleanup)
 
   @doc "Prepares and checks every case with no model, so a later run needs no internet."
@@ -93,7 +100,10 @@ defmodule Eab.Runs do
        cleanup: task,
        cleanup_error: nil,
        preparing: nil,
-       preparation: nil
+       preparation: nil,
+       # Runs in a row still to start, and why the last such row ended early.
+       queue: nil,
+       queue_note: nil
      }}
   end
 
@@ -106,8 +116,30 @@ defmodule Eab.Runs do
          history: Store.run_page().items,
          cleanup_error: state.cleanup_error,
          cleaning: state.cleanup != nil,
-         preparation: state.preparation
+         preparation: state.preparation,
+         queue: public_queue(state.queue),
+         queue_note: state.queue_note
        }, state}
+
+  def handle_call(:cancel_queue, _from, %{queue: nil} = state), do: {:reply, :ok, state}
+
+  def handle_call(:cancel_queue, _from, state) do
+    state = drop_queue(state, "Cancelled. #{unstarted(state.queue)} not started.")
+    broadcast()
+    {:reply, :ok, state}
+  end
+
+  # Between two runs in a row nothing is active, but the next start is already due.
+  def handle_call(request, _from, %{queue: queue, active: nil} = state)
+      when not is_nil(queue) and
+             (request == :prepare_all or
+                (is_tuple(request) and
+                   elem(request, 0) in [:start, :partial, :rerun_case, :resume])),
+      do:
+        {:reply,
+         {:error,
+          "Runs in a row are waiting for their next start. Cancel the remaining runs first."},
+         state}
 
   def handle_call(request, _from, %{preparing: preparing} = state)
       when not is_nil(preparing) and is_tuple(request) and
@@ -170,39 +202,28 @@ defmodule Eab.Runs do
       do: {:reply, {:error, "Container cleanup needs attention: #{error}"}, state}
 
   def handle_call({:start, endpoint, key, settings, opts}, _from, state) do
-    release = Release.freeze()
+    {opts, later, pause} = plan!(endpoint, settings, opts)
 
-    settings = Model.settings(endpoint, without_caps(endpoint, settings))
+    case begin_run(endpoint, key, settings, opts, %{state | queue_note: nil}) do
+      {:reply, {:ok, _}, started} = reply when later != [] ->
+        queue = %{
+          endpoint: endpoint,
+          key: key,
+          opts: opts,
+          settings: later,
+          total: length(later) + 1,
+          started: 1,
+          pause_ms: pause * 1000,
+          token: nil,
+          next_at: nil,
+          due: false
+        }
 
-    run =
-      release
-      |> new_run(endpoint, settings)
-      |> Map.put("parallel_attempts", parallel_attempts!(opts[:parallel_attempts] || 1))
+        put_elem(reply, 2, %{started | queue: queue})
 
-    run =
-      cond do
-        opts[:check] ->
-          check(run, endpoint, settings, release, opts[:check])
-
-        opts[:validation] ->
-          Map.put(run, "validation", true)
-
-        opts[:speed] && opts[:series] ->
-          raise "A speed run joins no run series; cancel the contribution first"
-
-        opts[:speed] ->
-          speed(run, endpoint, settings, release)
-
-        opts[:series] ->
-          Eab.Series.contribution!(run, opts[:series])
-          Map.put(run, "series", opts[:series])
-
-        true ->
-          run
-      end
-
-    Readiness.enforce!(run["cases"])
-    launch(run, key, state)
+      reply ->
+        reply
+    end
   rescue
     error -> {:reply, {:error, Exception.message(error)}, state}
   end
@@ -407,8 +428,15 @@ defmodule Eab.Runs do
         cleanup(run["id"])
       end)
 
+    state = %{state | active: nil, worker: nil, memory_monitor: nil, cleanup: task}
+
+    state =
+      if state.queue && state.queue.settings != [],
+        do: drop_queue(state, "The run was stopped. #{unstarted(state.queue)} not started."),
+        else: %{state | queue: nil}
+
     broadcast()
-    {:reply, :ok, %{state | active: nil, worker: nil, memory_monitor: nil, cleanup: task}}
+    {:reply, :ok, state}
   end
 
   @impl true
@@ -520,13 +548,33 @@ defmodule Eab.Runs do
 
   def handle_info({ref, _}, %{cleanup: %{ref: ref}} = state) do
     Process.demonitor(ref, [:flush])
+    state = %{state | cleanup: nil}
+    # The next run in a row was due while the last one's containers were still being removed.
+    state = if state.queue && state.queue.due, do: start_queued(state), else: state
     broadcast()
-    {:noreply, %{state | cleanup: nil}}
+    {:noreply, state}
   end
 
   def handle_info({:DOWN, ref, :process, _, reason}, %{cleanup: %{ref: ref}} = state) do
+    state = %{state | cleanup: nil, cleanup_error: inspect(reason)}
+
+    state =
+      if state.queue,
+        do: drop_queue(state, "Container cleanup failed. #{unstarted(state.queue)} not started."),
+        else: state
+
     broadcast()
-    {:noreply, %{state | cleanup: nil, cleanup_error: inspect(reason)}}
+    {:noreply, state}
+  end
+
+  def handle_info({:queued_run, token}, %{queue: %{token: token}} = state) do
+    state =
+      if is_nil(state.cleanup),
+        do: start_queued(state),
+        else: put_in(state.queue.due, true)
+
+    broadcast()
+    {:noreply, state}
   end
 
   def handle_info(_, state), do: {:noreply, state}
@@ -693,6 +741,161 @@ defmodule Eab.Runs do
     }
   end
 
+  # The settings of the runs that follow the first of `runs: n` in a row, and the pause
+  # between them. A run series takes one run per seed, so each run takes the next seed.
+  defp plan!(endpoint, settings, opts) do
+    {count, opts} = Keyword.pop(opts, :runs, 1)
+    {pause, opts} = Keyword.pop(opts, :pause_seconds, 60)
+
+    unless is_integer(count) and count in 1..Eab.Series.required(),
+      do: raise("Runs in a row must be a whole number from 1 to #{Eab.Series.required()}")
+
+    unless is_integer(pause) and pause in 0..3600,
+      do: raise("The pause between runs must be a whole number of seconds from 0 to 3600")
+
+    if count > 1 and (opts[:check] || opts[:speed] || opts[:validation]),
+      do: raise("Runs in a row are for full runs; start this kind of run one at a time")
+
+    later =
+      if count == 1 do
+        []
+      else
+        case Model.settings(endpoint, without_caps(endpoint, settings))["seed"] do
+          seed when is_integer(seed) ->
+            seeds = Eab.Series.seeds()
+            following = seeds |> Enum.drop_while(&(&1 != seed)) |> Enum.drop(1)
+
+            if length(following) < count - 1,
+              do:
+                raise(
+                  "Runs in a row take the seeds #{Enum.join(seeds, ", ")} in turn: " <>
+                    "seed #{seed} leaves room for #{length(following) + 1}, not #{count}"
+                )
+
+            for next <- Enum.take(following, count - 1), do: Map.put(settings, "seed", next)
+
+          _ ->
+            List.duplicate(settings, count - 1)
+        end
+      end
+
+    # A seed the series already has would only be refused hours later, at its run's start.
+    if opts[:series] do
+      release = Release.freeze()
+
+      for settings <- later do
+        settings = Model.settings(endpoint, without_caps(endpoint, settings))
+        Eab.Series.contribution!(new_run(release, endpoint, settings), opts[:series])
+      end
+    end
+
+    {opts, later, pause}
+  end
+
+  defp begin_run(endpoint, key, settings, opts, state) do
+    release = Release.freeze()
+
+    settings = Model.settings(endpoint, without_caps(endpoint, settings))
+
+    run =
+      release
+      |> new_run(endpoint, settings)
+      |> Map.put("parallel_attempts", parallel_attempts!(opts[:parallel_attempts] || 1))
+
+    run =
+      cond do
+        opts[:check] ->
+          check(run, endpoint, settings, release, opts[:check])
+
+        opts[:validation] ->
+          Map.put(run, "validation", true)
+
+        opts[:speed] && opts[:series] ->
+          raise "A speed run joins no run series; cancel the contribution first"
+
+        opts[:speed] ->
+          speed(run, endpoint, settings, release)
+
+        opts[:series] ->
+          Eab.Series.contribution!(run, opts[:series])
+          Map.put(run, "series", opts[:series])
+
+        true ->
+          run
+      end
+
+    Readiness.enforce!(run["cases"])
+    launch(run, key, state)
+  rescue
+    error -> {:reply, {:error, Exception.message(error)}, state}
+  end
+
+  defp advance_queue(%{queue: nil} = state, _run), do: state
+  defp advance_queue(%{queue: %{settings: []}} = state, _run), do: %{state | queue: nil}
+
+  defp advance_queue(%{queue: queue} = state, run) do
+    # A run that ended with evaluation errors still measured its other cases, so the row goes
+    # on. One that finished no case found nothing to run against: its successors would not either.
+    finished? = Enum.any?(Map.values(run["attempts"] || %{}), &(&1["status"] == "completed"))
+
+    if run["status"] == "completed" or (run["status"] == "error" and finished?) do
+      token = make_ref()
+      Process.send_after(self(), {:queued_run, token}, queue.pause_ms)
+      next_at = DateTime.add(DateTime.utc_now(), queue.pause_ms, :millisecond)
+      %{state | queue: %{queue | token: token, next_at: next_at, due: false}}
+    else
+      drop_queue(
+        state,
+        "Run #{queue.started} of #{queue.total} finished no case. #{unstarted(queue)} not started."
+      )
+    end
+  end
+
+  defp start_queued(%{queue: queue} = state) do
+    [settings | later] = queue.settings
+
+    queue = %{
+      queue
+      | settings: later,
+        started: queue.started + 1,
+        token: nil,
+        next_at: nil,
+        due: false
+    }
+
+    case begin_run(queue.endpoint, queue.key, settings, queue.opts, %{state | queue: queue}) do
+      {:reply, {:ok, _id}, state} ->
+        state
+
+      {:reply, {:error, message}, state} ->
+        drop_queue(
+          state,
+          "Run #{queue.started} of #{queue.total} could not start: #{message}. " <>
+            unstarted(%{queue | settings: [settings | later]}) <> " not started."
+        )
+    end
+  end
+
+  # A timer already set finds no queue with its token and is ignored.
+  defp drop_queue(state, note), do: %{state | queue: nil, queue_note: note}
+
+  defp unstarted(%{settings: [_]}), do: "The 1 remaining run was"
+  defp unstarted(%{settings: settings}), do: "The #{length(settings)} remaining runs were"
+
+  defp public_queue(nil), do: nil
+
+  defp public_queue(queue) do
+    %{
+      "total" => queue.total,
+      "started" => queue.started,
+      "remaining" => length(queue.settings),
+      "pause_seconds" => div(queue.pause_ms, 1000),
+      "next_at" => queue.next_at && DateTime.to_iso8601(queue.next_at),
+      "backend" => queue.endpoint["backend"],
+      "seeds" => for(s <- queue.settings, is_integer(s["seed"]), do: s["seed"])
+    }
+  end
+
   defp launch(run, key, state) do
     case MemoryMonitor.start(run, key) do
       {:ok, monitor, memory} ->
@@ -756,8 +959,11 @@ defmodule Eab.Runs do
         cleanup(run["id"])
       end)
 
+    state =
+      advance_queue(%{state | active: nil, worker: nil, memory_monitor: nil, cleanup: task}, run)
+
     broadcast()
-    {:noreply, %{state | active: nil, worker: nil, memory_monitor: nil, cleanup: task}}
+    {:noreply, state}
   end
 
   defp end_preparation(state, status, message) do

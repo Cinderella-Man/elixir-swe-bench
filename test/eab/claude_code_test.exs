@@ -1213,6 +1213,78 @@ defmodule Eab.ClaudeCodeTest do
     assert record["claude_code"]["claude_code_version"] == "2.1.308"
   end
 
+  # Polls until `condition` holds. (`cond || Process.sleep(10)` inside Enum.find does not
+  # wait: sleep returns :ok, which ends the search at once.)
+  defp eventually(condition, attempts \\ 1000) do
+    cond do
+      condition.() -> true
+      attempts == 0 -> flunk("The expected state was not reached")
+      true -> Process.sleep(10) && eventually(condition, attempts - 1)
+    end
+  end
+
+  test "between two Claude Code runs in a row the solver session keeps waiting" do
+    parent = self()
+
+    old =
+      Map.new(
+        [:runner, :cleanup, :claude_code_claim_wait_ms],
+        &{&1, Application.get_env(:eab, &1)}
+      )
+
+    Application.put_env(:eab, :cleanup, fn _ -> :ok end)
+    Application.put_env(:eab, :claude_code_claim_wait_ms, 200)
+
+    Application.put_env(:eab, :runner, fn run, _, progress ->
+      send(parent, {:started, self(), run})
+
+      receive do
+        :finish ->
+          progress.(%{
+            "case_result" =>
+              {hd(run["cases"]), %{"status" => "completed", "grade" => %{"passed" => true}}}
+          })
+
+          :ok
+      end
+    end)
+
+    idle = fn ->
+      eventually(fn ->
+        snapshot = Eab.Runs.snapshot()
+        is_nil(snapshot.active) and not snapshot.cleaning
+      end)
+    end
+
+    on_exit(fn ->
+      Eab.Runs.cancel_queue()
+      Eab.Runs.stop()
+      idle.()
+
+      for {k, v} <- old do
+        if v == nil, do: Application.delete_env(:eab, k), else: Application.put_env(:eab, k, v)
+      end
+    end)
+
+    endpoint = ClaudeCode.endpoint("claude-haiku-5-5")
+    assert {:ok, _} = Eab.Runs.start(endpoint, "", %{}, runs: 2, pause_seconds: 3600)
+    assert_receive {:started, worker, _}, 3000
+    send(worker, :finish)
+    idle.()
+    assert %{"remaining" => 1} = Eab.Runs.snapshot().queue
+
+    # No run is active, but the next is due: the session must not be told to stop.
+    denied = hook(agent_call("eab-haiku-5-5-max"))["hookSpecificOutput"]
+    assert denied["permissionDecision"] == "deny"
+    assert denied["permissionDecisionReason"] =~ "next run of this row"
+    assert denied["permissionDecisionReason"] =~ "keep waiting"
+
+    # Once the rest is cancelled there is nothing left to wait for.
+    Eab.Runs.cancel_queue()
+    denied = hook(agent_call("eab-haiku-5-5-max"))["hookSpecificOutput"]
+    assert denied["permissionDecisionReason"] =~ "No Claude Code run is active"
+  end
+
   test "without a waiting workspace the solver is told to wait or stop" do
     denied = hook(agent_call("eab-opus-5-5-xhigh"))["hookSpecificOutput"]
     assert denied["permissionDecision"] == "deny"

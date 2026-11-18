@@ -782,6 +782,102 @@ defmodule EabWeb.DashboardTest do
     assert run["selection"] == %{"kind" => "escape_test", "cases" => [id]}
   end
 
+  # Polls until `condition` holds. (`cond || Process.sleep(10)` inside Enum.find does not
+  # wait: sleep returns :ok, which ends the search at once.)
+  defp eventually(condition, attempts \\ 1000) do
+    cond do
+      condition.() -> true
+      attempts == 0 -> flunk("The expected state was not reached")
+      true -> Process.sleep(10) && eventually(condition, attempts - 1)
+    end
+  end
+
+  test "runs in a row are started from the dashboard, shown while they last and can be cancelled" do
+    parent = self()
+    old = Map.new([:runner, :cleanup], &{&1, Application.get_env(:eab, &1)})
+    Application.put_env(:eab, :cleanup, fn _ -> :ok end)
+
+    Application.put_env(:eab, :runner, fn run, _, progress ->
+      send(parent, {:started, self(), run})
+
+      receive do
+        :finish ->
+          progress.(%{
+            "case_result" =>
+              {hd(run["cases"]), %{"status" => "completed", "grade" => %{"passed" => true}}}
+          })
+
+          :ok
+      end
+    end)
+
+    idle = fn ->
+      eventually(fn ->
+        snapshot = Eab.Runs.snapshot()
+        is_nil(snapshot.active) and not snapshot.cleaning
+      end)
+    end
+
+    on_exit(fn ->
+      Eab.Runs.cancel_queue()
+      Eab.Runs.stop()
+      idle.()
+
+      for {k, v} <- old do
+        if v == nil, do: Application.delete_env(:eab, k), else: Application.put_env(:eab, k, v)
+      end
+    end)
+
+    {:ok, view, _} = live(build_conn(), "/")
+    view |> form("#provider-choice", provider: "claude_code") |> render_change()
+    view |> form("#claude-code-model-form", model: "claude-haiku-5-5") |> render_change()
+
+    # One run by default; the pause shows only when there is something to pause between.
+    assert has_element?(view, "#runs-in-row[value='1']")
+    refute has_element?(view, "#runs-pause")
+    assert has_element?(view, "#run", "Run benchmark")
+    view |> form("#runs-in-row-form", runs: "4") |> render_change()
+    assert has_element?(view, "#runs-in-row[value='1']")
+    view |> form("#runs-in-row-form", runs: "2") |> render_change()
+    assert has_element?(view, "#runs-pause[value='60']")
+    assert has_element?(view, "#run", "Run benchmark 2 times")
+    view |> form("#runs-in-row-form", runs: "2", pause: "0") |> render_change()
+    assert has_element?(view, "#runs-pause[value='0']")
+
+    view |> element("#run") |> render_click()
+    assert_receive {:started, worker, first}, 15_000
+    assert has_element?(view, "#run-queue", "run 1 of 2 is running")
+    assert has_element?(view, "#run-queue", "The next starts right after it ends.")
+    assert has_element?(view, "#cancel-queue")
+
+    send(worker, :finish)
+    assert_receive {:started, worker, second}, 15_000
+    assert second["id"] != first["id"]
+
+    eventually(fn -> has_element?(view, "#run-queue", "run 2 of 2") end)
+
+    assert has_element?(view, "#run-queue", "run 2 of 2 is running. It is the last.")
+    refute has_element?(view, "#cancel-queue")
+    send(worker, :finish)
+    idle.()
+    eventually(fn -> has_element?(view, "#run:not([disabled])") end)
+    refute has_element?(view, "#run-queue")
+    refute has_element?(view, "#run-queue-note")
+
+    # Cancelling the rest lets the run in progress finish alone.
+    view |> form("#runs-in-row-form", runs: "3", pause: "120") |> render_change()
+    view |> element("#run") |> render_click()
+    assert_receive {:started, worker, _}, 15_000
+    assert has_element?(view, "#run-queue", "The next starts 2 minutes after it ends.")
+    view |> element("#cancel-queue") |> render_click()
+    refute has_element?(view, "#run-queue")
+    assert has_element?(view, "#run-queue-note", "The 2 remaining runs were not started.")
+    assert Eab.Runs.snapshot().active
+    send(worker, :finish)
+    idle.()
+    refute_receive {:started, _, _}, 200
+  end
+
   test "clearing an endpoint cancels pending discovery and cannot restore its stale model" do
     parent = self()
 
