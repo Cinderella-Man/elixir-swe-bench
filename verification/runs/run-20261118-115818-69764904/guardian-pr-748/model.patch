@@ -1,0 +1,2233 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index eaea1db..a64585e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,25 @@
+ 
+ ## Unreleased
+ 
++### Enhancement
++
++* The `:secret` plug option may now be given as a function of arity 1, which is
++  called with the connection so that the secret can be chosen per request. It is
++  understood by `Guardian.Plug.VerifyHeader`, `Guardian.Plug.VerifySession`,
++  `Guardian.Plug.VerifyCookie` and `Guardian.Plug.SlidingCookie`, and by
++  `Guardian.Plug.sign_in/5`, `Guardian.Plug.remember_me/5` and
++  `Guardian.Plug.remember_me_from_token/5` (including the matching functions on
++  an implementation module's `MyApp.Guardian.Plug`), where the resolved secret is
++  used both to verify incoming tokens and to sign the tokens that are issued.
++  `Guardian.Plug.resolve_secret/2` is public so custom plugs can offer the same
++  option. A function of any other arity raises `ArgumentError`.
++* A `:secret` that is given explicitly and is `nil`, or that resolves to `nil`,
++  is now reported as `{:error, :secret_not_found}` instead of quietly falling
++  back to the implementation module's configured `:secret_key`. Only an omitted
++  `:secret` uses `:secret_key`. `Guardian.Token.JWT.decode_token/3` reports
++  `{:error, :secret_not_found}` rather than collapsing it into
++  `{:error, :invalid_token}`.
++
+ ## v2.4.1
+ 
+ ### Security
+diff --git a/guides/plug/pipelines.md b/guides/plug/pipelines.md
+index b7fd04b..f8e1075 100644
+--- a/guides/plug/pipelines.md
++++ b/guides/plug/pipelines.md
+@@ -185,3 +185,74 @@ end
+ ```
+ 
+ Using these two pipelines should give you plenty of mileage in your router. Remember that the pipeline applies downstream so you can change out the module or error handler anywhere downstream including your controllers.
++
++## Choosing the secret per request
++
++The `:secret` option usually names one signing secret for the whole
++application. In a multi-tenant application each tenant has its own secret and
++you only know which tenant a request belongs to after an earlier plug has run,
++for example by assigning the tenant key to `conn.assigns`.
++
++For that case `Guardian.Plug.VerifyHeader`, `Guardian.Plug.VerifySession`,
++`Guardian.Plug.VerifyCookie` and `Guardian.Plug.SlidingCookie` accept a
++function of arity 1 as `:secret`. It is called with the current `Plug.Conn` and
++its return value is the secret used for that operation:
++
++```elixir
++defmodule MyApp.Secrets do
++  def for_conn(conn), do: conn.assigns[:tenant_secret]
++end
++
++plug MyAppWeb.LoadTenant
++
++plug Guardian.Plug.VerifyHeader, secret: &MyApp.Secrets.for_conn/1
++```
++
++A remote capture like `&MyApp.Secrets.for_conn/1` can be used in a compiled
++pipeline (`Plug.Builder`, Phoenix router pipelines). Anonymous functions can
++not be escaped into a compiled pipeline, they only work when the plug is called
++directly.
++
++The same option is understood when issuing tokens:
++
++```elixir
++conn
++|> MyApp.Guardian.Plug.sign_in(user, %{}, secret: &MyApp.Secrets.for_conn/1)
++|> MyApp.Guardian.Plug.remember_me(user, %{}, secret: &MyApp.Secrets.for_conn/1)
++
++plug Guardian.Plug.SlidingCookie, secret: &MyApp.Secrets.for_conn/1
++```
++
++`remember_me_from_token` uses the resolved secret both to verify the token it
++was given and to sign the new cookie, `SlidingCookie` uses it to verify the
++current cookie and to sign its replacement, and `VerifyCookie` uses it to
++verify the refresh cookie and to sign the access token it is exchanged for.
++
++Notes:
++
++* A `:secret` function is only called once a token has been found. A request
++  without a token never calls it. It may be called more than once in a request,
++  so it should be a cheap read from the connection.
++* Only functions of arity 1 are supported. Any other arity is a configuration
++  error and raises `ArgumentError`. Exceptions raised inside the function
++  propagate to the caller, they are not reported as authentication errors.
++* `:refresh_from_cookie` keeps its own option list. A `:secret` given to the
++  plug is not inherited by the refresh, set it in both places to refresh with a
++  per request secret:
++
++  ```elixir
++  plug Guardian.Plug.VerifyHeader,
++    secret: &MyApp.Secrets.for_conn/1,
++    refresh_from_cookie: [secret: &MyApp.Secrets.for_conn/1]
++  ```
++
++* If a secret cannot be found the request fails closed: the verify plugs report
++  `{:invalid_token, :secret_not_found}` to the error handler, the issuing
++  functions report `{:unauthenticated, {:error, :secret_not_found}}` and issue
++  nothing, and `SlidingCookie` leaves the request unchanged. Guardian never
++  falls back to the configured `:secret_key` for a `:secret` that was given
++  explicitly. Only an omitted `:secret` uses `:secret_key`.
++
++`Guardian.Plug.resolve_secret/2` is public so custom plugs can offer the same
++option. It returns the options with a one argument `:secret` function replaced
++by its result for the connection, every other form is left as it is.
+diff --git a/lib/guardian/plug.ex b/lib/guardian/plug.ex
+index 637f83f..f65bcee 100644
+--- a/lib/guardian/plug.ex
++++ b/lib/guardian/plug.ex
+@@ -200,8 +200,53 @@ if Code.ensure_loaded?(Plug) do
+       |> configure_session(renew: true)
+     end
+ 
++    @doc """
++    Resolves the `:secret` option for the given connection.
++
++    The `:secret` option may be given as:
++
++    * omitted - the implementation module's configured `:secret_key` is used
++    * a static value (a string, a JWK map or a `JOSE.JWK`) - used as is
++    * `{module, function, args}` - resolved by the token module, the connection
++      is not passed along
++    * a function of arity 1 - called with the `Plug.Conn.t`, its return value is
++      the secret to use for the operation
++
++    Only the function form is resolved here. Every other form is returned
++    unchanged. When the function returns `nil` the `:secret` is kept in the
++    options with the value `nil`, which the token module treats as a missing
++    secret (`{:error, :secret_not_found}`).
++
++    A function of any other arity is a configuration error and raises
++    `ArgumentError`. Exceptions raised by the function propagate to the caller.
++
++    ```elixir
++    defmodule MyApp.Secrets do
++      def for_conn(conn), do: conn.assigns[:tenant_secret]
++    end
++
++    plug Guardian.Plug.VerifyHeader, secret: &MyApp.Secrets.for_conn/1
++    ```
++    """
++
++    @spec resolve_secret(Plug.Conn.t(), Guardian.options()) :: Guardian.options()
++    def resolve_secret(conn, opts) do
++      case Keyword.fetch(opts, :secret) do
++        {:ok, secret} when is_function(secret, 1) -> Keyword.put(opts, :secret, secret.(conn))
++        {:ok, secret} when is_function(secret) -> raise ArgumentError, bad_secret_function_message(secret)
++        _ -> opts
++      end
++    end
++
++    defp bad_secret_function_message(secret) do
++      "The `:secret` option may only be given as a function of arity 1 " <>
++        "(it is called with the connection), got: #{inspect(secret)}"
++    end
++
+     @spec sign_in(Plug.Conn.t(), module, any, Guardian.Token.claims(), Guardian.options()) :: Plug.Conn.t()
+     def sign_in(conn, impl, resource, claims \\ %{}, opts \\ []) do
++      opts = resolve_secret(conn, opts)
++
+       with {:ok, token, full_claims} <- Guardian.encode_and_sign(impl, resource, claims, opts),
+            {:ok, conn} <- add_data_to_conn(conn, resource, token, full_claims, opts),
+            {:ok, conn} <- returning_tuple({impl, :after_sign_in, [conn, resource, token, full_claims, opts]}) do
+@@ -269,6 +314,7 @@ if Code.ensure_loaded?(Plug) do
+     @spec remember_me(Plug.Conn.t(), module, any, Guardian.Token.claims(), Guardian.options()) :: Plug.Conn.t()
+     def remember_me(conn, mod, resource, claims \\ %{}, opts \\ []) do
+       opts = Keyword.put_new(opts, :token_type, "refresh")
++      opts = resolve_secret(conn, opts)
+       key = fetch_token_key(conn, opts)
+ 
+       case Guardian.encode_and_sign(mod, resource, claims, opts) do
+@@ -288,6 +334,7 @@ if Code.ensure_loaded?(Plug) do
+             Guardian.options()
+           ) :: Plug.Conn.t()
+     def remember_me_from_token(conn, mod, token, claims_to_check \\ %{}, opts \\ []) do
++      opts = resolve_secret(conn, opts)
+       token_type = Keyword.get(opts, :token_type, "refresh")
+       key = fetch_token_key(conn, opts)
+ 
+diff --git a/lib/guardian/plug/sliding_cookie.ex b/lib/guardian/plug/sliding_cookie.ex
+index ea6cfee..5cc5484 100644
+--- a/lib/guardian/plug/sliding_cookie.ex
++++ b/lib/guardian/plug/sliding_cookie.ex
+@@ -52,6 +52,10 @@ if Code.ensure_loaded?(Plug) do
+     Options:
+ 
+     * `:key` - The location of the token (default `:default`)
++    * `:secret` - The secret used to verify the cookie token and to sign its
++      replacement. It may be given as a static value, as `{module, function, args}`
++      or as a function of arity 1 which is called with the connection once a cookie
++      token has been found. See `Guardian.Plug.resolve_secret/2`.
+     * `:sliding_cookie` - The minimum TTL remaining after which a replacement
+       will be issued. Defaults to configured values.
+     * `:halt` - Whether to halt the connection in case of error. Defaults to `true`.
+@@ -84,13 +88,14 @@ if Code.ensure_loaded?(Plug) do
+     def call(conn, opts) do
+       with {:ok, token} <- find_token_from_cookies(conn, opts),
+            module <- Pipeline.fetch_module!(conn, opts),
++           cookie_opts <- Guardian.Plug.resolve_secret(conn, opts),
+            {:ok, ttl_softlimit} <- sliding_window(module, opts),
+-           {:ok, %{"exp" => exp} = claims} <- decode_and_verify(module, token, %{}, opts),
++           {:ok, %{"exp" => exp} = claims} <- decode_and_verify(module, token, %{}, cookie_opts),
+            {:ok, resource} <- module.resource_from_claims(claims),
+            true <- timestamp() >= exp - ttl_softlimit,
+            {:ok, new_c} <- module.sliding_cookie(claims, resource, opts) do
+         conn
+-        |> Guardian.Plug.remember_me(module, resource, proc_new_claims(new_c, claims), opts)
++        |> Guardian.Plug.remember_me(module, resource, proc_new_claims(new_c, claims), cookie_opts)
+       else
+         {:error, :not_implemented} ->
+           conn
+diff --git a/lib/guardian/plug/verify_cookie.ex b/lib/guardian/plug/verify_cookie.ex
+index 729794a..11192f7 100644
+--- a/lib/guardian/plug/verify_cookie.ex
++++ b/lib/guardian/plug/verify_cookie.ex
+@@ -40,6 +40,11 @@ if Code.ensure_loaded?(Plug) do
+     Options:
+ 
+     * `:key` - The location of the token (default `:default`)
++    * `:secret` - The secret used to verify the cookie token and to sign the
++      exchanged access token. It may be given as a static value, as
++      `{module, function, args}` or as a function of arity 1 which is called with
++      the connection once a cookie token has been found.
++      See `Guardian.Plug.resolve_secret/2`.
+     * `:exchange_from` - The type of the cookie (default `"refresh"`)
+     * `:exchange_to` - The type of token to provide. Defaults to the
+       implementation modules `default_type`
+@@ -76,6 +81,7 @@ if Code.ensure_loaded?(Plug) do
+       with nil <- Guardian.Plug.current_token(conn, opts),
+            {:ok, token} <- find_token_from_cookies(conn, opts),
+            module <- Pipeline.fetch_module!(conn, opts),
++           exchange_opts <- Guardian.Plug.resolve_secret(conn, opts),
+            key <- storage_key(conn, opts),
+            exchange_from <-
+              Keyword.get(opts, :exchange_from, "refresh"),
+@@ -83,7 +89,7 @@ if Code.ensure_loaded?(Plug) do
+            exchange_to <- Keyword.get(opts, :exchange_to, default_type),
+            active_session? <- Guardian.Plug.session_active?(conn),
+            {:ok, _old, {new_t, new_c}} <-
+-             Guardian.exchange(module, token, exchange_from, exchange_to, opts) do
++             Guardian.exchange(module, token, exchange_from, exchange_to, exchange_opts) do
+         conn
+         |> Guardian.Plug.put_current_token(new_t, key: key)
+         |> Guardian.Plug.put_current_claims(new_c, key: key)
+diff --git a/lib/guardian/plug/verify_header.ex b/lib/guardian/plug/verify_header.ex
+index 3fe88a0..7cd5c4c 100644
+--- a/lib/guardian/plug/verify_header.ex
++++ b/lib/guardian/plug/verify_header.ex
+@@ -36,6 +36,10 @@ if Code.ensure_loaded?(Plug) do
+       `:none` will not use a prefix.
+     * `key` - The location to store the information in the connection. Defaults to: `default`
+     * `halt` - Whether to halt the connection in case of error. Defaults to `true`.
++    * `:secret` - The secret to verify the token with. It may be given as a static
++      value, as `{module, function, args}` or as a function of arity 1 which is
++      called with the connection once a token has been found.
++      See `Guardian.Plug.resolve_secret/2`.
+     * `:refresh_from_cookie` - Looks for and validates a token found in the request cookies. (default `false`)
+ 
+     Refresh from cookie option
+@@ -87,9 +91,10 @@ if Code.ensure_loaded?(Plug) do
+       with nil <- Guardian.Plug.current_token(conn, opts),
+            {:ok, token} <- fetch_token_from_header(conn, opts),
+            module <- Pipeline.fetch_module!(conn, opts),
++           verify_opts <- Guardian.Plug.resolve_secret(conn, opts),
+            claims_to_check <- Keyword.get(opts, :claims, %{}),
+            key <- storage_key(conn, opts),
+-           {:ok, claims} <- Guardian.decode_and_verify(module, token, claims_to_check, opts) do
++           {:ok, claims} <- Guardian.decode_and_verify(module, token, claims_to_check, verify_opts) do
+         conn
+         |> Guardian.Plug.put_current_token(token, key: key)
+         |> Guardian.Plug.put_current_claims(claims, key: key)
+diff --git a/lib/guardian/plug/verify_session.ex b/lib/guardian/plug/verify_session.ex
+index 9260bed..bb543ca 100644
+--- a/lib/guardian/plug/verify_session.ex
++++ b/lib/guardian/plug/verify_session.ex
+@@ -30,6 +30,10 @@ if Code.ensure_loaded?(Plug) do
+ 
+     Options:
+ 
++    * `:secret` - The secret to verify the token with. It may be given as a static
++      value, as `{module, function, args}` or as a function of arity 1 which is
++      called with the connection once a token has been found.
++      See `Guardian.Plug.resolve_secret/2`.
+     * `:refresh_from_cookie` - Looks for and validates a token found in the request cookies. (default `false`)
+ 
+     Refresh from cookie option
+@@ -67,9 +71,10 @@ if Code.ensure_loaded?(Plug) do
+       with nil <- Guardian.Plug.current_token(conn, opts),
+            {:ok, token} <- find_token_from_session(conn, opts),
+            module <- Pipeline.fetch_module!(conn, opts),
++           verify_opts <- Guardian.Plug.resolve_secret(conn, opts),
+            claims_to_check <- Keyword.get(opts, :claims, %{}),
+            key <- storage_key(conn, opts),
+-           {:ok, claims} <- Guardian.decode_and_verify(module, token, claims_to_check, opts) do
++           {:ok, claims} <- Guardian.decode_and_verify(module, token, claims_to_check, verify_opts) do
+         conn
+         |> Guardian.Plug.put_current_token(token, key: key)
+         |> Guardian.Plug.put_current_claims(claims, key: key)
+diff --git a/lib/guardian/token/jwt.ex b/lib/guardian/token/jwt.ex
+index dac5988..aaf2c69 100644
+--- a/lib/guardian/token/jwt.ex
++++ b/lib/guardian/token/jwt.ex
+@@ -210,24 +210,23 @@ defmodule Guardian.Token.Jwt do
+     use Guardian.Token.Jwt.SecretFetcher
+ 
+     def fetch_signing_secret(mod, opts) do
+-      secret = Keyword.get(opts, :secret)
+-      secret = Config.resolve_value(secret) || apply(mod, :config, [:secret_key])
+-
+-      case secret do
+-        nil -> {:error, :secret_not_found}
+-        val -> {:ok, val}
++      case Keyword.fetch(opts, :secret) do
++        {:ok, secret} -> secret_or_not_found(Config.resolve_value(secret))
++        :error -> secret_or_not_found(apply(mod, :config, [:secret_key]))
+       end
+     end
+ 
+     def fetch_verifying_secret(mod, _token_headers, opts) do
+-      secret = Keyword.get(opts, :secret)
+-      secret = Config.resolve_value(secret) || mod.config(:secret_key)
+-
+-      case secret do
+-        nil -> {:error, :secret_not_found}
+-        val -> {:ok, val}
++      case Keyword.fetch(opts, :secret) do
++        {:ok, secret} -> secret_or_not_found(Config.resolve_value(secret))
++        :error -> secret_or_not_found(mod.config(:secret_key))
+       end
+     end
++
++    # An explicitly provided secret that resolves to `nil` is a missing secret.
++    # It never falls back to the implementation module's configured `secret_key`.
++    defp secret_or_not_found(nil), do: {:error, :secret_not_found}
++    defp secret_or_not_found(secret), do: {:ok, secret}
+   end
+ 
+   @doc """
+@@ -318,6 +317,10 @@ defmodule Guardian.Token.Jwt do
+ 
+   * `secret` - Override the configured secret. `Guardian.Config.config_value` is valid
+   * `allowed_algos` - A list of allowable algos
++
++  When the secret cannot be found (an explicit `nil` secret, or one that
++  resolves to `nil`) the result is `{:error, :secret_not_found}`. A secret that
++  is found but does not match the signature is `{:error, :invalid_token}`.
+   """
+   def decode_token(mod, token, options \\ []) do
+     with {:ok, secret_fetcher} <- fetch_secret_fetcher(mod),
+@@ -332,6 +335,7 @@ defmodule Guardian.Token.Jwt do
+         {false, _, _} -> {:error, :invalid_token}
+       end
+     else
++      {:error, :secret_not_found} = err -> err
+       _ -> {:error, :invalid_token}
+     end
+   end
+diff --git a/test/guardian/plug/sliding_cookie_test.exs b/test/guardian/plug/sliding_cookie_test.exs
+index b31ebde..8d3cbff 100644
+--- a/test/guardian/plug/sliding_cookie_test.exs
++++ b/test/guardian/plug/sliding_cookie_test.exs
+@@ -255,4 +255,215 @@ defmodule Guardian.Plug.SlidingCookieTest do
+                __MODULE__.Impl.decode_and_verify(conn.resp_cookies["guardian_default_token"].value)
+     end
+   end
++
++  describe "with a secret that is resolved from the connection" do
++    @sliding_resource %{id: "bobby"}
++    @tenant_secret "tenant-secret-k-a"
++    @other_tenant_secret "tenant-secret-k-b"
++    @configured_secret "configured-secret-key"
++
++    defmodule PerRequestSecrets do
++      @moduledoc false
++
++      def for_conn(conn), do: conn.assigns[:tenant_secret]
++
++      def notify(conn) do
++        send(conn.assigns[:notify_pid], :secret_resolved)
++        conn.assigns[:tenant_secret]
++      end
++
++      def boom(_conn), do: raise("boom from the secret function")
++
++      def no_arity, do: "not a per request secret"
++
++      def nil_secret, do: nil
++    end
++
++    defmodule PerRequestImpl do
++      @moduledoc false
++
++      use Guardian,
++        otp_app: :guardian,
++        token_module: Guardian.Token.Jwt,
++        secret_key: "configured-secret-key",
++        allowed_algos: ["HS512"],
++        ttl: {4, :weeks},
++        token_ttl: %{
++          "access" => {1, :day},
++          "refresh" => {2, :weeks}
++        }
++
++      def subject_for_token(%{id: id}, _claims), do: {:ok, "User:#{id}"}
++      def resource_from_claims(%{"sub" => "User:" <> sub}), do: {:ok, %{id: sub}}
++      def sliding_cookie(_claims, _resource, _opts), do: {:ok, %{"new" => "claim"}}
++    end
++
++    defmodule CompiledPipeline do
++      @moduledoc false
++
++      use Guardian.Plug.Pipeline,
++        otp_app: :guardian,
++        module: Guardian.Plug.SlidingCookieTest.PerRequestImpl,
++        error_handler: Guardian.Plug.SlidingCookieTest.Handler
++
++      plug(Guardian.Plug.SlidingCookie,
++        secret: &Guardian.Plug.SlidingCookieTest.PerRequestSecrets.for_conn/1,
++        sliding_cookie: {30, :seconds}
++      )
++    end
++
++    defp sliding_conn(secret, secret_key \\ @tenant_secret) do
++      iat = Guardian.timestamp() - 110
++      exp = Guardian.timestamp() + 10
++
++      {:ok, token, _claims} =
++        PerRequestImpl.encode_and_sign(@sliding_resource, %{"iat" => iat, "exp" => exp},
++          token_type: "refresh",
++          secret: secret_key
++        )
++
++      conn =
++        conn(:get, "/")
++        |> Pipeline.put_module(PerRequestImpl)
++        |> Pipeline.put_error_handler(__MODULE__.Handler)
++        |> put_req_cookie("guardian_default_token", token)
++        |> fetch_cookies()
++
++      if is_nil(secret) do
++        conn
++      else
++        assign(conn, :tenant_secret, secret)
++      end
++    end
++
++    defp slide_with(conn, secret) do
++      SlidingCookie.call(conn, secret: secret, sliding_cookie: {30, :seconds})
++    end
++
++    test "the replacement cookie is signed with the secret from the connection" do
++      conn =
++        @tenant_secret
++        |> sliding_conn()
++        |> slide_with(&PerRequestSecrets.for_conn/1)
++
++      refute conn.halted
++      refute conn.status == 401
++
++      replacement = conn.resp_cookies["guardian_default_token"].value
++      assert replacement
++      assert {:ok, claims} = PerRequestImpl.decode_and_verify(replacement, %{}, secret: @tenant_secret)
++      assert %{"new" => "claim", "sub" => "User:bobby", "typ" => "refresh"} = claims
++      assert {:error, :invalid_token} = PerRequestImpl.decode_and_verify(replacement)
++    end
++
++    test "when the connection has no secret the request continues and the cookie is left alone" do
++      input = sliding_conn(nil, @configured_secret)
++
++      conn = slide_with(input, &PerRequestSecrets.for_conn/1)
++
++      assert conn === input
++      assert conn.resp_cookies == %{}
++      refute conn.halted
++      refute conn.status == 401
++    end
++
++    test "an explicit nil secret does not re-sign the cookie with the configured secret_key" do
++      conn =
++        sliding_conn(nil, @configured_secret)
++        |> slide_with(nil)
++
++      assert conn.resp_cookies == %{}
++      refute conn.halted
++      refute conn.status == 401
++    end
++
++    test "a {module, function, args} secret resolving to nil leaves the request unchanged" do
++      conn =
++        sliding_conn(nil, @configured_secret)
++        |> slide_with({PerRequestSecrets, :nil_secret, []})
++
++      assert conn.resp_cookies == %{}
++      refute conn.halted
++      refute conn.status == 401
++    end
++
++    test "a cookie signed for another tenant is left alone" do
++      input = sliding_conn(@tenant_secret, @other_tenant_secret)
++
++      conn = slide_with(input, &PerRequestSecrets.for_conn/1)
++
++      assert conn === input
++      assert conn.resp_cookies == %{}
++      refute conn.halted
++    end
++
++    test "the secret function is not called when there is no cookie token" do
++      conn =
++        conn(:get, "/")
++        |> Pipeline.put_module(PerRequestImpl)
++        |> Pipeline.put_error_handler(__MODULE__.Handler)
++        |> assign(:notify_pid, self())
++        |> assign(:tenant_secret, @tenant_secret)
++        |> fetch_cookies()
++        |> SlidingCookie.call(secret: &PerRequestSecrets.notify/1, sliding_cookie: {30, :seconds})
++
++      refute conn.halted
++      assert conn.resp_cookies == %{}
++      refute_received :secret_resolved
++    end
++
++    test "the secret function is called once per plug call" do
++      conn =
++        @tenant_secret
++        |> sliding_conn()
++        |> assign(:notify_pid, self())
++        |> slide_with(&PerRequestSecrets.notify/1)
++
++      assert conn.resp_cookies["guardian_default_token"]
++      assert_received :secret_resolved
++      refute_received :secret_resolved
++    end
++
++    test "a secret function of any other arity is a configuration error" do
++      conn =
++        @tenant_secret
++        |> sliding_conn()
++
++      assert_raise ArgumentError, fn ->
++        SlidingCookie.call(conn, secret: &PerRequestSecrets.no_arity/0, sliding_cookie: {30, :seconds})
++      end
++    end
++
++    test "an exception raised in the secret function propagates to the caller" do
++      conn =
++        @tenant_secret
++        |> sliding_conn()
++
++      assert_raise RuntimeError, "boom from the secret function", fn ->
++        SlidingCookie.call(conn, secret: &PerRequestSecrets.boom/1, sliding_cookie: {30, :seconds})
++      end
++    end
++
++    test "a static secret still slides the cookie" do
++      conn =
++        @tenant_secret
++        |> sliding_conn()
++        |> slide_with(@tenant_secret)
++
++      replacement = conn.resp_cookies["guardian_default_token"].value
++      assert {:ok, %{"new" => "claim"}} = PerRequestImpl.decode_and_verify(replacement, %{}, secret: @tenant_secret)
++    end
++
++    test "in a compiled pipeline: the remote capture is called with the connection" do
++      conn =
++        @tenant_secret
++        |> sliding_conn()
++        |> CompiledPipeline.call(CompiledPipeline.init([]))
++
++      replacement = conn.resp_cookies["guardian_default_token"].value
++      assert replacement
++      assert {:ok, %{"typ" => "refresh"}} = PerRequestImpl.decode_and_verify(replacement, %{}, secret: @tenant_secret)
++      assert {:error, :invalid_token} = PerRequestImpl.decode_and_verify(replacement)
++    end
++  end
+ end
+diff --git a/test/guardian/plug/verify_cookie_test.exs b/test/guardian/plug/verify_cookie_test.exs
+index 34f20e9..5e8454e 100644
+--- a/test/guardian/plug/verify_cookie_test.exs
++++ b/test/guardian/plug/verify_cookie_test.exs
+@@ -174,4 +174,250 @@ defmodule Guardian.Plug.VerifyCookieTest do
+       refute new_conn.status == 401
+     end
+   end
++
++  describe "with a secret that is resolved from the connection" do
++    @cookie_resource %{id: "bobby"}
++    @tenant_secret "tenant-secret-k-a"
++    @other_tenant_secret "tenant-secret-k-b"
++
++    defmodule PerRequestSecrets do
++      @moduledoc false
++
++      def for_conn(conn), do: conn.assigns[:tenant_secret]
++
++      def notify(conn) do
++        send(conn.assigns[:notify_pid], :secret_resolved)
++        conn.assigns[:tenant_secret]
++      end
++
++      def boom(_conn), do: raise("boom from the secret function")
++
++      def no_arity, do: "not a per request secret"
++
++      def nil_secret, do: nil
++    end
++
++    defmodule PerRequestImpl do
++      @moduledoc false
++
++      use Guardian,
++        otp_app: :guardian,
++        token_module: Guardian.Token.Jwt,
++        secret_key: "configured-secret-key",
++        allowed_algos: ["HS512"],
++        ttl: {4, :weeks},
++        token_ttl: %{
++          "access" => {1, :day},
++          "refresh" => {2, :weeks}
++        }
++
++      def subject_for_token(%{id: id}, _claims), do: {:ok, "User:#{id}"}
++      def resource_from_claims(%{"sub" => "User:" <> sub}), do: {:ok, %{id: sub}}
++    end
++
++    defmodule CompiledPipeline do
++      @moduledoc false
++
++      use Guardian.Plug.Pipeline,
++        otp_app: :guardian,
++        module: Guardian.Plug.VerifyCookieTest.PerRequestImpl,
++        error_handler: Guardian.Plug.VerifyCookieTest.Handler
++
++      plug(Guardian.Plug.VerifyCookie,
++        secret: &Guardian.Plug.VerifyCookieTest.PerRequestSecrets.for_conn/1
++      )
++    end
++
++    defp cookie_conn(secret) do
++      {:ok, refresh_token, _} =
++        PerRequestImpl.encode_and_sign(@cookie_resource, %{}, token_type: "refresh", secret: @tenant_secret)
++
++      conn =
++        conn(:get, "/")
++        |> put_req_cookie("guardian_default_token", refresh_token)
++        |> fetch_cookies()
++
++      if is_nil(secret) do
++        conn
++      else
++        assign(conn, :tenant_secret, secret)
++      end
++    end
++
++    defp verify_with(conn, secret) do
++      VerifyCookie.call(conn, secret: secret, module: PerRequestImpl, error_handler: __MODULE__.Handler)
++    end
++
++    test "verifies the cookie and signs the exchanged token with the connection secret" do
++      conn =
++        @tenant_secret
++        |> cookie_conn()
++        |> verify_with(&PerRequestSecrets.for_conn/1)
++
++      refute conn.status == 401
++      refute conn.halted
++
++      new_token = Guardian.Plug.current_token(conn)
++      assert new_token
++      assert {:ok, claims} = PerRequestImpl.decode_and_verify(new_token, %{}, secret: @tenant_secret)
++      assert %{"sub" => "User:bobby", "typ" => "access"} = claims
++      assert {:error, :invalid_token} = PerRequestImpl.decode_and_verify(new_token)
++      assert Guardian.Plug.current_claims(conn)["sub"] == "User:bobby"
++    end
++
++    test "a cookie signed for another tenant is rejected" do
++      {:ok, other_token, _} =
++        PerRequestImpl.encode_and_sign(@cookie_resource, %{}, token_type: "refresh", secret: @other_tenant_secret)
++
++      conn =
++        conn(:get, "/")
++        |> put_req_cookie("guardian_default_token", other_token)
++        |> fetch_cookies()
++        |> assign(:tenant_secret, @tenant_secret)
++        |> verify_with(&PerRequestSecrets.for_conn/1)
++
++      assert conn.halted
++      assert conn.status == 401
++      assert conn.resp_body == inspect({:invalid_token, :invalid_token})
++      refute Guardian.Plug.current_token(conn)
++    end
++
++    test "when the connection has no secret it does not fall back to the configured secret_key" do
++      {:ok, configured_token, _} = PerRequestImpl.encode_and_sign(@cookie_resource, %{}, token_type: "refresh")
++
++      conn =
++        conn(:get, "/")
++        |> put_req_cookie("guardian_default_token", configured_token)
++        |> fetch_cookies()
++        |> verify_with(&PerRequestSecrets.for_conn/1)
++
++      assert conn.halted
++      assert conn.status == 401
++      assert conn.resp_body == inspect({:invalid_token, :secret_not_found})
++      refute Guardian.Plug.current_token(conn)
++      refute Guardian.Plug.current_claims(conn)
++    end
++
++    test "an explicit nil secret does not fall back to the configured secret_key" do
++      {:ok, configured_token, _} = PerRequestImpl.encode_and_sign(@cookie_resource, %{}, token_type: "refresh")
++
++      conn =
++        conn(:get, "/")
++        |> put_req_cookie("guardian_default_token", configured_token)
++        |> fetch_cookies()
++        |> verify_with(nil)
++
++      assert conn.status == 401
++      assert conn.resp_body == inspect({:invalid_token, :secret_not_found})
++      refute Guardian.Plug.current_token(conn)
++    end
++
++    test "a {module, function, args} secret resolving to nil does not fall back" do
++      {:ok, configured_token, _} = PerRequestImpl.encode_and_sign(@cookie_resource, %{}, token_type: "refresh")
++
++      conn =
++        conn(:get, "/")
++        |> put_req_cookie("guardian_default_token", configured_token)
++        |> fetch_cookies()
++        |> verify_with({PerRequestSecrets, :nil_secret, []})
++
++      assert conn.status == 401
++      assert conn.resp_body == inspect({:invalid_token, :secret_not_found})
++      refute Guardian.Plug.current_token(conn)
++    end
++
++    test "the secret function is not called when there is no cookie" do
++      conn =
++        conn(:get, "/")
++        |> assign(:notify_pid, self())
++        |> assign(:tenant_secret, @tenant_secret)
++        |> fetch_cookies()
++        |> verify_with(&PerRequestSecrets.notify/1)
++
++      refute conn.halted
++      refute conn.status == 401
++      refute_received :secret_resolved
++    end
++
++    test "the secret function is called once per plug call" do
++      conn =
++        @tenant_secret
++        |> cookie_conn()
++        |> assign(:notify_pid, self())
++        |> verify_with(&PerRequestSecrets.notify/1)
++
++      refute conn.halted
++      assert Guardian.Plug.current_token(conn)
++      assert_received :secret_resolved
++      refute_received :secret_resolved
++    end
++
++    test "a secret function of any other arity is a configuration error" do
++      conn =
++        @tenant_secret
++        |> cookie_conn()
++
++      assert_raise ArgumentError, fn ->
++        VerifyCookie.call(conn,
++          module: PerRequestImpl,
++          error_handler: __MODULE__.Handler,
++          secret: &PerRequestSecrets.no_arity/0
++        )
++      end
++    end
++
++    test "an exception raised in the secret function propagates to the caller" do
++      conn =
++        @tenant_secret
++        |> cookie_conn()
++
++      assert_raise RuntimeError, "boom from the secret function", fn ->
++        VerifyCookie.call(conn,
++          module: PerRequestImpl,
++          error_handler: __MODULE__.Handler,
++          secret: &PerRequestSecrets.boom/1
++        )
++      end
++    end
++
++    test "a static secret still verifies and signs" do
++      conn =
++        @tenant_secret
++        |> cookie_conn()
++        |> verify_with(@tenant_secret)
++
++      refute conn.status == 401
++
++      assert {:ok, %{"typ" => "access"}} =
++               PerRequestImpl.decode_and_verify(Guardian.Plug.current_token(conn), %{}, secret: @tenant_secret)
++    end
++
++    test "in a compiled pipeline: the remote capture is called with the connection" do
++      conn =
++        @tenant_secret
++        |> cookie_conn()
++        |> CompiledPipeline.call(CompiledPipeline.init([]))
++
++      refute conn.status == 401
++      refute conn.halted
++      new_token = Guardian.Plug.current_token(conn)
++      assert new_token
++      assert {:ok, %{"typ" => "access"}} = PerRequestImpl.decode_and_verify(new_token, %{}, secret: @tenant_secret)
++    end
++
++    test "in a compiled pipeline: without a secret on the connection the cookie is not exchanged" do
++      {:ok, configured_token, _} = PerRequestImpl.encode_and_sign(@cookie_resource, %{}, token_type: "refresh")
++
++      conn =
++        conn(:get, "/")
++        |> put_req_cookie("guardian_default_token", configured_token)
++        |> fetch_cookies()
++        |> CompiledPipeline.call(CompiledPipeline.init([]))
++
++      assert conn.halted
++      assert conn.status == 401
++      assert conn.resp_body == inspect({:invalid_token, :secret_not_found})
++      refute Guardian.Plug.current_token(conn)
++    end
++  end
+ end
+diff --git a/test/guardian/plug/verify_header_test.exs b/test/guardian/plug/verify_header_test.exs
+index c0b4ae3..6af3a67 100644
+--- a/test/guardian/plug/verify_header_test.exs
++++ b/test/guardian/plug/verify_header_test.exs
+@@ -354,4 +354,510 @@ defmodule Guardian.Plug.VerifyHeaderTest do
+       assert %{"sub" => "User:jane", "typ" => "access"} = Guardian.Plug.current_claims(conn)
+     end
+   end
++
++  describe "with a secret that is resolved from the connection" do
++    @pr_resource %{id: "bobby"}
++    @tenant_secret "tenant-secret-k-a"
++    @other_tenant_secret "tenant-secret-k-b"
++    @configured_secret "configured-secret-key"
++
++    defmodule PerRequestSecrets do
++      @moduledoc false
++
++      def for_conn(conn), do: conn.assigns[:tenant_secret]
++
++      def notify(conn) do
++        send(conn.assigns[:notify_pid], :secret_resolved)
++        conn.assigns[:tenant_secret]
++      end
++
++      def boom(_conn), do: raise("boom from the secret function")
++
++      def no_arity, do: "not a per request secret"
++
++      def two_arity(_conn, _other), do: "not a per request secret"
++
++      def nil_secret, do: nil
++    end
++
++    defmodule PerRequestImpl do
++      @moduledoc false
++
++      use Guardian,
++        otp_app: :guardian,
++        token_module: Guardian.Token.Jwt,
++        secret_key: "configured-secret-key",
++        allowed_algos: ["HS512"],
++        ttl: {4, :weeks},
++        token_ttl: %{
++          "access" => {1, :day},
++          "refresh" => {2, :weeks}
++        }
++
++      def subject_for_token(%{id: id}, _claims), do: {:ok, "User:#{id}"}
++      def resource_from_claims(%{"sub" => "User:" <> sub}), do: {:ok, %{id: sub}}
++
++      def the_secret(val), do: val
++    end
++
++    defmodule CompiledPipeline do
++      @moduledoc false
++
++      use Guardian.Plug.Pipeline,
++        otp_app: :guardian,
++        module: Guardian.Plug.VerifyHeaderTest.PerRequestImpl,
++        error_handler: Guardian.Plug.VerifyHeaderTest.Handler
++
++      plug(Guardian.Plug.VerifyHeader,
++        secret: &Guardian.Plug.VerifyHeaderTest.PerRequestSecrets.for_conn/1
++      )
++    end
++
++    defmodule RecordingFetcher do
++      @moduledoc false
++
++      @behaviour Guardian.Token.Jwt.SecretFetcher
++
++      alias Guardian.Token.Jwt.SecretFetcher.SecretFetcherDefaultImpl
++
++      def fetch_signing_secret(mod, opts) do
++        notify(opts)
++        SecretFetcherDefaultImpl.fetch_signing_secret(mod, opts)
++      end
++
++      def fetch_verifying_secret(mod, token_headers, opts) do
++        notify(opts)
++        SecretFetcherDefaultImpl.fetch_verifying_secret(mod, token_headers, opts)
++      end
++
++      defp notify(opts) do
++        if pid = opts[:notify_pid] do
++          send(pid, {:fetcher_secret, Keyword.fetch(opts, :secret)})
++        end
++      end
++    end
++
++    defmodule FetcherImpl do
++      @moduledoc false
++
++      use Guardian,
++        otp_app: :guardian,
++        token_module: Guardian.Token.Jwt,
++        secret_key: "configured-secret-key",
++        allowed_algos: ["HS512"],
++        secret_fetcher: Guardian.Plug.VerifyHeaderTest.RecordingFetcher
++
++      def subject_for_token(%{id: id}, _claims), do: {:ok, "User:#{id}"}
++      def resource_from_claims(%{"sub" => "User:" <> sub}), do: {:ok, %{id: sub}}
++    end
++
++    defmodule FallbackFetcher do
++      @moduledoc false
++
++      @behaviour Guardian.Token.Jwt.SecretFetcher
++
++      def fetch_signing_secret(_mod, opts), do: decide(opts)
++
++      def fetch_verifying_secret(_mod, _token_headers, opts), do: decide(opts)
++
++      defp decide(opts) do
++        case Keyword.fetch(opts, :secret) do
++          {:ok, nil} -> {:ok, "fetcher-supplied-secret"}
++          {:ok, secret} -> {:ok, secret}
++          :error -> {:error, :no_secret_option}
++        end
++      end
++    end
++
++    defmodule FallbackImpl do
++      @moduledoc false
++
++      use Guardian,
++        otp_app: :guardian,
++        token_module: Guardian.Token.Jwt,
++        allowed_algos: ["HS512"],
++        secret_fetcher: Guardian.Plug.VerifyHeaderTest.FallbackFetcher
++
++      def subject_for_token(%{id: id}, _claims), do: {:ok, "User:#{id}"}
++      def resource_from_claims(%{"sub" => "User:" <> sub}), do: {:ok, %{id: sub}}
++    end
++
++    defp per_request_conn(secret \\ nil) do
++      conn = conn(:get, "/")
++
++      if is_nil(secret) do
++        conn
++      else
++        Plug.Conn.assign(conn, :tenant_secret, secret)
++      end
++    end
++
++    defp verify_with(conn, secret) do
++      VerifyHeader.call(conn, secret: secret, module: PerRequestImpl, error_handler: __MODULE__.Handler)
++    end
++
++    test "verifies the token with the secret found on the connection" do
++      {:ok, token, claims} = PerRequestImpl.encode_and_sign(@pr_resource, %{}, secret: @tenant_secret)
++
++      conn =
++        @tenant_secret
++        |> per_request_conn()
++        |> put_req_header("authorization", token)
++        |> verify_with(&PerRequestSecrets.for_conn/1)
++
++      refute conn.status == 401
++      refute conn.halted
++      assert Guardian.Plug.current_token(conn) == token
++      assert Guardian.Plug.current_claims(conn) == claims
++    end
++
++    test "an anonymous secret function works when the plug is called directly" do
++      {:ok, token, claims} = PerRequestImpl.encode_and_sign(@pr_resource, %{}, secret: @tenant_secret)
++      secret_fun = fn conn -> conn.assigns[:tenant_secret] end
++
++      conn =
++        @tenant_secret
++        |> per_request_conn()
++        |> put_req_header("authorization", token)
++        |> verify_with(secret_fun)
++
++      refute conn.status == 401
++      assert Guardian.Plug.current_token(conn) == token
++      assert Guardian.Plug.current_claims(conn) == claims
++    end
++
++    test "a token signed for another tenant is rejected" do
++      {:ok, token, _claims} = PerRequestImpl.encode_and_sign(@pr_resource, %{}, secret: @other_tenant_secret)
++
++      conn =
++        @tenant_secret
++        |> per_request_conn()
++        |> put_req_header("authorization", token)
++        |> verify_with(&PerRequestSecrets.for_conn/1)
++
++      assert conn.halted
++      assert conn.status == 401
++      assert conn.resp_body == inspect({:invalid_token, :invalid_token})
++      refute Guardian.Plug.current_token(conn)
++      refute Guardian.Plug.current_claims(conn)
++    end
++
++    test "when the connection has no secret it does not fall back to the configured secret_key" do
++      {:ok, token, _claims} = PerRequestImpl.encode_and_sign(@pr_resource)
++
++      conn =
++        per_request_conn()
++        |> put_req_header("authorization", token)
++        |> verify_with(&PerRequestSecrets.for_conn/1)
++
++      assert conn.halted
++      assert conn.status == 401
++      assert conn.resp_body == inspect({:invalid_token, :secret_not_found})
++      refute Guardian.Plug.current_token(conn)
++      refute Guardian.Plug.current_claims(conn)
++    end
++
++    test "an explicit nil secret does not fall back to the configured secret_key" do
++      {:ok, token, _claims} = PerRequestImpl.encode_and_sign(@pr_resource)
++
++      conn =
++        per_request_conn()
++        |> put_req_header("authorization", token)
++        |> verify_with(nil)
++
++      assert conn.halted
++      assert conn.status == 401
++      assert conn.resp_body == inspect({:invalid_token, :secret_not_found})
++      refute Guardian.Plug.current_token(conn)
++    end
++
++    test "a {module, function, args} secret resolving to nil does not fall back" do
++      {:ok, token, _claims} = PerRequestImpl.encode_and_sign(@pr_resource)
++
++      conn =
++        per_request_conn()
++        |> put_req_header("authorization", token)
++        |> verify_with({PerRequestSecrets, :nil_secret, []})
++
++      assert conn.status == 401
++      assert conn.resp_body == inspect({:invalid_token, :secret_not_found})
++      refute Guardian.Plug.current_token(conn)
++    end
++
++    test "the secret function is not called when there is no token" do
++      conn =
++        conn(:get, "/")
++        |> Plug.Conn.assign(:notify_pid, self())
++        |> Plug.Conn.assign(:tenant_secret, @tenant_secret)
++        |> verify_with(&PerRequestSecrets.notify/1)
++
++      refute conn.halted
++      refute conn.status == 401
++      refute_received :secret_resolved
++    end
++
++    test "the secret function is called once per plug call" do
++      {:ok, token, _claims} = PerRequestImpl.encode_and_sign(@pr_resource, %{}, secret: @tenant_secret)
++
++      conn =
++        @tenant_secret
++        |> per_request_conn()
++        |> Plug.Conn.assign(:notify_pid, self())
++        |> put_req_header("authorization", token)
++        |> verify_with(&PerRequestSecrets.notify/1)
++
++      refute conn.halted
++      assert Guardian.Plug.current_token(conn) == token
++      assert_received :secret_resolved
++      refute_received :secret_resolved
++    end
++
++    test "the connection is given to the secret function" do
++      {:ok, token, _claims} = PerRequestImpl.encode_and_sign(@pr_resource, %{}, secret: @tenant_secret)
++      pid = self()
++
++      fun = fn conn ->
++        send(pid, {:conn_assigns, conn.assigns[:tenant_secret]})
++        conn.assigns[:tenant_secret]
++      end
++
++      conn =
++        @tenant_secret
++        |> per_request_conn()
++        |> put_req_header("authorization", token)
++        |> verify_with(fun)
++
++      assert Guardian.Plug.current_token(conn) == token
++      assert_received {:conn_assigns, @tenant_secret}
++    end
++
++    test "a secret function of any other arity is a configuration error" do
++      {:ok, token, _claims} = PerRequestImpl.encode_and_sign(@pr_resource, %{}, secret: @tenant_secret)
++
++      conn =
++        @tenant_secret
++        |> per_request_conn()
++        |> put_req_header("authorization", token)
++
++      base_opts = [module: PerRequestImpl, error_handler: __MODULE__.Handler]
++
++      assert_raise ArgumentError, fn ->
++        VerifyHeader.call(conn, base_opts ++ [secret: &PerRequestSecrets.no_arity/0])
++      end
++
++      assert_raise ArgumentError, fn ->
++        VerifyHeader.call(conn, base_opts ++ [secret: &PerRequestSecrets.two_arity/2])
++      end
++
++      assert_raise ArgumentError, fn ->
++        VerifyHeader.call(conn, base_opts ++ [secret: fn _conn, _other -> @tenant_secret end])
++      end
++    end
++
++    test "an exception raised in the secret function propagates to the caller" do
++      {:ok, token, _claims} = PerRequestImpl.encode_and_sign(@pr_resource, %{}, secret: @tenant_secret)
++
++      conn =
++        @tenant_secret
++        |> per_request_conn()
++        |> put_req_header("authorization", token)
++
++      assert_raise RuntimeError, "boom from the secret function", fn ->
++        VerifyHeader.call(conn,
++          module: PerRequestImpl,
++          error_handler: __MODULE__.Handler,
++          secret: &PerRequestSecrets.boom/1
++        )
++      end
++    end
++
++    test "a static secret still verifies" do
++      {:ok, token, claims} = PerRequestImpl.encode_and_sign(@pr_resource, %{}, secret: @tenant_secret)
++
++      conn =
++        per_request_conn()
++        |> put_req_header("authorization", token)
++        |> verify_with(@tenant_secret)
++
++      refute conn.status == 401
++      assert Guardian.Plug.current_token(conn) == token
++      assert Guardian.Plug.current_claims(conn) == claims
++    end
++
++    test "a {module, function, args} secret still verifies" do
++      {:ok, token, claims} = PerRequestImpl.encode_and_sign(@pr_resource, %{}, secret: @tenant_secret)
++
++      conn =
++        per_request_conn()
++        |> put_req_header("authorization", token)
++        |> verify_with({PerRequestImpl, :the_secret, [@tenant_secret]})
++
++      refute conn.status == 401
++      assert Guardian.Plug.current_token(conn) == token
++      assert Guardian.Plug.current_claims(conn) == claims
++    end
++
++    test "the configured secret_key is still used when :secret is omitted" do
++      {:ok, token, claims} = PerRequestImpl.encode_and_sign(@pr_resource)
++
++      conn =
++        per_request_conn()
++        |> put_req_header("authorization", token)
++        |> VerifyHeader.call(module: PerRequestImpl, error_handler: __MODULE__.Handler)
++
++      refute conn.status == 401
++      assert Guardian.Plug.current_token(conn) == token
++      assert Guardian.Plug.current_claims(conn) == claims
++      assert PerRequestImpl.config(:secret_key) == @configured_secret
++    end
++
++    test "in a compiled pipeline: the remote capture is called with the connection" do
++      {:ok, token, claims} = PerRequestImpl.encode_and_sign(@pr_resource, %{}, secret: @tenant_secret)
++
++      conn =
++        @tenant_secret
++        |> per_request_conn()
++        |> put_req_header("authorization", "Bearer #{token}")
++        |> CompiledPipeline.call(CompiledPipeline.init([]))
++
++      refute conn.status == 401
++      refute conn.halted
++      assert Guardian.Plug.current_token(conn) == token
++      assert Guardian.Plug.current_claims(conn) == claims
++    end
++
++    test "in a compiled pipeline: without a secret on the connection the token is not verified" do
++      {:ok, token, _claims} = PerRequestImpl.encode_and_sign(@pr_resource)
++
++      conn =
++        per_request_conn()
++        |> put_req_header("authorization", "Bearer #{token}")
++        |> CompiledPipeline.call(CompiledPipeline.init([]))
++
++      assert conn.halted
++      assert conn.status == 401
++      assert conn.resp_body == inspect({:invalid_token, :secret_not_found})
++      refute Guardian.Plug.current_token(conn)
++    end
++
++    defp refresh_conn(secret) do
++      {:ok, refresh_token, _} =
++        PerRequestImpl.encode_and_sign(%{id: "jane"}, %{}, token_type: "refresh", secret: @tenant_secret)
++
++      secret
++      |> per_request_conn()
++      |> Pipeline.put_module(PerRequestImpl)
++      |> Pipeline.put_error_handler(__MODULE__.Handler)
++      |> put_req_cookie("guardian_default_token", refresh_token)
++    end
++
++    test "refresh_from_cookie does not inherit the secret given to the plug" do
++      conn =
++        @tenant_secret
++        |> refresh_conn()
++        |> VerifyHeader.call(secret: &PerRequestSecrets.for_conn/1, refresh_from_cookie: [])
++
++      assert conn.halted
++      assert conn.status == 401
++      assert conn.resp_body == inspect({:invalid_token, :invalid_token})
++      refute Guardian.Plug.current_token(conn)
++    end
++
++    test "refresh_from_cookie uses its own secret and signs the new token with it" do
++      conn =
++        @tenant_secret
++        |> refresh_conn()
++        |> VerifyHeader.call(
++          secret: &PerRequestSecrets.for_conn/1,
++          refresh_from_cookie: [secret: &PerRequestSecrets.for_conn/1]
++        )
++
++      refute conn.halted
++      refute conn.status == 401
++
++      new_token = Guardian.Plug.current_token(conn)
++      assert new_token
++      assert {:ok, %{"typ" => "access"}} = PerRequestImpl.decode_and_verify(new_token, %{}, secret: @tenant_secret)
++      assert {:error, :invalid_token} = PerRequestImpl.decode_and_verify(new_token)
++      assert %{"sub" => "User:jane"} = Guardian.Plug.current_claims(conn)
++    end
++
++    test "refresh_from_cookie hands a missing secret to the cookie refresh" do
++      {:ok, token, _claims} = PerRequestImpl.encode_and_sign(@pr_resource)
++
++      conn =
++        per_request_conn()
++        |> Pipeline.put_module(PerRequestImpl)
++        |> Pipeline.put_error_handler(__MODULE__.Handler)
++        |> put_req_header("authorization", token)
++        |> VerifyHeader.call(
++          secret: &PerRequestSecrets.for_conn/1,
++          refresh_from_cookie: [secret: &PerRequestSecrets.for_conn/1]
++        )
++
++      refute conn.halted
++      refute conn.status == 401
++      refute Guardian.Plug.current_token(conn)
++      refute Guardian.Plug.current_claims(conn)
++    end
++
++    test "a custom secret fetcher receives the resolved secret" do
++      {:ok, token, claims} = FetcherImpl.encode_and_sign(@pr_resource, %{}, secret: @tenant_secret)
++
++      conn =
++        @tenant_secret
++        |> per_request_conn()
++        |> Plug.Conn.assign(:notify_pid, self())
++        |> put_req_header("authorization", token)
++        |> VerifyHeader.call(
++          secret: &PerRequestSecrets.for_conn/1,
++          module: FetcherImpl,
++          error_handler: __MODULE__.Handler,
++          notify_pid: self()
++        )
++
++      refute conn.status == 401
++      assert Guardian.Plug.current_token(conn) == token
++      assert Guardian.Plug.current_claims(conn) == claims
++      assert_received {:fetcher_secret, {:ok, @tenant_secret}}
++    end
++
++    test "a custom secret fetcher receives the nil returned by the secret function" do
++      {:ok, token, _claims} = FetcherImpl.encode_and_sign(@pr_resource, %{}, secret: @tenant_secret)
++
++      conn =
++        per_request_conn()
++        |> Plug.Conn.assign(:notify_pid, self())
++        |> put_req_header("authorization", token)
++        |> VerifyHeader.call(
++          secret: &PerRequestSecrets.for_conn/1,
++          module: FetcherImpl,
++          error_handler: __MODULE__.Handler,
++          notify_pid: self()
++        )
++
++      assert_received {:fetcher_secret, {:ok, nil}}
++      assert conn.status == 401
++      assert conn.resp_body == inspect({:invalid_token, :secret_not_found})
++      refute Guardian.Plug.current_token(conn)
++    end
++
++    test "a custom secret fetcher may decide the outcome for a missing secret" do
++      {:ok, token, claims} = FallbackImpl.encode_and_sign(@pr_resource, %{}, secret: "fetcher-supplied-secret")
++
++      conn =
++        per_request_conn()
++        |> put_req_header("authorization", token)
++        |> VerifyHeader.call(
++          secret: &PerRequestSecrets.for_conn/1,
++          module: FallbackImpl,
++          error_handler: __MODULE__.Handler
++        )
++
++      refute conn.status == 401
++      refute conn.halted
++      assert Guardian.Plug.current_token(conn) == token
++      assert Guardian.Plug.current_claims(conn) == claims
++    end
++  end
+ end
+diff --git a/test/guardian/plug/verify_session_test.exs b/test/guardian/plug/verify_session_test.exs
+index a4b2bb7..2926954 100644
+--- a/test/guardian/plug/verify_session_test.exs
++++ b/test/guardian/plug/verify_session_test.exs
+@@ -336,4 +336,322 @@ defmodule Guardian.Plug.VerifySessionTest do
+       assert %{"sub" => "User:jane", "typ" => "access"} = Guardian.Plug.current_claims(conn)
+     end
+   end
++
++  describe "with a secret that is resolved from the connection" do
++    @session_resource %{id: "bobby"}
++    @tenant_secret "tenant-secret-k-a"
++    @other_tenant_secret "tenant-secret-k-b"
++
++    defmodule PerRequestSecrets do
++      @moduledoc false
++
++      def for_conn(conn), do: conn.assigns[:tenant_secret]
++
++      def notify(conn) do
++        send(conn.assigns[:notify_pid], :secret_resolved)
++        conn.assigns[:tenant_secret]
++      end
++
++      def boom(_conn), do: raise("boom from the secret function")
++
++      def no_arity, do: "not a per request secret"
++
++      def nil_secret, do: nil
++    end
++
++    defmodule PerRequestImpl do
++      @moduledoc false
++
++      use Guardian,
++        otp_app: :guardian,
++        token_module: Guardian.Token.Jwt,
++        secret_key: "configured-secret-key",
++        allowed_algos: ["HS512"],
++        ttl: {4, :weeks},
++        token_ttl: %{
++          "access" => {1, :day},
++          "refresh" => {2, :weeks}
++        }
++
++      def subject_for_token(%{id: id}, _claims), do: {:ok, "User:#{id}"}
++      def resource_from_claims(%{"sub" => "User:" <> sub}), do: {:ok, %{id: sub}}
++    end
++
++    defmodule CompiledPipeline do
++      @moduledoc false
++
++      use Guardian.Plug.Pipeline,
++        otp_app: :guardian,
++        module: Guardian.Plug.VerifySessionTest.PerRequestImpl,
++        error_handler: Guardian.Plug.VerifySessionTest.Handler
++
++      plug(Guardian.Plug.VerifySession,
++        secret: &Guardian.Plug.VerifySessionTest.PerRequestSecrets.for_conn/1
++      )
++    end
++
++    defp session_conn(secret \\ nil) do
++      conn = conn(:get, "/") |> init_test_session(%{})
++
++      if is_nil(secret) do
++        conn
++      else
++        Plug.Conn.assign(conn, :tenant_secret, secret)
++      end
++    end
++
++    defp verify_with(conn, secret) do
++      VerifySession.call(conn, secret: secret, module: PerRequestImpl, error_handler: __MODULE__.Handler)
++    end
++
++    test "verifies the session token with the secret found on the connection" do
++      {:ok, token, claims} = PerRequestImpl.encode_and_sign(@session_resource, %{}, secret: @tenant_secret)
++
++      conn =
++        @tenant_secret
++        |> session_conn()
++        |> Plug.Conn.put_session("guardian_default_token", token)
++        |> verify_with(&PerRequestSecrets.for_conn/1)
++
++      refute conn.status == 401
++      refute conn.halted
++      assert Guardian.Plug.current_token(conn) == token
++      assert Guardian.Plug.current_claims(conn) == claims
++    end
++
++    test "a token signed for another tenant is rejected" do
++      {:ok, token, _claims} = PerRequestImpl.encode_and_sign(@session_resource, %{}, secret: @other_tenant_secret)
++
++      conn =
++        @tenant_secret
++        |> session_conn()
++        |> Plug.Conn.put_session("guardian_default_token", token)
++        |> verify_with(&PerRequestSecrets.for_conn/1)
++
++      assert conn.halted
++      assert conn.status == 401
++      assert conn.resp_body == inspect({:invalid_token, :invalid_token})
++      refute Guardian.Plug.current_token(conn)
++    end
++
++    test "when the connection has no secret it does not fall back to the configured secret_key" do
++      {:ok, token, _claims} = PerRequestImpl.encode_and_sign(@session_resource)
++
++      conn =
++        session_conn()
++        |> Plug.Conn.put_session("guardian_default_token", token)
++        |> verify_with(&PerRequestSecrets.for_conn/1)
++
++      assert conn.halted
++      assert conn.status == 401
++      assert conn.resp_body == inspect({:invalid_token, :secret_not_found})
++      refute Guardian.Plug.current_token(conn)
++      refute Guardian.Plug.current_claims(conn)
++    end
++
++    test "an explicit nil secret does not fall back to the configured secret_key" do
++      {:ok, token, _claims} = PerRequestImpl.encode_and_sign(@session_resource)
++
++      conn =
++        session_conn()
++        |> Plug.Conn.put_session("guardian_default_token", token)
++        |> verify_with(nil)
++
++      assert conn.status == 401
++      assert conn.resp_body == inspect({:invalid_token, :secret_not_found})
++      refute Guardian.Plug.current_token(conn)
++    end
++
++    test "a {module, function, args} secret resolving to nil does not fall back" do
++      {:ok, token, _claims} = PerRequestImpl.encode_and_sign(@session_resource)
++
++      conn =
++        session_conn()
++        |> Plug.Conn.put_session("guardian_default_token", token)
++        |> verify_with({PerRequestSecrets, :nil_secret, []})
++
++      assert conn.status == 401
++      assert conn.resp_body == inspect({:invalid_token, :secret_not_found})
++      refute Guardian.Plug.current_token(conn)
++    end
++
++    test "the secret function is not called when there is no session" do
++      conn =
++        conn(:get, "/")
++        |> Plug.Conn.assign(:notify_pid, self())
++        |> Plug.Conn.assign(:tenant_secret, @tenant_secret)
++        |> verify_with(&PerRequestSecrets.notify/1)
++
++      refute conn.halted
++      refute conn.status == 401
++      refute_received :secret_resolved
++    end
++
++    test "the secret function is not called when the session has no token" do
++      conn =
++        conn(:get, "/")
++        |> Plug.Conn.assign(:notify_pid, self())
++        |> Plug.Conn.assign(:tenant_secret, @tenant_secret)
++        |> init_test_session(%{})
++        |> verify_with(&PerRequestSecrets.notify/1)
++
++      refute conn.halted
++      refute conn.status == 401
++      refute_received :secret_resolved
++    end
++
++    test "the secret function is called once per plug call" do
++      {:ok, token, _claims} = PerRequestImpl.encode_and_sign(@session_resource, %{}, secret: @tenant_secret)
++
++      conn =
++        @tenant_secret
++        |> session_conn()
++        |> Plug.Conn.assign(:notify_pid, self())
++        |> Plug.Conn.put_session("guardian_default_token", token)
++        |> verify_with(&PerRequestSecrets.notify/1)
++
++      refute conn.halted
++      assert Guardian.Plug.current_token(conn) == token
++      assert_received :secret_resolved
++      refute_received :secret_resolved
++    end
++
++    test "a secret function of any other arity is a configuration error" do
++      {:ok, token, _claims} = PerRequestImpl.encode_and_sign(@session_resource, %{}, secret: @tenant_secret)
++
++      conn =
++        @tenant_secret
++        |> session_conn()
++        |> Plug.Conn.put_session("guardian_default_token", token)
++
++      assert_raise ArgumentError, fn ->
++        VerifySession.call(conn,
++          module: PerRequestImpl,
++          error_handler: __MODULE__.Handler,
++          secret: &PerRequestSecrets.no_arity/0
++        )
++      end
++    end
++
++    test "an exception raised in the secret function propagates to the caller" do
++      {:ok, token, _claims} = PerRequestImpl.encode_and_sign(@session_resource, %{}, secret: @tenant_secret)
++
++      conn =
++        @tenant_secret
++        |> session_conn()
++        |> Plug.Conn.put_session("guardian_default_token", token)
++
++      assert_raise RuntimeError, "boom from the secret function", fn ->
++        VerifySession.call(conn,
++          module: PerRequestImpl,
++          error_handler: __MODULE__.Handler,
++          secret: &PerRequestSecrets.boom/1
++        )
++      end
++    end
++
++    test "a static secret still verifies" do
++      {:ok, token, claims} = PerRequestImpl.encode_and_sign(@session_resource, %{}, secret: @tenant_secret)
++
++      conn =
++        session_conn()
++        |> Plug.Conn.put_session("guardian_default_token", token)
++        |> verify_with(@tenant_secret)
++
++      refute conn.status == 401
++      assert Guardian.Plug.current_token(conn) == token
++      assert Guardian.Plug.current_claims(conn) == claims
++    end
++
++    test "in a compiled pipeline: the remote capture is called with the connection" do
++      {:ok, token, claims} = PerRequestImpl.encode_and_sign(@session_resource, %{}, secret: @tenant_secret)
++
++      conn =
++        @tenant_secret
++        |> session_conn()
++        |> Plug.Conn.put_session("guardian_default_token", token)
++        |> CompiledPipeline.call(CompiledPipeline.init([]))
++
++      refute conn.status == 401
++      refute conn.halted
++      assert Guardian.Plug.current_token(conn) == token
++      assert Guardian.Plug.current_claims(conn) == claims
++    end
++
++    test "in a compiled pipeline: without a secret on the connection the token is not verified" do
++      {:ok, token, _claims} = PerRequestImpl.encode_and_sign(@session_resource)
++
++      conn =
++        session_conn()
++        |> Plug.Conn.put_session("guardian_default_token", token)
++        |> CompiledPipeline.call(CompiledPipeline.init([]))
++
++      assert conn.halted
++      assert conn.status == 401
++      assert conn.resp_body == inspect({:invalid_token, :secret_not_found})
++      refute Guardian.Plug.current_token(conn)
++    end
++
++    defp refresh_session_conn(secret) do
++      {:ok, refresh_token, _} =
++        PerRequestImpl.encode_and_sign(%{id: "jane"}, %{}, token_type: "refresh", secret: @tenant_secret)
++
++      secret
++      |> session_conn()
++      |> Pipeline.put_module(PerRequestImpl)
++      |> Pipeline.put_error_handler(__MODULE__.Handler)
++      |> put_req_cookie("guardian_default_token", refresh_token)
++    end
++
++    test "refresh_from_cookie does not inherit the secret given to the plug" do
++      conn =
++        @tenant_secret
++        |> refresh_session_conn()
++        |> VerifySession.call(secret: &PerRequestSecrets.for_conn/1, refresh_from_cookie: [])
++
++      assert conn.halted
++      assert conn.status == 401
++      assert conn.resp_body == inspect({:invalid_token, :invalid_token})
++      refute Guardian.Plug.current_token(conn)
++    end
++
++    test "refresh_from_cookie uses its own secret and signs the new token with it" do
++      conn =
++        @tenant_secret
++        |> refresh_session_conn()
++        |> VerifySession.call(
++          secret: &PerRequestSecrets.for_conn/1,
++          refresh_from_cookie: [secret: &PerRequestSecrets.for_conn/1]
++        )
++
++      refute conn.halted
++      refute conn.status == 401
++
++      new_token = Guardian.Plug.current_token(conn)
++      assert new_token
++      assert {:ok, %{"typ" => "access"}} = PerRequestImpl.decode_and_verify(new_token, %{}, secret: @tenant_secret)
++      assert {:error, :invalid_token} = PerRequestImpl.decode_and_verify(new_token)
++      assert %{"sub" => "User:jane"} = Guardian.Plug.current_claims(conn)
++      assert Plug.Conn.get_session(conn, "guardian_default_token") == new_token
++    end
++
++    test "refresh_from_cookie hands a missing secret to the cookie refresh" do
++      {:ok, token, _claims} = PerRequestImpl.encode_and_sign(@session_resource)
++
++      conn =
++        session_conn()
++        |> Pipeline.put_module(PerRequestImpl)
++        |> Pipeline.put_error_handler(__MODULE__.Handler)
++        |> Plug.Conn.put_session("guardian_default_token", token)
++        |> VerifySession.call(
++          secret: &PerRequestSecrets.for_conn/1,
++          refresh_from_cookie: [secret: &PerRequestSecrets.for_conn/1]
++        )
++
++      refute conn.halted
++      refute conn.status == 401
++      refute Guardian.Plug.current_token(conn)
++      refute Guardian.Plug.current_claims(conn)
++    end
++  end
+ end
+diff --git a/test/guardian/plug_test.exs b/test/guardian/plug_test.exs
+index 50fda46..acdd753 100644
+--- a/test/guardian/plug_test.exs
++++ b/test/guardian/plug_test.exs
+@@ -727,4 +727,393 @@ defmodule Guardian.PlugTest do
+       assert Keys.key_from_other(:plug_session) == nil
+     end
+   end
++
++  describe "issuing with a secret that is resolved from the connection" do
++    @per_request_resource %{id: "bobby"}
++    @tenant_secret "tenant-secret-k-a"
++
++    defmodule PerRequestSecrets do
++      @moduledoc false
++
++      def for_conn(conn), do: conn.assigns[:tenant_secret]
++
++      def boom(_conn), do: raise("boom from the secret function")
++
++      def no_arity, do: "not a per request secret"
++
++      def recorded_secret do
++        send(self(), :mfa_secret_resolved)
++        "recorded-secret"
++      end
++
++      def nil_secret, do: nil
++    end
++
++    defmodule PerRequestImpl do
++      @moduledoc false
++
++      use Guardian,
++        otp_app: :guardian,
++        token_module: Guardian.Token.Jwt,
++        secret_key: "configured-secret-key",
++        allowed_algos: ["HS512"],
++        ttl: {4, :weeks},
++        token_ttl: %{
++          "access" => {1, :day},
++          "refresh" => {2, :weeks}
++        }
++
++      def subject_for_token(%{id: id}, _claims), do: {:ok, "User:#{id}"}
++      def resource_from_claims(%{"sub" => "User:" <> sub}), do: {:ok, %{id: sub}}
++    end
++
++    defmodule RecordingHandler do
++      @moduledoc false
++
++      import Plug.Conn
++
++      @behaviour Guardian.Plug.ErrorHandler
++
++      @impl Guardian.Plug.ErrorHandler
++      def auth_error(conn, reason, _opts) do
++        send(self(), {:auth_error, reason})
++        send_resp(conn, 401, inspect(reason))
++      end
++    end
++
++    defp tenant_conn(secret \\ nil) do
++      conn = conn(:post, "/") |> init_test_session(%{})
++
++      if is_nil(secret) do
++        conn
++      else
++        assign(conn, :tenant_secret, secret)
++      end
++    end
++
++    defp erroring_conn(secret \\ nil) do
++      tenant_conn(secret) |> Guardian.Plug.Pipeline.put_error_handler(__MODULE__.Handler)
++    end
++
++    defp unauthenticated(conn, reason) do
++      assert conn.halted
++      assert conn.status == 401
++      assert conn.resp_body == inspect({:unauthenticated, {:error, reason}})
++      refute Guardian.Plug.current_token(conn)
++      refute Guardian.Plug.current_claims(conn)
++      refute Guardian.Plug.current_resource(conn)
++      assert get_session(conn, "guardian_default_token") == nil
++      assert conn.resp_cookies == %{}
++    end
++
++    test "sign_in signs the token with the secret from the connection" do
++      conn =
++        @tenant_secret
++        |> tenant_conn()
++        |> Guardian.Plug.sign_in(PerRequestImpl, @per_request_resource, %{}, secret: &PerRequestSecrets.for_conn/1)
++
++      token = Guardian.Plug.current_token(conn)
++      assert token
++      assert {:ok, claims} = PerRequestImpl.decode_and_verify(token, %{}, secret: @tenant_secret)
++      assert %{"sub" => "User:bobby", "typ" => "access"} = claims
++      assert {:error, :invalid_token} = PerRequestImpl.decode_and_verify(token)
++      assert Guardian.Plug.current_resource(conn) == @per_request_resource
++      assert get_session(conn, "guardian_default_token") == token
++    end
++
++    test "sign_in issues nothing when the connection has no secret" do
++      conn =
++        erroring_conn()
++        |> Guardian.Plug.sign_in(PerRequestImpl, @per_request_resource, %{}, secret: &PerRequestSecrets.for_conn/1)
++
++      unauthenticated(conn, :secret_not_found)
++    end
++
++    test "sign_in with an explicit nil secret does not fall back to the configured secret_key" do
++      conn =
++        erroring_conn()
++        |> Guardian.Plug.sign_in(PerRequestImpl, @per_request_resource, %{}, secret: nil)
++
++      unauthenticated(conn, :secret_not_found)
++    end
++
++    test "sign_in with a {module, function, args} secret resolving to nil issues nothing" do
++      conn =
++        erroring_conn()
++        |> Guardian.Plug.sign_in(PerRequestImpl, @per_request_resource, %{},
++          secret: {PerRequestSecrets, :nil_secret, []}
++        )
++
++      unauthenticated(conn, :secret_not_found)
++    end
++
++    test "sign_in raises without an error handler when the secret is not found" do
++      assert_raise Guardian.Plug.UnauthenticatedError, fn ->
++        tenant_conn()
++        |> Guardian.Plug.sign_in(PerRequestImpl, @per_request_resource, %{}, secret: &PerRequestSecrets.for_conn/1)
++      end
++    end
++
++    test "sign_in raises ArgumentError for a secret function of another arity" do
++      conn = tenant_conn(@tenant_secret)
++
++      assert_raise ArgumentError, fn ->
++        Guardian.Plug.sign_in(conn, PerRequestImpl, @per_request_resource, %{}, secret: &PerRequestSecrets.no_arity/0)
++      end
++    end
++
++    test "sign_in lets an exception raised by the secret function propagate" do
++      conn = tenant_conn(@tenant_secret)
++
++      assert_raise RuntimeError, "boom from the secret function", fn ->
++        Guardian.Plug.sign_in(conn, PerRequestImpl, @per_request_resource, %{}, secret: &PerRequestSecrets.boom/1)
++      end
++    end
++
++    test "a configuration error is not reported to the error handler" do
++      conn =
++        tenant_conn(@tenant_secret)
++        |> Guardian.Plug.Pipeline.put_error_handler(__MODULE__.RecordingHandler)
++
++      assert_raise ArgumentError, fn ->
++        Guardian.Plug.sign_in(conn, PerRequestImpl, @per_request_resource, %{}, secret: &PerRequestSecrets.no_arity/0)
++      end
++
++      assert_raise RuntimeError, "boom from the secret function", fn ->
++        Guardian.Plug.sign_in(conn, PerRequestImpl, @per_request_resource, %{}, secret: &PerRequestSecrets.boom/1)
++      end
++
++      refute_received {:auth_error, _}
++    end
++
++    test "remember_me raises ArgumentError for a secret function of another arity" do
++      conn = tenant_conn(@tenant_secret)
++
++      assert_raise ArgumentError, fn ->
++        Guardian.Plug.remember_me(conn, PerRequestImpl, @per_request_resource, %{},
++          secret: &PerRequestSecrets.no_arity/0
++        )
++      end
++    end
++
++    test "remember_me lets an exception raised by the secret function propagate" do
++      conn = tenant_conn(@tenant_secret)
++
++      assert_raise RuntimeError, "boom from the secret function", fn ->
++        Guardian.Plug.remember_me(conn, PerRequestImpl, @per_request_resource, %{}, secret: &PerRequestSecrets.boom/1)
++      end
++    end
++
++    test "remember_me_from_token raises ArgumentError for a secret function of another arity" do
++      {:ok, old_token, _} =
++        PerRequestImpl.encode_and_sign(@per_request_resource, %{}, token_type: "refresh", secret: @tenant_secret)
++
++      conn = tenant_conn(@tenant_secret)
++
++      assert_raise ArgumentError, fn ->
++        Guardian.Plug.remember_me_from_token(conn, PerRequestImpl, old_token, %{},
++          secret: &PerRequestSecrets.no_arity/0
++        )
++      end
++    end
++
++    test "remember_me_from_token lets an exception raised by the secret function propagate" do
++      {:ok, old_token, _} =
++        PerRequestImpl.encode_and_sign(@per_request_resource, %{}, token_type: "refresh", secret: @tenant_secret)
++
++      conn = tenant_conn(@tenant_secret)
++
++      assert_raise RuntimeError, "boom from the secret function", fn ->
++        Guardian.Plug.remember_me_from_token(conn, PerRequestImpl, old_token, %{}, secret: &PerRequestSecrets.boom/1)
++      end
++    end
++
++    test "sign_out with a nil secret reports that the secret was not found" do
++      {:ok, token, claims} = PerRequestImpl.encode_and_sign(@per_request_resource)
++
++      conn =
++        tenant_conn(@tenant_secret)
++        |> Guardian.Plug.put_current_token(token)
++        |> Guardian.Plug.put_current_claims(claims)
++        |> Guardian.Plug.Pipeline.put_error_handler(__MODULE__.Handler)
++
++      conn = Guardian.Plug.sign_out(conn, PerRequestImpl, secret: nil)
++
++      assert conn.halted
++      assert conn.status == 401
++      assert conn.resp_body == inspect({:unauthenticated, :secret_not_found})
++    end
++
++    test "sign_in with a static secret still works" do
++      conn =
++        tenant_conn()
++        |> Guardian.Plug.sign_in(PerRequestImpl, @per_request_resource, %{}, secret: @tenant_secret)
++
++      token = Guardian.Plug.current_token(conn)
++      assert {:ok, %{"sub" => "User:bobby"}} = PerRequestImpl.decode_and_verify(token, %{}, secret: @tenant_secret)
++    end
++
++    test "sign_in without :secret still uses the configured secret_key" do
++      conn =
++        tenant_conn()
++        |> Guardian.Plug.sign_in(PerRequestImpl, @per_request_resource, %{}, [])
++
++      token = Guardian.Plug.current_token(conn)
++      assert {:ok, %{"sub" => "User:bobby"}} = PerRequestImpl.decode_and_verify(token)
++    end
++
++    test "remember_me signs the cookie with the secret from the connection" do
++      conn =
++        @tenant_secret
++        |> tenant_conn()
++        |> Guardian.Plug.remember_me(PerRequestImpl, @per_request_resource, %{}, secret: &PerRequestSecrets.for_conn/1)
++
++      %{value: token} = conn.resp_cookies["guardian_default_token"]
++      assert {:ok, claims} = PerRequestImpl.decode_and_verify(token, %{}, secret: @tenant_secret)
++      assert %{"sub" => "User:bobby", "typ" => "refresh"} = claims
++      assert {:error, :invalid_token} = PerRequestImpl.decode_and_verify(token)
++    end
++
++    test "remember_me issues nothing when the connection has no secret" do
++      conn =
++        erroring_conn()
++        |> Guardian.Plug.remember_me(PerRequestImpl, @per_request_resource, %{}, secret: &PerRequestSecrets.for_conn/1)
++
++      unauthenticated(conn, :secret_not_found)
++    end
++
++    test "remember_me with an explicit nil secret does not fall back to the configured secret_key" do
++      conn =
++        erroring_conn()
++        |> Guardian.Plug.remember_me(PerRequestImpl, @per_request_resource, %{}, secret: nil)
++
++      unauthenticated(conn, :secret_not_found)
++    end
++
++    test "remember_me_from_token verifies with the resolved secret and signs the cookie with it" do
++      {:ok, old_token, _} =
++        PerRequestImpl.encode_and_sign(@per_request_resource, %{}, token_type: "refresh", secret: @tenant_secret)
++
++      conn =
++        @tenant_secret
++        |> tenant_conn()
++        |> Guardian.Plug.remember_me_from_token(PerRequestImpl, old_token, %{}, secret: &PerRequestSecrets.for_conn/1)
++
++      %{value: new_token} = conn.resp_cookies["guardian_default_token"]
++      assert new_token != old_token
++      assert {:ok, claims} = PerRequestImpl.decode_and_verify(new_token, %{}, secret: @tenant_secret)
++      assert %{"sub" => "User:bobby", "typ" => "refresh"} = claims
++      assert {:error, :invalid_token} = PerRequestImpl.decode_and_verify(new_token)
++    end
++
++    test "remember_me_from_token does not verify a token signed with another secret" do
++      {:ok, old_token, _} =
++        PerRequestImpl.encode_and_sign(@per_request_resource, %{}, token_type: "refresh")
++
++      conn =
++        @tenant_secret
++        |> erroring_conn()
++        |> Guardian.Plug.remember_me_from_token(PerRequestImpl, old_token, %{}, secret: &PerRequestSecrets.for_conn/1)
++
++      assert conn.resp_body == inspect({:unauthenticated, {:error, :invalid_token}})
++      assert conn.resp_cookies == %{}
++    end
++
++    test "remember_me_from_token issues nothing when the connection has no secret" do
++      {:ok, old_token, _} =
++        PerRequestImpl.encode_and_sign(@per_request_resource, %{}, token_type: "refresh", secret: @tenant_secret)
++
++      conn =
++        erroring_conn()
++        |> Guardian.Plug.remember_me_from_token(PerRequestImpl, old_token, %{}, secret: &PerRequestSecrets.for_conn/1)
++
++      unauthenticated(conn, :secret_not_found)
++    end
++
++    test "the implementation module plug wrappers accept a secret function" do
++      conn =
++        @tenant_secret
++        |> tenant_conn()
++        |> PerRequestImpl.Plug.sign_in(@per_request_resource, %{}, secret: &PerRequestSecrets.for_conn/1)
++
++      assert {:ok, %{"sub" => "User:bobby"}} =
++               PerRequestImpl.decode_and_verify(Guardian.Plug.current_token(conn), %{}, secret: @tenant_secret)
++
++      conn =
++        @tenant_secret
++        |> tenant_conn()
++        |> PerRequestImpl.Plug.remember_me(@per_request_resource, %{}, secret: &PerRequestSecrets.for_conn/1)
++
++      %{value: cookie_token} = conn.resp_cookies["guardian_default_token"]
++
++      assert {:ok, %{"typ" => "refresh"}} =
++               PerRequestImpl.decode_and_verify(cookie_token, %{}, secret: @tenant_secret)
++
++      {:ok, old_token, _} =
++        PerRequestImpl.encode_and_sign(@per_request_resource, %{}, token_type: "refresh", secret: @tenant_secret)
++
++      conn =
++        @tenant_secret
++        |> tenant_conn()
++        |> PerRequestImpl.Plug.remember_me_from_token(old_token, %{}, secret: &PerRequestSecrets.for_conn/1)
++
++      %{value: new_token} = conn.resp_cookies["guardian_default_token"]
++      assert {:ok, %{"typ" => "refresh"}} = PerRequestImpl.decode_and_verify(new_token, %{}, secret: @tenant_secret)
++    end
++
++    test "the implementation module plug wrappers report a missing secret" do
++      conn =
++        erroring_conn()
++        |> PerRequestImpl.Plug.sign_in(@per_request_resource, %{}, secret: &PerRequestSecrets.for_conn/1)
++
++      unauthenticated(conn, :secret_not_found)
++    end
++
++    defp resolve(conn, opts), do: apply(Guardian.Plug, :resolve_secret, [conn, opts])
++
++    test "resolve_secret/2 returns options without a secret unchanged" do
++      conn = conn(:get, "/")
++      assert resolve(conn, []) == []
++      assert resolve(conn, key: :bob) == [key: :bob]
++    end
++
++    test "resolve_secret/2 returns a static secret unchanged" do
++      conn = conn(:get, "/")
++      opts = [secret: @tenant_secret, key: :bob]
++      assert resolve(conn, opts) == opts
++    end
++
++    test "resolve_secret/2 returns a {module, function, args} secret unchanged and does not call it" do
++      conn = conn(:get, "/")
++      opts = [secret: {PerRequestSecrets, :recorded_secret, []}, key: :bob]
++      assert resolve(conn, opts) == opts
++      refute_received :mfa_secret_resolved
++    end
++
++    test "resolve_secret/2 replaces a one argument secret function with its result" do
++      conn = assign(conn(:get, "/"), :tenant_secret, @tenant_secret)
++      assert resolve(conn, secret: &PerRequestSecrets.for_conn/1, key: :bob) == [secret: @tenant_secret, key: :bob]
++    end
++
++    test "resolve_secret/2 keeps a nil result in the options" do
++      conn = conn(:get, "/")
++      assert resolve(conn, secret: &PerRequestSecrets.for_conn/1) == [secret: nil]
++    end
++
++    test "resolve_secret/2 raises ArgumentError for a function of any other arity" do
++      assert_raise ArgumentError, fn ->
++        resolve(conn(:get, "/"), secret: &PerRequestSecrets.no_arity/0)
++      end
++
++      assert_raise ArgumentError, fn ->
++        resolve(conn(:get, "/"), secret: fn _conn, _other -> @tenant_secret end)
++      end
++    end
++
++    test "resolve_secret/2 lets an exception raised by the secret function propagate" do
++      assert_raise RuntimeError, "boom from the secret function", fn ->
++        resolve(conn(:get, "/"), secret: &PerRequestSecrets.boom/1)
++      end
++    end
++  end
+ end
+diff --git a/test/guardian/token/jwt_test.exs b/test/guardian/token/jwt_test.exs
+index 0a8a733..ee64325 100644
+--- a/test/guardian/token/jwt_test.exs
++++ b/test/guardian/token/jwt_test.exs
+@@ -568,4 +568,50 @@ defmodule Guardian.Token.JwtTest do
+       assert_received({:secret_fetcher, _headers})
+     end
+   end
++
++  describe "when the secret is not found" do
++    alias Guardian.Token.Jwt
++
++    defmodule NilSecretProvider do
++      @moduledoc false
++      def get, do: nil
++    end
++
++    test "decode_token/3 with an explicit nil secret", ctx do
++      assert {:error, :secret_not_found} = Jwt.decode_token(ctx.impl, ctx.jwt, secret: nil)
++    end
++
++    test "decode_token/3 with a {module, function, args} secret resolving to nil", ctx do
++      assert {:error, :secret_not_found} = Jwt.decode_token(ctx.impl, ctx.jwt, secret: {NilSecretProvider, :get, []})
++    end
++
++    test "decode_token/3 with a bad signature is still an invalid token", ctx do
++      assert {:error, :invalid_token} = Jwt.decode_token(ctx.impl, ctx.jwt, secret: "definitely-not-the-secret")
++    end
++
++    test "decode_token/3 with a malformed token is still an invalid token", ctx do
++      assert {:error, :invalid_token} = Jwt.decode_token(ctx.impl, "not-a-jwt", [])
++    end
++
++    test "decode_token/3 without a secret option still uses the configured secret_key", ctx do
++      assert {:ok, claims} = Jwt.decode_token(ctx.impl, ctx.jwt, [])
++      assert claims == ctx.claims
++    end
++
++    test "create_token/3 with an explicit nil secret", ctx do
++      assert {:error, :secret_not_found} = Jwt.create_token(ctx.impl, ctx.claims, secret: nil)
++    end
++
++    test "create_token/3 with a {module, function, args} secret resolving to nil", ctx do
++      assert {:error, :secret_not_found} = Jwt.create_token(ctx.impl, ctx.claims, secret: {NilSecretProvider, :get, []})
++    end
++
++    test "create_token/3 with a static secret still signs", ctx do
++      secret = "another-secret"
++      assert {:ok, token} = Jwt.create_token(ctx.impl, ctx.claims, secret: secret)
++      assert {:ok, claims} = Jwt.decode_token(ctx.impl, token, secret: secret)
++      assert claims == ctx.claims
++      assert {:error, :invalid_token} = Jwt.decode_token(ctx.impl, token, [])
++    end
++  end
+ end
+diff --git a/test/guardian_test.exs b/test/guardian_test.exs
+index 641c289..5c26e9a 100644
+--- a/test/guardian_test.exs
++++ b/test/guardian_test.exs
+@@ -381,4 +381,97 @@ defmodule GuardianTest do
+       assert gather_function_calls() == expected
+     end
+   end
++
++  describe "with a secret that is not found" do
++    @secret_resource %{id: "bobby"}
++
++    defmodule JwtImpl do
++      @moduledoc false
++
++      use Guardian,
++        otp_app: :guardian,
++        token_module: Guardian.Token.Jwt,
++        secret_key: "configured-secret-key",
++        allowed_algos: ["HS512"],
++        ttl: {4, :weeks},
++        token_ttl: %{
++          "access" => {1, :day},
++          "refresh" => {2, :weeks}
++        }
++
++      def subject_for_token(%{id: id}, _claims), do: {:ok, "User:#{id}"}
++      def resource_from_claims(%{"sub" => "User:" <> sub}), do: {:ok, %{id: sub}}
++      def nil_secret, do: nil
++    end
++
++    test "encode_and_sign/4 with an explicit nil secret" do
++      assert {:error, :secret_not_found} = JwtImpl.encode_and_sign(@secret_resource, %{}, secret: nil)
++    end
++
++    test "encode_and_sign/4 with a {module, function, args} secret resolving to nil" do
++      assert {:error, :secret_not_found} =
++               JwtImpl.encode_and_sign(@secret_resource, %{}, secret: {JwtImpl, :nil_secret, []})
++    end
++
++    test "decode_and_verify/3 with an explicit nil secret" do
++      {:ok, token, _claims} = JwtImpl.encode_and_sign(@secret_resource)
++
++      assert {:error, :secret_not_found} = JwtImpl.decode_and_verify(token, %{}, secret: nil)
++    end
++
++    test "resource_from_token/3 with an explicit nil secret" do
++      {:ok, token, _claims} = JwtImpl.encode_and_sign(@secret_resource)
++
++      assert {:error, :secret_not_found} = JwtImpl.resource_from_token(token, %{}, secret: nil)
++    end
++
++    test "exchange/4 with an explicit nil secret" do
++      {:ok, token, _claims} = JwtImpl.encode_and_sign(@secret_resource, %{}, token_type: "refresh")
++
++      assert {:error, :secret_not_found} = JwtImpl.exchange(token, "refresh", "access", secret: nil)
++    end
++
++    test "refresh/2 with an explicit nil secret" do
++      {:ok, token, _claims} = JwtImpl.encode_and_sign(@secret_resource)
++
++      assert {:error, :secret_not_found} = JwtImpl.refresh(token, secret: nil)
++    end
++
++    test "revoke/2 with an explicit nil secret" do
++      {:ok, token, _claims} = JwtImpl.encode_and_sign(@secret_resource)
++
++      assert {:error, :secret_not_found} = JwtImpl.revoke(token, secret: nil)
++    end
++
++    test "revoke/2 with a {module, function, args} secret resolving to nil" do
++      {:ok, token, _claims} = JwtImpl.encode_and_sign(@secret_resource)
++
++      assert {:error, :secret_not_found} = JwtImpl.revoke(token, secret: {JwtImpl, :nil_secret, []})
++    end
++
++    test "the functions still work with the configured secret_key" do
++      {:ok, token, claims} = JwtImpl.encode_and_sign(@secret_resource)
++
++      assert {:ok, ^claims} = JwtImpl.decode_and_verify(token)
++      assert {:ok, %{id: "bobby"}, ^claims} = JwtImpl.resource_from_token(token)
++      assert {:ok, _old, {_new_token, _new_claims}} = JwtImpl.refresh(token)
++      assert {:ok, _claims} = JwtImpl.revoke(token)
++
++      {:ok, refresh_token, _} = JwtImpl.encode_and_sign(@secret_resource, %{}, token_type: "refresh")
++      assert {:ok, _old, {access_token, access_claims}} = JwtImpl.exchange(refresh_token, "refresh", "access")
++      assert access_claims["typ"] == "access"
++      assert {:ok, _} = JwtImpl.decode_and_verify(access_token)
++    end
++
++    test "the functions still work with a static secret" do
++      secret = "static-secret"
++      {:ok, token, claims} = JwtImpl.encode_and_sign(@secret_resource, %{}, secret: secret)
++
++      assert {:ok, ^claims} = JwtImpl.decode_and_verify(token, %{}, secret: secret)
++      assert {:ok, %{id: "bobby"}, ^claims} = JwtImpl.resource_from_token(token, %{}, secret: secret)
++      assert {:ok, _old, {_new_token, _new_claims}} = JwtImpl.refresh(token, secret: secret)
++      assert {:ok, _claims} = JwtImpl.revoke(token, secret: secret)
++      assert {:error, :invalid_token} = JwtImpl.decode_and_verify(token)
++    end
++  end
+ end

@@ -50,6 +50,12 @@ One carried case was graded again. v5 rejected both of Sonnet's guardian-pr-748 
 
 Haiku 5.5's v6 series is not assembled. It is two ordinary full runs made the same night.
 
+## Amendment, 2026-11-18: a Flash Next run is assembled from a run and a rerun
+
+A full v6 run of Qwen3.8 Flash Next UD-IQ2_XS finished with beacon-pr-687 as an evaluation error: the harness ended the attempt when a patch snapshot was over the size limit, a bug fixed the same day. The case passed when run again on its own, with the same model, settings, seed and case files. The user asked for the two to be merged and published, and chose an assembled series over joining the model's real series.
+
+Its one run takes 19 cases from the full run and beacon-pr-687 from the rerun. This sets aside the same two rules on the same terms as for Opus and Sonnet: a published run is one full run of the release, and single-case attempts are never published. The errored attempt has no outcome to replace, so no graded outcome is discarded. The series says it is assembled in its note and in the release note, and a real run of this model starts a separate series. See the [record](../../verification/flash-next-series-2026-11-18/README.md).
+
 ## Considered options
 
 - **Keep upstream pins under a recorded exception**: no fork work, but cases would keep two kinds of source and overlay handling.
