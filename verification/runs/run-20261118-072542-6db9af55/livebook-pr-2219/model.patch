@@ -1,0 +1,169 @@
+diff --git a/lib/livebook/session/data.ex b/lib/livebook/session/data.ex
+index 001b957..69194df 100644
+--- a/lib/livebook/session/data.ex
++++ b/lib/livebook/session/data.ex
+@@ -1247,6 +1247,36 @@ defmodule Livebook.Session.Data do
+     |> update_cell_eval_info!(cell.id, &%{&1 | status: :ready})
+   end
+ 
++  defp add_cell_output({data, _} = data_actions, cell, %{type: :frame_update} = frame_update) do
++    notebook = Notebook.add_cell_output(data.notebook, cell.id, frame_update)
++
++    new_input_infos =
++      notebook
++      |> Notebook.find_frame_outputs(frame_update.ref)
++      |> Enum.flat_map(fn {idx, frame} -> Cell.find_inputs_in_output({idx, frame}) end)
++      |> Map.new(fn input -> {input.id, input_info(input.attrs.default)} end)
++
++    data_actions =
++      data_actions
++      |> set!(
++        notebook: notebook,
++        input_infos: Map.merge(new_input_infos, data.input_infos)
++      )
++
++    if data.cell_infos[cell.id].eval.status == :evaluating do
++      # When a cell renders an input, it should also be able to read
++      # that input during the same evaluation, so we make it seem as
++      # if it already existed prior to the evaluation
++
++      data_actions
++      |> update_cell_eval_info!(cell.id, fn eval_info ->
++        update_in(eval_info.data.input_infos, &Map.merge(new_input_infos, &1))
++      end)
++    else
++      data_actions
++    end
++  end
++
+   defp add_cell_output({data, _} = data_actions, cell, output) do
+     {[indexed_output], _counter} = Notebook.index_outputs([output], 0)
+ 
+diff --git a/lib/livebook_web/live/session_live.ex b/lib/livebook_web/live/session_live.ex
+index 328f903..16df354 100644
+--- a/lib/livebook_web/live/session_live.ex
++++ b/lib/livebook_web/live/session_live.ex
+@@ -2783,14 +2783,24 @@ defmodule LivebookWeb.SessionLive do
+       # For outputs that update existing outputs we send the update directly
+       # to the corresponding component, so the DOM patch is isolated and fast.
+       # This is important for intensive output updates
+-      {:add_cell_evaluation_output, _client_id, _cell_id, %{type: :frame_update} = output} ->
++      {:add_cell_evaluation_output, _client_id, cell_id, %{type: :frame_update} = output} ->
+         %{ref: ref, update: {update_type, _}} = output
+ 
++        input_views =
++          case Notebook.fetch_cell_and_section(data.notebook, cell_id) do
++            {:ok, cell, _section} ->
++              input_views_for_cell(cell, data, Session.Data.changed_input_ids(data))
++
++            :error ->
++              %{}
++          end
++
+         for {idx, frame} <- Notebook.find_frame_outputs(data.notebook, ref) do
+           send_update(LivebookWeb.Output.FrameComponent,
+             id: "output-#{idx}",
+             outputs: frame.outputs,
+-            update_type: update_type
++            update_type: update_type,
++            input_views: input_views
+           )
+         end
+ 
+diff --git a/test/livebook_web/live/session_live_test.exs b/test/livebook_web/live/session_live_test.exs
+index 241aa53..e59b61f 100644
+--- a/test/livebook_web/live/session_live_test.exs
++++ b/test/livebook_web/live/session_live_test.exs
+@@ -680,6 +680,92 @@ defmodule LivebookWeb.SessionLiveTest do
+       refute content =~ "In frame"
+     end
+ 
++    test "frame update that adds inputs renders the new inputs", %{conn: conn, session: session} do
++      Session.subscribe(session.id)
++      evaluate_setup(session.pid)
++
++      section_id = insert_section(session.pid)
++      cell_id = insert_text_cell(session.pid, section_id, :code)
++
++      Session.queue_cell_evaluation(session.pid, cell_id)
++
++      frame = %{type: :frame, ref: "1", outputs: [terminal_text("In frame")], placeholder: false}
++      send(session.pid, {:runtime_evaluation_output, cell_id, frame})
++
++      {:ok, view, _} = live(conn, ~p"/sessions/#{session.id}")
++      assert render(view) =~ "In frame"
++
++      frame_update = %{
++        type: :frame_update,
++        ref: "1",
++        update: {:append, [
++          %{
++            type: :input,
++            ref: "ref1",
++            id: "input1",
++            destination: self(),
++            attrs: %{type: :text, default: "hey", label: "Name"}
++          }
++        ]}
++      }
++
++      send(session.pid, {:runtime_evaluation_output, cell_id, frame_update})
++
++      wait_for_session_update(session.pid)
++
++      # Render once, so that frame send_update is processed
++      _ = render(view)
++
++      content = render(view)
++      # Outputs already present in the frame are kept
++      assert content =~ "In frame"
++      # The newly added input is rendered with its label and default value
++      assert content =~ "Name"
++      assert content =~ "hey"
++      refute content =~ "Nothing here"
++    end
++
++    test "inputs added by frame updates are editable", %{conn: conn, session: session, test: test} do
++      section_id = insert_section(session.pid)
++
++      Process.register(self(), test)
++
++      input = %{
++        type: :input,
++        ref: "ref1",
++        id: "input1",
++        destination: test,
++        attrs: %{type: :text, default: "hey", label: "Name"}
++      }
++
++      cell_id = insert_text_cell(session.pid, section_id, :code)
++      Session.queue_cell_evaluation(session.pid, cell_id)
++
++      frame = %{type: :frame, ref: "1", outputs: [], placeholder: false}
++      send(session.pid, {:runtime_evaluation_output, cell_id, frame})
++
++      frame_update = %{
++        type: :frame_update,
++        ref: "1",
++        update: {:replace, [input]}
++      }
++
++      send(session.pid, {:runtime_evaluation_output, cell_id, frame_update})
++
++      wait_for_session_update(session.pid)
++
++      # Render once, so that frame send_update is processed
++      {:ok, view, _} = live(conn, ~p"/sessions/#{session.id}")
++      _ = render(view)
++
++      view
++      |> element(~s/[data-el-outputs-container] form/)
++      |> render_change(%{"html_value" => "sherlock"})
++
++      assert %{input_infos: %{"input1" => %{value: "sherlock"}}} = Session.get_data(session.pid)
++      assert_receive {:event, "ref1", %{value: "sherlock", type: :change}}
++    end
++
+     test "client-specific output is sent only to one target", %{conn: conn, session: session} do
+       user1 = build(:user, name: "Jake Peralta")
+       {_, client_id} = Session.register_client(session.pid, self(), user1)

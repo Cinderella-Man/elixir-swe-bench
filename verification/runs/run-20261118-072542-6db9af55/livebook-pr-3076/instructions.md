@@ -1,0 +1,13 @@
+Complete the bug_fix task in /workspace. Investigate the source and run the relevant tests.
+Test command: mix test test/livebook_web/live/hub/edit_live_test.exs.
+Add or change a test that fails in its test body on the starting source and passes after your change. Compilation/setup failures do not count.
+Required outcome (save-s3-storage): In the personal workspace settings, adding S3 storage by submitting only the fields the form displays (bucket URL, region, access key ID and secret access key) works when the bucket is reachable. Once those fields are valid the form's Add button is enabled. Saving shows "File storage added successfully", returns to the workspace page, shows the bucket URL in the workspace's storage list and stores the storage among the workspace's file systems. The saved storage belongs to the personal workspace, has the ID Livebook derives from that workspace and the bucket URL, and keeps the submitted bucket URL, region and credentials.
+Required outcome (s3-form-validation): The S3 storage form keeps its existing validation errors: when a displayed credential is left blank while the other is filled (for example an access key ID with an empty secret access key), the form shows the existing "can't be blank" error, the Add button stays disabled, and submitting the form anyway keeps it open with that error and saves no storage.
+Required outcome (s3-connection-failure): When the S3 connection test fails (for example the bucket answers 403 AccessDenied), saving shows the existing "Connection test failed" error message, the form stays open and no storage is saved. As in the starting form, the connection is tested once, when the form is saved; changing the form's fields does not contact the bucket.
+Dependencies are prepared. The workspace is offline. Preserve existing behavior and do not weaken tests.
+
+Allowed edit prefixes: lib/, test/. Changes anywhere else are discarded before grading.
+When finished, give a short summary. Your current patch is then checked in a fresh workspace.
+Model and tool calls are unlimited, and so are generated tokens. The only limit is the context window: 262144 tokens for the whole conversation, your replies included.
+History is never compacted. When the context window is full, the current patch is graded.
+Task details: {"environment":"Historical dependencies and application assets are prepared. Tests run offline with working loopback and no external services.","verification":"Add or update a *_test.exs regression test under test/. It must expose the reported defect in the original code and pass after repair. Preserve existing behavior."}

@@ -1,0 +1,245 @@
+diff --git a/lib/vutuv/mentions.ex b/lib/vutuv/mentions.ex
+index e937184..af1ab79 100644
+--- a/lib/vutuv/mentions.ex
++++ b/lib/vutuv/mentions.ex
+@@ -55,7 +55,6 @@ defmodule Vutuv.Mentions do
+   `RepairMilkdownEscapedMentions` migration), so the source stays canonical too.
+   """
+ 
+-  import Ecto.Query
+ 
+   alias Ecto.Changeset
+   alias Vutuv.Accounts.User
+@@ -72,6 +71,11 @@ defmodule Vutuv.Mentions do
+   alias Vutuv.Repo
+   alias Vutuv.SearchText
+ 
++  import Ecto.Query
++  import Vutuv.Moderation.Query, only: [account_confirmed_row: 1, account_hidden_row: 1]
++  import Vutuv.Organizations.Query, only: [organization_public_row: 1]
++  import Vutuv.SearchText, only: [name_ilike: 3]
++
+   # The canonical `@`/`#` entity grammar. It lives here (not in the renderer) so
+   # rendering, validation and rewriting share ONE definition; `VutuvWeb.Markdown`
+   # reads it through `entity_regex/0`. The leading `@`/`#` must not sit
+@@ -484,6 +488,211 @@ defmodule Vutuv.Mentions do
+ 
+   defp check_mention_limit(changeset, _field, _handles), do: changeset
+ 
++  ## Suggestions + check (the editor's `@`-picker) -----------------------------
++
++  # The two answers the composer's `@`-picker asks the server: which accounts
++  # to offer for a half-typed handle, and which of a draft's handles will become
++  # mention links. Both read the same sources the rest of this module reads —
++  # the shared handle grammar, the moderation gates, the follow/block edges —
++  # so the picker never offers an account the save will refuse and never
++  # promises a link the render will not make.
++
++  # A term shorter than two characters names nobody (a one-character prefix is
++  # anybody's handle, not a half-typed one).
++  @min_suggest_length 2
++
++  # The picker's default page size.
++  @default_suggest_limit 8
++
++  # The check's cap: a draft may name fifty handles and the client keeps the
++  # first fifty distinct ones, so the answer is bounded however wide the field.
++  @max_check_handles 50
++
++  @doc """
++  The accounts to offer for a half-typed `@term`, best match first, at most
++  `limit` of them (the default is {@link @default_suggest_limit}).
++
++  `viewer` is the signed-in member asking; the answer ranks the viewer's own
++  world first and never offers an account they have already ruled out —
++  themselves, a member they have blocked in either direction, an unconfirmed or
++  moderation-hidden member, or a page that is not publicly visible. A page is
++  never excluded by a block: blocks are between members, and pages have no
++  inbox to protect.
++
++  The term is normalized the way typed handles are (`Vutuv.Handles.normalize/1`:
++  trim, drop a leading `@`, lowercase) and is **literal** — `%`, `_` and `\` are
++  handle characters or prose, never pattern wildcards
++  (`Vutuv.SearchText.escape_like/1` keeps them literal). A term shorter than
++  two characters after normalization answers `[]`.
++
++  Members and pages are ranked together in one order: accounts the viewer
++  follows come first (a muted follow still counts), handle-prefix matches
++  before name-only matches within each group, then by name ignoring case (a
++  member's first and last name without honorifics, a page's name), then by
++  handle. The whole ranked list is taken from before the limit is applied, so
++  a smaller limit is the top of a larger one and excluded accounts never spend
++  a place.
++  """
++  def suggest(viewer, term, limit \\ @default_suggest_limit)
++
++  def suggest(%User{} = viewer, term, limit) when is_integer(limit) and limit >= 0 do
++    term_n = normalize(term)
++
++    if String.length(term_n) < @min_suggest_length do
++      []
++    else
++      viewer.id
++      |> suggestion_pool(term_n)
++      |> Enum.map(fn {kind, account} ->
++        {suggestion_sort_key(kind, account, term_n, viewer.id), {kind, account}}
++      end)
++      |> Enum.sort_by(fn {key, _entry} -> key end)
++      |> Enum.take(limit)
++      |> Enum.map(fn {_key, {kind, account}} -> {kind, account} end)
++      |> Enum.map(fn {_kind, account} -> account end)
++    end
++  end
++
++  def suggest(_viewer, _term, _limit), do: []
++
++  # The candidate pool: confirmed, not-moderation-hidden members the term
++  # names, plus publicly-visible pages the term names — the accounts a
++  # suggestion may still offer, before ranking.
++  defp suggestion_pool(viewer_id, term) do
++    handle_prefix = SearchText.escape_like(term) <> "%"
++    name_pattern = SearchText.contains(term)
++
++    from(u in User,
++      where:
++        account_confirmed_row(u) and not account_hidden_row(u) and
++          (ilike(u.username, ^handle_prefix) or name_ilike(u.first_name, u.last_name, ^name_pattern))
++    )
++    |> Repo.all()
++    |> Enum.reject(&(&1.id == viewer_id or Vutuv.Social.blocked_between?(viewer_id, &1.id)))
++    |> Enum.map(&{:user, &1})
++    |> Kernel.++(suggestion_organizations(term))
++  end
++
++  defp suggestion_organizations(term) do
++    handle_prefix = SearchText.escape_like(term) <> "%"
++    name_pattern = SearchText.contains(term)
++
++    from(o in Organization,
++      where:
++        organization_public_row(o) and not is_nil(o.username) and
++          (ilike(o.username, ^handle_prefix) or ilike(o.name, ^name_pattern))
++    )
++    |> Repo.all()
++    |> Enum.map(&{:organization, &1})
++  end
++
++  # The one ranking key for both kinds: followed first, handle-prefix before
++  # name-only, then name ignoring case, then handle. All four components
++  # compare as plain terms, which for downcased strings is exactly the
++  # character-by-character Unicode code point order the picker's order asks for
++  # (spaces and punctuation count like any other character, and `_` sorts before
++  # letters).
++  defp suggestion_sort_key(:user, %User{} = user, term, viewer_id) do
++    {followed_rank(Vutuv.Social.user_follows_user?(viewer_id, user.id)),
++     prefix_rank(user.username, term),
++     member_sort_name(user),
++     String.downcase(user.username || "")}
++  end
++
++  defp suggestion_sort_key(:organization, %Organization{} = organization, term, viewer_id) do
++    {followed_rank(Vutuv.Social.organization_follow(viewer_id, organization) != nil),
++     prefix_rank(organization.username, term),
++     String.downcase(organization.name || ""),
++     String.downcase(organization.username || "")}
++  end
++
++  # A muted follow still counts as following — only the edge's existence is
++  # asked, never its mute flag.
++  defp followed_rank(true), do: 0
++  defp followed_rank(false), do: 1
++
++  # Handle-prefix matches (rank 0) sort before name-only ones (rank 1) within
++  # the followed / not-followed group the key puts side by side.
++  defp prefix_rank(handle, term) when is_binary(handle), do: if(String.starts_with?(handle, term), do: 0, else: 1)
++  defp prefix_rank(_handle, _term), do: 1
++
++  # A member's ranking name: first and last name joined by one space, without
++  # honorifics.
++  defp member_sort_name(%User{} = user) do
++    [user.first_name, user.last_name]
++    |> Enum.reject(&(&1 in [nil, ""]))
++    |> Enum.join(" ")
++    |> String.downcase()
++  end
++
++  ## The check (the editor's "will this become a link?") ------------------------
++
++  @doc """
++  The handles `checked` — normalized like a suggestion term, blanks dropped,
++  duplicates removed keeping the first spelling's order, first
++  `max_check_handles/0` distinct ones kept — and the `resolved` MapSet of
++  exactly those that `VutuvWeb.Markdown.render/1` turns into a mention link.
++
++  No viewer is involved and the answer is the same for everyone: a handle held
++  by a member resolves whatever the member's state (confirmation,
++  moderation, blocks), while a handle held by a page resolves only while that
++  page is publicly visible — which is the renderer's own gate, so check and
++  render cannot drift. The one divergence from a plain lookup is Markdown
++  formatting: a `_` emphasis run the renderer applies can take the handle apart
++  before the mention pass sees it (`@max_mustermann_`), and such a handle is
++  answered unresolved.
++  """
++  def check_handles(handles) when is_list(handles) do
++    checked =
++      handles
++      |> Enum.map(&normalize/1)
++      |> Enum.reject(&(&1 == ""))
++      |> Enum.uniq()
++      |> Enum.take(@max_check_handles)
++
++    resolved =
++      Enum.reduce(checked, MapSet.new(), fn handle, acc ->
++        if renders_as_mention?(handle), do: MapSet.put(acc, handle), else: acc
++      end)
++
++    {checked, resolved}
++  end
++
++  def check_handles(_), do: {[], MapSet.new()}
++
++  # Renders one handle the way a typed mention would appear and asks the real
++  # renderer. The answer is the renderer's alone — formatting first, entity
++  # link second — so check and render cannot disagree about what a handle
++  # becomes.
++  defp renders_as_mention?(handle) do
++    html =
++      handle
++      |> mention_probe()
++      |> VutuvWeb.Markdown.render()
++      |> Phoenix.HTML.safe_to_string()
++
++    Regex.match?(~r{<a href="/#{handle}"[^>]*class="mention"}, html)
++  end
++
++  # The shape a typed handle is written in: a bare `@handle`, as the editor's
++  # canonical form stores it and the picker proposes it.
++  defp mention_probe(handle), do: "hi @#{handle}!"
++
++  @doc """
++  How many handles one check call answers about.
++  """
++  def max_check_handles, do: @max_check_handles
++
++  @doc """
++  How many suggestions the picker asks for per term by default.
++  """
++  def default_suggest_limit, do: @default_suggest_limit
++
++  @doc """
++  The shortest term a suggestion asks about (shorter answers nothing).
++  """
++  def min_suggest_length, do: @min_suggest_length
++
+   @doc """
+   Rejects a changeset whose handle `field` is already mentioned in a public
+   post, so a deliberate rename/claim cannot silently inherit someone else's
+@@ -501,8 +710,6 @@ defmodule Vutuv.Mentions do
+     end
+   end
+ 
+-  ## Availability + propagation (DB) ----------------------------------------
+-
+   @doc """
+   Whether `handle` is already used as a mention in any **public post**.
+ 

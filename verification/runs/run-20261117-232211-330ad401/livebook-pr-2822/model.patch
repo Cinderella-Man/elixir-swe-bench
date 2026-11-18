@@ -1,0 +1,134 @@
+diff --git a/lib/livebook/runtime/evaluator.ex b/lib/livebook/runtime/evaluator.ex
+index 2343b84..4f0100f 100644
+--- a/lib/livebook/runtime/evaluator.ex
++++ b/lib/livebook/runtime/evaluator.ex
+@@ -468,8 +468,35 @@ defmodule Livebook.Runtime.Evaluator do
+           identifiers_used = :unknown
+           identifiers_defined = %{}
+           identifier_definitions = []
+-          # Empty context
+-          new_context = initial_context()
++
++          # Roll back the process dictionary to the state that was in effect
++          # before the evaluation, since the failed evaluation must not leave
++          # any of its changes behind
++          set_pdict(context, state.ignored_pdict_keys)
++
++          # The evaluation failed, so we don't record any context out of it.
++          # We fall back to the context that was in effect before the evaluation
++          # and roll back all the changes that the evaluation introduced, so
++          # that the evaluations that depend on this one don't inherit any of
++          # the failed evaluation's state.
++          #
++          # We still keep the imports and the process dictionary from the
++          # context that was in effect before the evaluation, so that the
++          # subsequent evaluations can continue from where the earlier ones
++          # left off, instead of starting from scratch.
++          new_context = %{
++            id: context.id,
++            binding: [],
++            env: %{
++              context.env
++              | aliases: [],
++                versioned_vars: %{},
++                context_modules: [],
++                requires: []
++            },
++            pdict: context.pdict
++          }
++
+           {new_context, result, identifiers_used, identifiers_defined, identifier_definitions}
+       end
+ 
+diff --git a/test/livebook/runtime/evaluator_test.exs b/test/livebook/runtime/evaluator_test.exs
+index 6d2fe89..1b40d3c 100644
+--- a/test/livebook/runtime/evaluator_test.exs
++++ b/test/livebook/runtime/evaluator_test.exs
+@@ -362,6 +362,87 @@ defmodule Livebook.Runtime.EvaluatorTest do
+                       metadata()}
+     end
+ 
++    test "in case of an error the evaluation context is empty", %{evaluator: evaluator} do
++      Evaluator.evaluate_code(evaluator, :elixir, "import ExUnit.Assertions", :code_1, [])
++      assert_receive {:runtime_evaluation_response, :code_1, _, metadata()}
++
++      Evaluator.evaluate_code(evaluator, :elixir, "Process.put(:x, 41)", :code_2, [:code_1])
++      assert_receive {:runtime_evaluation_response, :code_2, _, metadata()}
++
++      Evaluator.evaluate_code(evaluator, :elixir, "y = 2\nraise :<", :code_3, [:code_2])
++      assert_receive {:runtime_evaluation_response, :code_3, error(_), metadata()}
++
++      context = Evaluator.get_evaluation_context(evaluator, [:code_3])
++
++      # The failed evaluation does not record a context of its own, so none
++      # of the bindings, aliases, versioned variables or context modules that
++      # were in effect before or were introduced by it are kept
++      assert context.binding == []
++      assert context.env.aliases == []
++      assert context.env.versioned_vars == %{}
++      assert context.env.context_modules == []
++      refute Enum.member?(context.env.requires, ExUnit.Assertions)
++
++      # The imports and the process dictionary from the context that was in
++      # effect before the failed evaluation are still available
++      assert Enum.any?(context.env.functions, fn {module, _functions} ->
++               module == ExUnit.Assertions
++             end)
++
++      assert Enum.any?(context.env.macros, fn {module, _macros} -> module == ExUnit.Assertions end)
++
++      assert context.pdict == %{x: 41}
++    end
++
++    test "in case of an error later evaluations see the context of the successful evaluations",
++         %{evaluator: evaluator} do
++      Evaluator.evaluate_code(evaluator, :elixir, "x = 1", :code_1, [])
++
++      assert_receive {:runtime_evaluation_response, :code_1, terminal_text(ansi_number(1)),
++                      metadata()}
++
++      Evaluator.evaluate_code(evaluator, :elixir, "Process.put(:x, 41)", :code_2, [:code_1])
++      assert_receive {:runtime_evaluation_response, :code_2, _, metadata()}
++
++      Evaluator.evaluate_code(evaluator, :elixir, "y = 2\nraise :<", :code_3, [:code_2])
++      assert_receive {:runtime_evaluation_response, :code_3, error(_), metadata()}
++
++      # The later evaluations see the context of the earlier successful
++      # evaluations only, since the failed evaluation contributes nothing
++      Evaluator.evaluate_code(evaluator, :elixir, "x * 2", :code_4, [:code_3, :code_2, :code_1])
++
++      assert_receive {:runtime_evaluation_response, :code_4, terminal_text(ansi_number(2)),
++                      metadata()}
++
++      Evaluator.evaluate_code(evaluator, :elixir, "Process.get(:x)", :code_5, [
++        :code_4,
++        :code_3,
++        :code_2,
++        :code_1
++      ])
++
++      assert_receive {:runtime_evaluation_response, :code_5, terminal_text(ansi_number(41)),
++                      metadata()}
++    end
++
++    test "in case of an error later evaluations can still use the imports of the previous evaluations",
++         %{evaluator: evaluator} do
++      Evaluator.evaluate_code(evaluator, :elixir, "import ExUnit.Assertions", :code_1, [])
++      assert_receive {:runtime_evaluation_response, :code_1, _, metadata()}
++
++      Evaluator.evaluate_code(evaluator, :elixir, "raise :<", :code_2, [:code_1])
++      assert_receive {:runtime_evaluation_response, :code_2, error(_), metadata()}
++
++      # The import from the successful evaluation is still visible to the
++      # subsequent evaluations, even though the failed one is their only
++      # evaluation parent
++      Evaluator.evaluate_code(evaluator, :elixir, "assert false", :code_3, [:code_2])
++
++      assert_receive {:runtime_evaluation_response, :code_3, error(message), metadata()}
++
++      assert clean_message(message) =~ "Expected truthy, got false"
++    end
++
+     test "given file option sets it in evaluation environment", %{evaluator: evaluator} do
+       code = """
+       __DIR__
