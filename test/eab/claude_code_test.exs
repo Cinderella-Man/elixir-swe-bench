@@ -850,6 +850,26 @@ defmodule Eab.ClaudeCodeTest do
         do: assert(log =~ ~s("broker":"#{step}"))
   end
 
+  test "a tool call whose patch snapshot fails returns the tool's own result" do
+    Application.put_env(:eab, :claude_code_workspace, %{
+      execute: fn _box, name, _arguments ->
+        %{"content" => [%{"type" => "text", "text" => "ran #{name}"}], "isError" => false}
+      end,
+      patch: fn _box -> raise "The workspace diff is over the 1048576-byte patch limit" end
+    })
+
+    prefix = "runs/run-x/case-x"
+    Store.write_text("#{prefix}/model.patch", "diff --git a/lib/a.ex b/lib/a.ex\n")
+    state = %{tools: 1, agent_id: "agent-1", box: %{name: "eab-box"}, prefix: prefix, key: ""}
+
+    assert ClaudeCode.Attempt.tool(state, "bash", %{"command" => "rm -rf lib"}) == %{
+             "content" => [%{"type" => "text", "text" => "ran bash"}],
+             "isError" => false
+           }
+
+    assert File.read!(Store.path("#{prefix}/model.patch")) == "diff --git a/lib/a.ex b/lib/a.ex\n"
+  end
+
   test "parallel solvers each reach only their own workspace, whatever the order" do
     task_x = start_attempt("Prompt X\n", [], "case-x")
     task_y = start_attempt("Prompt Y\n", [], "case-y")

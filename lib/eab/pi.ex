@@ -132,7 +132,9 @@ defmodule Eab.Pi do
 
     state = %{
       state(endpoint, key, settings, prefix, emit, Keyword.get(opts, :measure, true))
-      | snapshot: fn -> Store.write_text("#{prefix}/model.patch", Sandbox.patch(box), key) end
+      | snapshot: fn ->
+          Sandbox.snapshot("#{prefix}/model.patch", key, fn -> Sandbox.patch(box) end)
+        end
     }
 
     result =

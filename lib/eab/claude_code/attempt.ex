@@ -96,7 +96,9 @@ defmodule Eab.ClaudeCode.Attempt do
     append(state, %{"name" => name, "arguments" => arguments, "result" => result})
 
     if name in @mutating do
-      Store.write_text("#{state.prefix}/model.patch", workspace().patch.(state.box), state.key)
+      Sandbox.snapshot("#{state.prefix}/model.patch", state.key, fn ->
+        workspace().patch.(state.box)
+      end)
     end
 
     result

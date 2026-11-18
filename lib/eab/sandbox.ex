@@ -1,5 +1,7 @@
 defmodule Eab.Sandbox do
-  alias Eab.{AgentImage, Command, Inventory, Store}
+  alias Eab.{Activity, AgentImage, Command, Inventory, Store}
+  # The largest patch an attempt can save and submit.
+  @patch_limit 1_048_576
 
   def with_box(id, run_id, fun, opts \\ []) do
     runtime = Store.read("runtimes/#{id}.json") || raise "Fixture is not prepared"
@@ -178,16 +180,51 @@ defmodule Eab.Sandbox do
   # the agent left in the workspace, such as a log or a dump in another folder, is not part
   # of it and cannot make the patch too large to save.
   def patch(box) do
-    command!(
-      box,
+    box
+    |> command(
       ~S|index=$(mktemp -u) && trap 'rm -f "$index"' EXIT && | <>
         ~S|cp "$(git rev-parse --git-path index)" "$index" 2>/dev/null; | <>
         ~S|export GIT_INDEX_FILE="$index" && git add -A && git diff --cached --binary HEAD| <>
         patch_scope(box[:spec]),
-      limit: 1_048_576,
+      limit: @patch_limit,
       timeout: 60,
       quiet: true
     )
+    |> patch_output()
+  end
+
+  # An oversized diff is reported by its size: its cut-down text would fill the error.
+  @doc false
+  def patch_output(%{"output_truncated" => true}),
+    do: raise("The workspace diff is over the #{@patch_limit}-byte patch limit")
+
+  def patch_output(%{"returncode" => 0, "output" => output}), do: output
+  def patch_output(%{"output" => output}), do: raise("Workspace command failed: #{output}")
+
+  @doc """
+  Saves the workspace's current patch at `path` after an agent's tool call, as a record of
+  its progress. The submission is taken again once the agent stops, so a snapshot that
+  cannot be taken keeps the previous one and the attempt goes on. A command can leave the
+  workspace mid-change: on 2026-11-18 a Beacon attempt removed `lib/` before a copy back
+  that failed, and the diff deleting all of it was over the patch limit.
+  """
+  def snapshot(path, key, patch) do
+    taken =
+      try do
+        {:ok, patch.()}
+      rescue
+        error -> {:error, Exception.message(error)}
+      end
+
+    case taken do
+      {:ok, body} ->
+        Store.write_text(path, body, key)
+
+      {:error, reason} ->
+        Activity.note(
+          "Patch snapshot skipped, the previous one is kept: " <> String.slice(reason, 0, 500)
+        )
+    end
   end
 
   @doc false
