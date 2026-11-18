@@ -22,15 +22,19 @@ To retire the current release later, move its files from `results/` into a new `
 
 A series' name is its model, its quantization when it has one, and its thinking level: Extra for `xhigh`, Max for `max`, and so on, as in "Opus 5.5 Extra". Its harness and version, run count, settings and memory are in its details, opened by clicking the point. In the details, an "over 262k" tag marks a case, and a run, where the model generated more than the declared 262,144-token budget; Claude Code cannot enforce that budget, so the attempt is flagged, not failed. A grey tag marks a case cut off by a budget before the agent had finished: "stopped at 65k" when a generation budget ran out (local series have had none since ADR 0016, and show "Generation budget / case: No cap"), "context full" when the conversation filled the context limit, and "reply cut at 8k" when one reply reached the 8,192-token per-reply limit mid-answer. Only series made before [ADR 0015](../docs/adr/0015-drop-the-per-reply-token-cap.md) have that limit; later local series show "Tokens / response: No cap". The patch at that point was graded, so a cut-off case can still pass. In a release with token allowances ([ADR 0021](../docs/adr/0021-give-each-case-a-token-allowance.md)) it cannot: a case passes only if the agent finished on its own inside the case's allowance. The case list then shows each case's output tokens beside its allowance, the grey tag reads "stopped at allowance", and a "patch passed" tag marks a case whose patch passed every check although the attempt did not finish inside the allowance. Schema 11 records that verdict as each case's `patch_passed`, and the allowances in the series' `setup`. No release sets allowances.
 
+## Dark and light
+
+The page is dark by default. A button in the top corner switches to light and back, and the choice is kept in the browser. Every colour is a variable set once per theme in `styles.css`; the line and family colours are each theme's own steps of the same hues, checked against that theme's background. On the dark background only four family colours pass every pairwise check, so the second family's colour differs between the themes.
+
 ## Cases against context
 
 Where a release has series that recorded their attempts' peak context, as v6 does, the chart is cases solved against the context the whole attempt must fit in, from 0 to 262,144 tokens ([ADR 0022](../docs/adr/0022-score-runs-at-context-sizes.md)). Memory is no longer an axis there: a model's peak VRAM + RAM is measured with the whole 262,144-token window reserved, whatever the work needed, and hosted models have none. It stays in the table view and in each series' details.
 
-Each series is one line. It steps up at every case the series solves, at that attempt's peak context, averaged over its runs, so its height at any point is what the model solves when the whole attempt must fit in that much context. A dot ends each line at 262,144.
+Each series is one line with a dot every 16,384 tokens, from 32,768 to 262,144: the cases the series solves when the whole attempt must fit in that much context, averaged over its runs. The five context sizes are among those readings, so a dot there shows the number the table view gives. The lines between dots only join them. The dot that ends a line at 262,144 shows the harness by its shape and is hollow while the series is provisional.
 
-Every line is named beside the plot, at the height where it ends and joined to that end by a thin line, with the cases it solves inside 262,144 tokens. Names that would overlap are moved apart in the order the lines end. On a narrow page the names are a list under the plot. Pointing at a name, or near a line, lights that line and dims the rest. Pointing anywhere in the plot shows every series' count at that much context, most first. A series without recorded peaks has no line and is listed last. Clicking a name or the dot at a line's end opens the series' details.
+A legend above the plot names every line with its key, most cases first, and the number after a name is what the series solves inside 262,144 tokens. Pointing at a name, or near a line, lights that line and dims the rest. Pointing anywhere in the plot shows every series' count at the nearest reading, most first. A series without recorded peaks has no line and is listed last. Clicking a name or the dot at a line's end opens the series' details.
 
-Here the five colours go to the five best families whatever their size, because a line needs its own colour to be followed, and the sixth and later families are grey. Five colours cannot name every line, so a family's series share its colour and differ in dashes, and the grey families differ from each other in dashes.
+Each line has its own colour and its own dashes, both following the series in the order the series were first run, so neither changes when scores change or a series is added. Eight colours cannot all be told apart at a glance: blue and violet, aqua and green, and orange and red are near each other. The four dash styles are dealt so that no two near colours share one. A ninth series and later are grey.
 
 Until 2026-11-18 a strip beside the plot, **As run**, held a second dot per series: its own score with no context size applied. It read as part of the context axis and confused more than it told, so it was removed. That score is the **Cases passed** column of the table view and the score in a series' details.
 
@@ -159,6 +163,7 @@ The workflow runs the publication checks, builds `results-page/dist/`, uploads o
 ## Files
 
 - `index.html`, `styles.css`, `app.js`: page and interactions.
+- `theme.js`: sets the dark or light theme before the page is drawn. It is a file of its own because the page's content policy allows no inline script.
 - `results/*.json`: one public record per run series of the current release, named by its series ID; these are the everyday additions.
 - `releases/<name>/*.json`: the series of an earlier release, kept as published.
 - `releases.json`: the release the page opens on, and a note per release.

@@ -319,7 +319,7 @@ defmodule Eab.RunsTest do
     page = Path.join(System.tmp_dir!(), "eab-rerun-page-#{System.unique_integer([:positive])}")
     File.mkdir_p!(page)
 
-    for file <- ~w(index.html styles.css app.js),
+    for file <- ~w(index.html styles.css theme.js app.js),
         do: File.cp!(Path.join(Eab.Results.root(), file), Path.join(page, file))
 
     previous = Application.get_env(:eab, :results_page_root)

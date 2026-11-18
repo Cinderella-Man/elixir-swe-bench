@@ -9,6 +9,23 @@
     if (text !== undefined) e.textContent = text;
     return e;
   };
+  // Dark or light: theme.js set it before the page was drawn, the button in the corner changes it and keeps the
+  // choice. Every colour on the page is a variable of the theme, so nothing is drawn again.
+  const toggle = $("theme-toggle");
+  if (toggle) {
+    const show = theme => {
+      document.documentElement.dataset.theme = theme;
+      toggle.textContent = theme === "dark" ? "\u2600\uFE0E Light" : "\u263E\uFE0E Dark";
+      toggle.setAttribute("aria-label", theme === "dark" ? "Switch to light mode" : "Switch to dark mode");
+    };
+    show(document.documentElement.dataset.theme === "light" ? "light" : "dark");
+    toggle.hidden = false;
+    toggle.addEventListener("click", () => {
+      const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+      try { localStorage.setItem("theme", next); } catch { /* no storage: the choice lasts for this visit */ }
+      show(next);
+    });
+  }
   // An older controller's payload (schema 8 or 9) simply has no timing or machines; before 11, no patch verdicts;
   // before 12, no context sizes.
   if (!data || ![8, 9, 10, 11, 12].includes(data.schema_version) || !Array.isArray(data.releases) || data.releases.length === 0) {
@@ -518,12 +535,12 @@
   // another model, so it keeps its own family: "...-GSQ-RCO-Coder" belongs to "...-Coder".
   const family = r => r.model.family || r.model.name.replace(/-(GSQ-RCO|Gyro-[A-Z]+)(?=-|$)/, "");
   const memberName = r => [quant(r), effort(r)].filter(Boolean).join(" ") || chartName(r);
-  // These five hues pass every pairwise colour check on white (the dataviz validator with --pairs all). In this fixed
-  // order they go to the families with more than one series, best family first; every other family is grey. Where
-  // the chart draws a line per series, a line needs its own colour to be followed, so there the hues go to the best
-  // five families whatever their size. Colours are decided once from all results, so the filter below never repaints
-  // a family.
-  const HUES = ["#2a78d6", "#1baf7a", "#eda100", "#008300", "#e34948"], GREY = "#8a8494";
+  // Five family colours, each theme's own (styles.css): on white all five pass every pairwise colour check (the
+  // dataviz validator with --pairs all), on the dark background the first four do. In this fixed order they go to
+  // the families with more than one series, best family first; every other family is grey. The chart of cases
+  // against context colours each series instead (lineStyles). Colours are decided once from all results, so the
+  // filter below never repaints a family.
+  const HUES = [1, 2, 3, 4, 5].map(n => `var(--f${n})`), GREY = "var(--grey)";
   const grouped = list => {
     const groups = new Map();
     for (const r of list) groups.set(family(r), [...(groups.get(family(r)) || []), r]);
@@ -533,7 +550,7 @@
   const familyColors = (() => {
     let slot = 0;
     return new Map(grouped(release.results).map(([name, members]) =>
-      [name, (members.length > 1 || sized.length > 0) && slot < HUES.length ? HUES[slot++] : GREY]));
+      [name, members.length > 1 && slot < HUES.length ? HUES[slot++] : GREY]));
   })();
   const families = new Map(grouped(records).map(([name, members]) => [name, {name, members, color: familyColors.get(name)}]));
   // A family's best series carries its name on the chart: most cases passed, then least memory.
@@ -552,7 +569,11 @@
   }
   const svg = (tag, attributes) => {
     const e = document.createElementNS("http://www.w3.org/2000/svg", tag);
-    for (const [key, value] of Object.entries(attributes)) e.setAttribute(key, value);
+    // A theme colour is a variable, which a style can hold and an attribute cannot.
+    for (const [key, value] of Object.entries(attributes)) {
+      if ((key === "stroke" || key === "fill") && String(value).startsWith("var(")) e.style[key] = value;
+      else e.setAttribute(key, value);
+    }
     return e;
   };
   const xOf = r => required(r) / 1e9 / memoryMax * 100, yOf = r => 100 - r.score_percent;
@@ -758,152 +779,157 @@
     return figure;
   }
   const largestSize = sizes.at(-1);
-  // The peak context of every attempt a series solved inside the largest size, smallest first: where its line steps.
-  const peaksOf = r => {
-    const counted = [];
-    for (const run of r.runs) for (const c of run.cases) if (inside(c, largestSize)) counted.push(c.peak_context_tokens);
-    return counted.sort((a, b) => a - b);
-  };
+  // A line is read every 16,384 tokens, from 32,768 up: each of the five context sizes is one of those readings, so
+  // a dot there shows the number the table gives.
+  const stepSize = largestSize / 16, firstSize = stepSize * 2;
+  const readings = Array.from({length: (largestSize - firstSize) / stepSize + 1}, (_, i) => firstSize + i * stepSize);
+  const across = tokens => (tokens - firstSize) / (largestSize - firstSize) * 100;
   // Cases a series solves with the whole attempt inside `tokens` of context, as the mean of its runs.
-  const solvedInside = (r, tokens) => peaksOf(r).filter(peak => peak <= tokens).length / r.runs.length;
+  const solvedInside = (r, tokens) => {
+    let solved = 0;
+    for (const run of r.runs) for (const c of run.cases) if (inside(c, tokens)) solved += 1;
+    return solved / r.runs.length;
+  };
   const countText = cases => fmt(Math.round(cases * 10) / 10);
-  function steps(r) {
-    let solved = 0, d = "M0,100";
-    for (const tokens of peaksOf(r)) {
-      solved += 1 / r.runs.length;
-      d += ` H${tokens / largestSize * 100} V${100 - solved / r.total * 100}`;
-    }
-    return d + " H100";
-  }
-  // Five hues cannot name every line, so a line is told apart by its hue and its stroke: a family's series share the
-  // family's hue and differ in dashes, and the grey families differ from each other in dashes. Decided once from all
-  // results, like the hues, so the filter never restyles a line.
-  const DASHES = ["", "7 4", "2 4", "11 4 2 4"];
+  // Each line has its own colour and its own dashes. Eight colours cannot all be told from each other at a glance,
+  // so the dashes are dealt in fours: the colours that are near each other (blue and violet, aqua and green, orange
+  // and red) never share a stroke. Colour and stroke follow the series, in the order the series were first run, so
+  // neither changes when scores do or when a series is added. A ninth series and later are grey.
+  const DASHES = ["", "7 4", "2 4", "11 4 2 4"], LINE_HUES = 8;
   const lineStyles = (() => {
-    const styles = new Map();
-    let grey = 0;
-    for (const [name, members] of grouped(release.results)) {
-      const color = familyColors.get(name);
-      [...members].sort((a, b) => b.score_percent - a.score_percent || chartName(a).localeCompare(chartName(b)) || a.series_id.localeCompare(b.series_id))
-        .forEach((r, i) => styles.set(r.series_id, {color, dash: DASHES[(color === GREY ? grey++ : i) % DASHES.length]}));
-    }
-    return styles;
+    const first = r => r.runs.map(run => run.created_at).sort()[0];
+    const ordered = release.results.filter(r => r.by_context)
+      .sort((a, b) => first(a).localeCompare(first(b)) || a.series_id.localeCompare(b.series_id));
+    return new Map(ordered.map((r, i) => [r.series_id, {color: i < LINE_HUES ? `var(--s${i + 1})` : GREY, dash: DASHES[i % DASHES.length]}]));
   })();
-  // Lights one series up and dims the rest, wherever the pointer met it: its line, its end dot or its name.
+  const lineKey = style => {
+    const key = svg("svg", {class: "line-key", viewBox: "0 0 30 12", "aria-hidden": "true"});
+    key.append(svg("line", {x1: 1, y1: 6, x2: 29, y2: 6, stroke: style.color, "stroke-width": 2, "stroke-dasharray": style.dash}),
+      svg("circle", {cx: 15, cy: 6, r: 3.5, fill: style.color}));
+    return key;
+  };
+  // Lights one series up and dims the rest, wherever the pointer met it: its line, its dots or its name.
   function focusSeries(id) {
     const figure = document.querySelector(".scatter.curves");
     if (!figure) return;
     figure.classList.toggle("has-focus", Boolean(id));
     for (const mark of figure.querySelectorAll("[data-series]")) mark.classList.toggle("focus", mark.dataset.series === id);
   }
-  function choose(id, refocus) {
-    selected = selected === id ? null : id;
-    render();
-    document.getElementById(refocus)?.focus();
-  }
-  // The name of a line: its family, then what tells this series from the family's others.
-  function nameRow(r, end) {
-    const style = lineStyles.get(r.series_id), row = node("li", "name-row");
-    const button = node("button", "line-name" + (faded(r) ? " faded" : "") + (selected === r.series_id ? " selected" : ""));
-    button.id = `name-${r.series_id}`;
+  // A line's name in the legend: its key, the model, what tells this series from the model's others, and what it
+  // solves inside the largest size.
+  function legendEntry(r) {
+    const style = lineStyles.get(r.series_id), end = r.by_context?.[largestSize], entry = node("li");
+    const button = node("button", "legend-series" + (selected === r.series_id ? " selected" : ""));
+    button.id = `legend-${r.series_id}`;
     button.dataset.series = r.series_id;
-    if (end) row.dataset.end = end.score_percent;
-    const key = svg("svg", {class: "name-key", viewBox: "0 0 26 12", "aria-hidden": "true"});
-    if (end) key.append(svg("line", {x1: 1, y1: 6, x2: 25, y2: 6, stroke: style.color, "stroke-width": 2.5, "stroke-linecap": "butt", "stroke-dasharray": style.dash}));
-    const text = node("span", "name-text");
     const alone = families.get(family(r)).members.length === 1 && hosted(r);
-    text.append(node("span", "model-name", alone ? chartName(r) : family(r)));
-    if (!alone) text.append(node("span", "point-meta", memberName(r)));
-    if (records.filter(other => chartName(other) === chartName(r)).length > 1) text.append(node("span", "point-meta", `${harness(r)} · Series ${r.series_id.slice(0, 8)}`));
-    if (!end) text.append(node("span", "point-meta", "No context recorded: no line"));
-    button.append(key, text, node("span", "name-value", end ? countText(end.score_percent * r.total / 100) : "—"));
+    if (style) button.append(lineKey(style));
+    button.append(node("span", "series-name", alone ? chartName(r) : family(r)));
+    if (!alone) button.append(node("span", "series-meta", memberName(r)));
+    if (records.filter(other => chartName(other) === chartName(r)).length > 1) button.append(node("span", "series-meta", `${harness(r)} · Series ${r.series_id.slice(0, 8)}`));
+    button.append(node("span", "series-value", end ? countText(end.score_percent * r.total / 100) : "no context recorded"));
+    button.title = end ? `${countText(end.score_percent * r.total / 100)} of ${r.total} cases solved inside ${tokensText(largestSize)} tokens of context` : "No line: its runs did not record context";
     button.setAttribute("aria-label", `${chartName(r)}, ${harness(r)}, ` + (end ? `${countText(end.score_percent * r.total / 100)} of ${r.total} cases inside ` +
       `${tokensText(largestSize)} tokens of context` : "no context recorded") + `, ${runsText(r)}. Show details`);
     button.setAttribute("aria-expanded", String(selected === r.series_id));
     if (selected === r.series_id) button.setAttribute("aria-controls", "run-detail");
-    button.addEventListener("click", () => choose(r.series_id, button.id));
+    button.addEventListener("click", () => {
+      selected = selected === r.series_id ? null : r.series_id;
+      render();
+      document.getElementById(button.id)?.focus();
+    });
     for (const show of ["pointerenter", "focus"]) button.addEventListener(show, () => focusSeries(r.series_id));
     for (const hide of ["pointerleave", "blur"]) button.addEventListener(hide, () => focusSeries(null));
-    row.append(button);
-    return row;
+    entry.append(button);
+    return entry;
   }
   // The chart of a release whose series recorded their attempts' peak context (ADR 0022): cases solved against the
-  // context the whole attempt must fit in. Each series is one line that steps up at every case it solves, averaged
-  // over its runs, and ends at the largest size. Beside the plot every line is named, in the order the lines end and
-  // joined to its end; pointing at the plot reads every series at that much context. A series without recorded peaks
-  // has no line, only its name.
+  // context the whole attempt must fit in. Each series is one line with a dot at every reading, averaged over its
+  // runs. A legend above the plot names the lines, most cases first; pointing at the plot reads every series at the
+  // nearest reading. A series without recorded peaks has no line, only its name.
   function curves(shown) {
     const figure = node("div", "scatter curves");
     const endOf = r => r.by_context[largestSize].score_percent;
     const lined = shown.filter(r => r.by_context).sort((a, b) => endOf(b) - endOf(a) || chartName(a).localeCompare(chartName(b)));
-    const unlined = shown.filter(r => !r.by_context);
+    const names = node("ol", "series-legend");
+    names.setAttribute("aria-label", `Run series, by cases solved inside ${tokensText(largestSize)} tokens of context`);
+    for (const r of [...lined, ...shown.filter(r => !r.by_context)]) names.append(legendEntry(r));
     const list = node("div", "scatter-legend");
     const item = (mark, text) => { const entry = node("span", "legend-item"); entry.append(node("span", `legend-mark ${mark}`), text); list.append(entry); };
     if (shown.some(r => r.harness.name === "pi")) item("circle", "Pi");
     if (shown.some(r => r.harness.name === "claude_code")) item("diamond", "Claude Code");
     if (shown.some(r => !r.complete)) item("circle hollow", "Provisional (fewer than 3 runs)");
-    figure.append(chips(), list, node("div", "y-caption", "Cases solved (mean of runs)"));
-    const body = node("div", "scatter-body named"), wrap = node("div", "plot-wrap"), area = node("div", "scatter-plot");
+    figure.append(names, list, node("div", "y-caption", "Cases solved (mean of runs)"));
+    const body = node("div", "scatter-body"), area = node("div", "scatter-plot");
     for (const value of ticks(release.benchmark.case_count)) {
       const line = node("div", "grid-row");
       line.style.bottom = `${value / release.benchmark.case_count * 100}%`;
       line.append(node("span", "y-tick", value));
       area.append(line);
     }
-    for (const tokens of [0, ...sizes]) {
+    for (const tokens of [firstSize, ...sizes]) {
       const line = node("div", "grid-col");
-      line.style.left = `${tokens / largestSize * 100}%`;
-      line.append(node("span", "x-tick" + (tokens === largestSize ? " end" : ""), tokens ? tokensText(tokens) : "0"));
+      line.style.left = `${across(tokens)}%`;
+      line.append(node("span", "x-tick" + (tokens === largestSize ? " end" : tokens === firstSize ? " start" : ""), tokensText(tokens)));
       area.append(line);
     }
     const layer = svg("svg", {class: "plot-lines", viewBox: "0 0 100 100", preserveAspectRatio: "none", "aria-hidden": "true"});
+    const heights = new Map(lined.map(r => [r.series_id, readings.map(tokens => solvedInside(r, tokens) / r.total * 100)]));
     for (const r of lined) {
-      const style = lineStyles.get(r.series_id);
-      const path = svg("path", {class: "context-line" + (faded(r) ? " faded" : "") + (selected === r.series_id ? " selected" : ""),
-        stroke: style.color, "stroke-dasharray": style.dash, d: steps(r)});
+      const style = lineStyles.get(r.series_id), state = (faded(r) ? " faded" : "") + (selected === r.series_id ? " selected" : "");
+      const path = svg("path", {class: "context-line" + state, stroke: style.color, "stroke-dasharray": style.dash,
+        d: heights.get(r.series_id).map((height, i) => `${i ? "L" : "M"}${across(readings[i])},${100 - height}`).join(" ")});
       path.dataset.series = r.series_id;
       layer.append(path);
     }
     const hair = node("div", "crosshair");
     hair.hidden = true;
     area.append(layer, hair);
-    // Where a line ends: what the series solves inside the largest size. Its name is beside the plot.
     for (const r of lined) {
+      const style = lineStyles.get(r.series_id);
+      // The last reading is the series' end: its dot there opens its details and shows the harness and whether it is provisional.
+      heights.get(r.series_id).slice(0, -1).forEach((height, i) => {
+        const dot = node("span", "sample-dot" + (faded(r) ? " faded" : ""));
+        dot.dataset.series = r.series_id;
+        dot.style.left = `${across(readings[i])}%`;
+        dot.style.bottom = `${height}%`;
+        dot.style.setProperty("--dot", style.color);
+        area.append(dot);
+      });
       const end = r.by_context[largestSize];
-      const dot = point(r, 1, false, 0, 0, {score_percent: end.score_percent, interval_percent: end.interval_percent,
+      const last = point(r, 1, false, 0, 0, {score_percent: end.score_percent, interval_percent: end.interval_percent,
         tip_note: `inside ${tokensText(largestSize)} tokens of context`}, "-end");
-      dot.querySelector(".point-label").remove();
-      dot.dataset.series = r.series_id;
-      for (const show of ["pointerenter", "focus"]) dot.addEventListener(show, () => focusSeries(r.series_id));
-      for (const hide of ["pointerleave", "blur"]) dot.addEventListener(hide, () => focusSeries(null));
-      area.append(dot);
+      last.querySelector(".point-label").remove();
+      last.dataset.series = r.series_id;
+      last.style.setProperty("--dot", style.color);
+      for (const show of ["pointerenter", "focus"]) last.addEventListener(show, () => focusSeries(r.series_id));
+      for (const hide of ["pointerleave", "blur"]) last.addEventListener(hide, () => focusSeries(null));
+      area.append(last);
     }
     const tipBox = node("div", "chart-tip");
     tipBox.hidden = true;
     tipBox.setAttribute("role", "tooltip");
-    // One readout for the whole plot: every series at the context under the pointer, most cases first. The line
+    // One readout for the whole plot: every series at the reading nearest the pointer, most cases first. The line
     // nearest the pointer is lit, so a line can be asked its name.
     const readout = event => {
       if (event.target.closest(".scatter-point")) return;
       const box = area.getBoundingClientRect();
-      const across = Math.min(Math.max((event.clientX - box.left) / box.width, 0), 1), tokens = across * largestSize;
-      const rows = lined.filter(r => !faded(r)).map(r => ({r, solved: solvedInside(r, tokens)}))
-        .sort((a, b) => b.solved - a.solved || endOf(b.r) - endOf(a.r));
+      const at = Math.min(Math.max(Math.round((event.clientX - box.left) / box.width * (readings.length - 1)), 0), readings.length - 1);
+      const rows = lined.filter(r => !faded(r)).map(r => ({r, height: heights.get(r.series_id)[at]}))
+        .sort((a, b) => b.height - a.height || endOf(b.r) - endOf(a.r));
       if (!rows.length) return;
-      const height = row => box.bottom - row.solved / row.r.total * box.height;
-      const near = rows.reduce((best, row) => Math.abs(height(row) - event.clientY) < Math.abs(height(best) - event.clientY) ? row : best);
-      const lit = Math.abs(height(near) - event.clientY) <= 14 ? near.r.series_id : null;
+      const y = row => box.bottom - row.height / 100 * box.height;
+      const near = rows.reduce((best, row) => Math.abs(y(row) - event.clientY) < Math.abs(y(best) - event.clientY) ? row : best);
+      const lit = Math.abs(y(near) - event.clientY) <= 14 ? near.r.series_id : null;
       focusSeries(lit);
       hair.hidden = false;
-      hair.style.left = `${across * 100}%`;
-      const entries = rows.map(({r, solved}) => {
-        const style = lineStyles.get(r.series_id), entry = node("span", "tip-row" + (r.series_id === lit ? " lit" : ""));
-        const key = svg("svg", {class: "name-key", viewBox: "0 0 26 12", "aria-hidden": "true"});
-        key.append(svg("line", {x1: 1, y1: 6, x2: 25, y2: 6, stroke: style.color, "stroke-width": 2.5, "stroke-dasharray": style.dash}));
-        entry.append(key, node("strong", "", countText(solved)), node("span", "", chartName(r)));
+      hair.style.left = `${across(readings[at])}%`;
+      const entries = rows.map(({r, height}) => {
+        const entry = node("span", "tip-row" + (r.series_id === lit ? " lit" : ""));
+        entry.append(lineKey(lineStyles.get(r.series_id)), node("strong", "", countText(height * r.total / 100)), node("span", "", chartName(r)));
         return entry;
       });
-      tipBox.replaceChildren(node("span", "tip-muted", `Inside ${tokensText(Math.round(tokens / 1000) * 1000)} tokens of context`), ...entries);
+      tipBox.replaceChildren(node("span", "tip-muted", `Inside ${tokensText(readings[at])} tokens of context`), ...entries);
       tipBox.hidden = false;
       const frame = figure.getBoundingClientRect(), size = tipBox.getBoundingClientRect();
       const right = event.clientX - frame.left + 16;
@@ -912,68 +938,11 @@
     };
     area.addEventListener("pointermove", readout);
     area.addEventListener("pointerleave", () => { hair.hidden = true; tipBox.hidden = true; focusSeries(null); });
-    wrap.append(area, node("div", "axis-caption", "Context the whole attempt must fit in (tokens)"));
-    const names = node("ol", "line-names");
-    names.setAttribute("aria-label", `Run series, by cases solved inside ${tokensText(largestSize)} tokens of context`);
-    names.append(node("li", "names-caption", `Solved inside ${tokensText(largestSize)}`));
-    for (const r of lined) names.append(nameRow(r, r.by_context[largestSize]));
-    for (const r of unlined) names.append(nameRow(r, null));
-    const leaders = svg("svg", {class: "leaders", "aria-hidden": "true"});
-    body.append(wrap, names, leaders);
-    figure.append(body, tipBox, table(shown));
+    body.append(area);
+    figure.append(body, node("div", "axis-caption", "Context the whole attempt must fit in (tokens)"), tipBox, table(shown));
     const speed = speedView();
     if (speed) figure.append(speed);
     return figure;
-  }
-  // Puts each name beside the end of its line and joins the two. Names that would overlap are moved apart, keeping
-  // the order of the line ends, and the join shows which is which. On a narrow page the names are a list under the plot.
-  function placeNames() {
-    const body = document.querySelector(".scatter-body.named");
-    if (!body) return;
-    const area = body.querySelector(".scatter-plot"), names = body.querySelector(".line-names"), leaders = body.querySelector(".leaders");
-    const rows = [...names.querySelectorAll(".name-row")];
-    leaders.replaceChildren();
-    const beside = getComputedStyle(names).position === "relative";
-    names.style.height = "";
-    for (const row of rows) row.style.top = "";
-    if (!beside) return;
-    const plot = area.getBoundingClientRect(), frame = body.getBoundingClientRect(), column = names.getBoundingClientRect();
-    const gap = 3, placed = rows.map(row => {
-      const height = row.getBoundingClientRect().height;
-      // A series without a line waits at the bottom.
-      const at = row.dataset.end == null ? plot.height : plot.height * (1 - row.dataset.end / 100);
-      return {row, height, at, top: at - height / 2};
-    });
-    // Names that collide become one stack, set where its names are, together, nearest their line ends. A stack
-    // that then reaches the one above joins it.
-    const stacks = [];
-    for (const p of placed) {
-      let stack = {members: [p], top: p.top, height: p.height};
-      while (stacks.length && stacks.at(-1).top + stacks.at(-1).height + gap > stack.top) {
-        const members = [...stacks.pop().members, ...stack.members];
-        let offset = 0, wanted = 0;
-        for (const m of members) { wanted += m.at - m.height / 2 - offset; offset += m.height + gap; }
-        stack = {members, top: wanted / members.length, height: offset - gap};
-      }
-      stack.top = Math.max(stack.top, -8);
-      stacks.push(stack);
-    }
-    for (const stack of stacks) {
-      let top = stack.top;
-      for (const m of stack.members) { m.top = top; top += m.height + gap; }
-    }
-    names.style.height = `${Math.max(plot.height, ...placed.map(p => p.top + p.height))}px`;
-    for (const p of placed) {
-      p.row.style.top = `${p.top}px`;
-      if (p.row.dataset.end == null) continue;
-      const button = p.row.querySelector(".line-name"), style = lineStyles.get(button.dataset.series);
-      const fromX = plot.right - frame.left + 9, fromY = plot.top - frame.top + p.at;
-      const toX = column.left - frame.left - 2, toY = column.top - frame.top + p.top + p.height / 2;
-      const join = svg("path", {class: "leader" + (button.classList.contains("faded") ? " faded" : ""), stroke: style.color,
-        d: `M${fromX},${fromY} H${fromX + 5} L${toX - 6},${toY} H${toX}`});
-      join.dataset.series = button.dataset.series;
-      leaders.append(join);
-    }
   }
   const overlaps = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
   // Names go right, left, above or below their dot, whichever is free and inside the chart. The selected series and
@@ -1025,18 +994,18 @@
     $("chart").replaceChildren(sized.length ? curves(shown) : scatter(shown));
     if (sized.length) {
       $("chart").setAttribute("aria-label", "Cases solved against the context the whole attempt must fit in, by model");
-      $("chart-help").textContent = "One line per run series: its height at any point is how many cases the model solves when the whole attempt " +
-        "must fit in that much context (the mean of its runs). The list names every line, in the order the lines end. Point at the chart to read " +
-        "every model at one context size. Models reached through an API were not held to a context window: what each solved with no limit is " +
-        "in the table view. Hollow dots are provisional. Compare models within one harness. Click a name for details.";
+      $("chart-help").textContent = "One line per run series: each dot is how many cases the model solves when the whole attempt must fit in " +
+        "that much context (the mean of its runs), read every 16,384 tokens. The number after a name is what it solves inside " +
+        `${tokensText(largestSize)}. Point at the chart to read every model at one context size. Models reached through an API were not held ` +
+        "to a context window: what each solved with no limit is in the table view. Hollow dots are provisional. Compare models within one " +
+        "harness. Click a name for details.";
     }
     placeLabels();
-    placeNames();
     const active = shown.find(r => r.series_id === selected);
     if (active) $("chart").append(details(active)); else selected = null;
     $("result-status").textContent = `${records.length} run series in ${families.size} families` +
       (chosen.size ? ` · showing ${[...chosen].join(", ")}` : "");
   }
-  window.addEventListener("resize", () => { placeLabels(); placeNames(); });
+  window.addEventListener("resize", placeLabels);
   render();
 })();

@@ -22,7 +22,7 @@ The sizes are 65,536, 98,304, 131,072, 196,608 and 262,144 tokens. One run at th
 
 ## Reading the page
 
-- **The chart** of a release with recorded peaks plots cases solved against context. Each series is a line; its height at any point is how many cases the model solves when the whole attempt must fit in that much context. Higher and further left is better. Each line is named beside the plot, where it ends, with what it solves inside 262,144 tokens. Pointing at the plot reads every model at that much context.
+- **The chart** of a release with recorded peaks plots cases solved against context. Each series is a line; its height at any point is how many cases the model solves when the whole attempt must fit in that much context. Higher and further left is better. Each line has a dot every 16,384 tokens and is named in the legend above the plot, with what it solves inside 262,144 tokens. Pointing at the plot reads every model at the nearest of those sizes.
 - **Memory is not an axis there.** A model's peak VRAM + RAM is measured with the whole 262,144-token window reserved, so it says how large the window was, not how much room the work needed. It stays in the table and in each series' details.
 - **As run** is each series' score exactly as it was run: for a local model, inside its own context window. It is the **Cases passed** column of the table view and the score in a series' details. The chart does not show it: a model reached through an API was held to no window, so its own score can be far above where its line ends.
 - **The table view** has one column per size, holding the cases the series solves inside it. A series' details list each attempt's peak context beside its case.

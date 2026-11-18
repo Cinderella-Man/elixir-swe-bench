@@ -8,7 +8,7 @@ defmodule Eab.Results.Preview do
       Plug.Static.init(
         at: "/",
         from: directory,
-        only: ~w(index.html app.js styles.css results.js results.json),
+        only: ~w(index.html app.js theme.js styles.css results.js results.json),
         cache_control_for_etags: "no-cache"
       )
 

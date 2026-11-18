@@ -1078,9 +1078,16 @@ defmodule Eab.ResultsTest do
     refute File.read!(Path.join(output, "results.js")) =~ "<img"
 
     assert Enum.sort(File.ls!(output)) ==
-             Enum.sort(~w(index.html app.js styles.css results.js results.json .nojekyll))
+             Enum.sort(
+               ~w(index.html app.js theme.js styles.css results.js results.json .nojekyll)
+             )
 
-    assert File.read!(Path.join(output, "index.html")) =~ ~r/styles\.css\?v=[a-f0-9]{12}/
+    html = File.read!(Path.join(output, "index.html"))
+    assert html =~ ~r/styles\.css\?v=[a-f0-9]{12}/
+
+    # The theme is set by a script of its own, loaded before the page is drawn; the page's policy allows no inline one.
+    assert html =~ ~r/<script src="theme\.js\?v=[a-f0-9]{12}"><\/script>/
+    refute html =~ ~r/<script>(?!<)/
 
     altered =
       put_in(
@@ -1257,6 +1264,7 @@ defmodule Eab.ResultsTest do
     opts = Eab.Results.Preview.init(output)
     assert Eab.Results.Preview.call(Plug.Test.conn(:get, "/"), opts).status == 200
     assert Eab.Results.Preview.call(Plug.Test.conn(:get, "/styles.css?v=123"), opts).status == 200
+    assert Eab.Results.Preview.call(Plug.Test.conn(:get, "/theme.js?v=123"), opts).status == 200
     assert Eab.Results.Preview.call(Plug.Test.conn(:get, "/private.json"), opts).status == 404
   end
 
@@ -1264,7 +1272,7 @@ defmodule Eab.ResultsTest do
     page = Path.join(dir, "page")
     File.mkdir_p!(page)
 
-    for file <- ~w(index.html styles.css app.js),
+    for file <- ~w(index.html styles.css theme.js app.js),
         do: File.cp!(Path.join(Results.root(), file), Path.join(page, file))
 
     page

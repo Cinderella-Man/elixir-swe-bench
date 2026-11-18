@@ -7,7 +7,7 @@ defmodule Eab.SeriesTest do
     dir = Path.join(System.tmp_dir!(), "eab-series-#{System.unique_integer([:positive])}")
     File.mkdir_p!(Path.join(dir, "results"))
 
-    for file <- ~w(index.html styles.css app.js),
+    for file <- ~w(index.html styles.css theme.js app.js),
         do: File.cp!(Path.join(Results.root(), file), Path.join(dir, file))
 
     Application.put_env(:eab, :results_page_root, dir)

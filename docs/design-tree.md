@@ -303,6 +303,8 @@ The user then asked for two things: several runs one after another while they sl
 
 With seven series on the chart of cases against context, the user found three faults: names printed over each other, lines that could not be matched to models, and an **As run** strip that confused. The names had been placed inside the plot near line ends that converge. Each line is now named in a column beside the plot, at the height its line ends and joined to that end, so names never share space with lines or each other. Five colours pass the colour checks together and a sixth does not, so a family's series share a colour and differ in dashes. Pointing at the plot reads every series at that context, and lights the nearest line. The strip is gone: a series' own score stays in the table and its details.
 
+The user then asked for a dark page with a switch to light, and pointed at a chart drawn for them earlier in the conversation as the look to match: a dark surface, a colour and a dash style for every model, dots joined by lines, the legend on top. The page is now dark by default, with the choice of light kept in the browser. The context chart reads each line every 16,384 tokens instead of stepping at every case, which loses the exact context of each case and gains a line that can be followed; the five context sizes are among the readings, so the dots there match the table. The names moved from beside the line ends to a legend above the plot. Colours and dashes follow the series in the order they were first run, so they do not change with scores.
+
 ## Selecting future new cases — 2026-10-18
 
 Status: closed at the user's request. No case-selection or combined-result feature is being pursued from this discussion.

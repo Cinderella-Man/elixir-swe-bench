@@ -628,7 +628,7 @@ defmodule Eab.Results do
         end
 
         # Replace complete files, with HTML last so it references the new asset hashes.
-        for name <- ~w(styles.css app.js results.js results.json .nojekyll index.html) do
+        for name <- ~w(styles.css theme.js app.js results.js results.json .nojekyll index.html) do
           source = Path.join(stage, name)
           inherit_owner!(source, page)
           File.rename!(source, Path.join([page, "dist", name]))
@@ -769,7 +769,7 @@ defmodule Eab.Results do
       |> String.replace("__REPOSITORY_URL__", "https://github.com/#{repository}")
 
     html =
-      Enum.reduce(~w(styles.css app.js), html, fn name, html ->
+      Enum.reduce(~w(styles.css theme.js app.js), html, fn name, html ->
         body = File.read!(Path.join(page, name))
         File.write!(Path.join(destination, name), body)
         version_asset(html, name, body)
