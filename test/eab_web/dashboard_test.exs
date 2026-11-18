@@ -36,6 +36,45 @@ defmodule EabWeb.DashboardTest do
     assert has_element?(view, "#case-time", "Case time: 1.234 s")
   end
 
+  test "panels the reader opens stay open when an update reaches them" do
+    id = "reader-panels-ui"
+    case_id = "synthetic-case"
+    attempt = %{"status" => "completed", "grade" => %{"passed" => true}}
+
+    run = %{
+      "id" => id,
+      "created_at" => "9999-01-01T00:00:00Z",
+      "status" => "completed",
+      "cases" => [case_id],
+      "attempts" => %{case_id => attempt},
+      "settings" => %{},
+      "model" => %{"model" => "fixture"}
+    }
+
+    Eab.Store.write("runs/#{id}/run.json", run)
+    Eab.Store.write("runs/#{id}/#{case_id}/attempt.json", attempt)
+    Eab.Store.index_run(run)
+    on_exit(fn -> File.rm_rf!(Eab.Store.path("runs/#{id}")) end)
+    {:ok, view, _} = live(build_conn(), "/")
+    view |> element("#case-#{case_id}") |> render_click()
+    assert has_element?(view, "#run-evidence", "Run settings and evidence")
+
+    # The server opens these itself when it has something to show in them.
+    reader_panels =
+      view
+      |> render()
+      |> LazyHTML.from_fragment()
+      |> LazyHTML.query("details:not(#comparison, #run-series, #cache-controls)")
+
+    assert Enum.count(reader_panels) >= 4
+
+    # The browser keeps the reader's `open` (LiveView's JS.ignore_attributes/1).
+    for panel <- reader_panels do
+      assert [js] = LazyHTML.attribute(panel, "phx-mounted")
+      assert Jason.decode!(js) == [["ignore_attrs", %{"attrs" => ["open"]}]]
+    end
+  end
+
   test "a case says plainly whether it ran out of tokens or finished on its own" do
     id = "token-outcome-ui"
 

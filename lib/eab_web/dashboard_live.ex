@@ -940,6 +940,12 @@ defmodule EabWeb.DashboardLive do
   defp preparing?(snapshot), do: (snapshot.preparation || %{})["status"] == "running"
   defp busy?(snapshot), do: not is_nil(snapshot.active) or preparing?(snapshot)
 
+  # For a <details> that only the reader opens and closes. An update patches it with the
+  # server's markup, which has no `open`, so an opened panel closed again whenever an
+  # update reached it: each new case log line, while a case was expanded. Ignoring the
+  # attribute leaves it to the reader. Panels the server opens itself must not use this.
+  defp keep_open, do: Phoenix.LiveView.JS.ignore_attributes("open")
+
   defp rerun_error_for({key, message}, key), do: message
   defp rerun_error_for(_, _), do: nil
 
@@ -1420,7 +1426,7 @@ defmodule EabWeb.DashboardLive do
                   autocomplete="url"
                 /><button type="submit" class="secondary" disabled={@detecting}>Connect</button>
               </div>
-              <details>
+              <details phx-mounted={keep_open()}>
                 <summary>Server credentials</summary><label for="key">API key
                 <span class="muted">— optional, kept in memory</span></label><input
                   id="key"
@@ -1785,7 +1791,7 @@ defmodule EabWeb.DashboardLive do
               <p :if={@provider == "claude_code"} class="fine-print">
                 Pi's exact instructions declare a 262,144 generated-token threshold that Claude Code cannot enforce; usage above it is flagged. Compaction is off, a full context grades the current patch, a usage-limit stop is an evaluation error, there is no seed and no timing is stored.
               </p>
-              <details :if={@provider != "claude_code"} class="advanced">
+              <details :if={@provider != "claude_code"} class="advanced" phx-mounted={keep_open()}>
                 <summary>Advanced run settings</summary>
                 <p :if={@provider == "local"} class="fine-print">
                   Defaults use the detected context up to 262,144 tokens. Full history is retained.
@@ -2348,7 +2354,7 @@ defmodule EabWeb.DashboardLive do
                       <p :if={check["failure_count"] > length(check["failures"])} class="fine-print">
                         {check["failure_count"] - length(check["failures"])} additional failures in full grading evidence.
                       </p>
-                      <details :if={check["excerpt"]}>
+                      <details :if={check["excerpt"]} phx-mounted={keep_open()}>
                         <summary>Error excerpt</summary><pre>{check["excerpt"]}</pre>
                       </details>
                     </div>
@@ -2444,7 +2450,7 @@ defmodule EabWeb.DashboardLive do
                 disabled={@case_offset + 25 >= length(@run["cases"])}
               >Next cases</button>
             </nav>
-            <details>
+            <details id="run-evidence" phx-mounted={keep_open()}>
               <summary>Run settings and evidence</summary><pre>{Jason.encode!(@run["settings"], pretty: true)}</pre>
               <p class="fine-print">
                 Select a case for its patch, transcript, environment and grading evidence. Resuming preserves completed failures and evaluation errors; it restarts only unfinished work.
@@ -2511,7 +2517,7 @@ defmodule EabWeb.DashboardLive do
               "message"
             ]}
           </p>
-          <details :if={@snapshot.preparation["errors"] != %{}} open>
+          <details :if={@snapshot.preparation["errors"] != %{}} open phx-mounted={keep_open()}>
             <summary>{map_size(@snapshot.preparation["errors"])} cases could not be prepared</summary>
             <div :for={{id, error} <- Enum.sort(@snapshot.preparation["errors"])}>
               <strong>{id}</strong>
@@ -2702,7 +2708,7 @@ defmodule EabWeb.DashboardLive do
           <p :if={series["missing_seeds"] != []}>
             Missing seeds: {Enum.join(series["missing_seeds"], ", ")}
           </p>
-          <details>
+          <details phx-mounted={keep_open()}>
             <summary>Required setup</summary>
             <pre>{Jason.encode!(series["setup"], pretty: true)}</pre>
           </details>
@@ -2792,7 +2798,7 @@ defmodule EabWeb.DashboardLive do
               </tr>
             </tbody>
           </table>
-          <details>
+          <details phx-mounted={keep_open()}>
             <summary>Shared and unique storage per image</summary>
             <table>
               <thead>
@@ -2847,7 +2853,7 @@ defmodule EabWeb.DashboardLive do
           </li>
         </ul>
       </details>
-      <details class="case-inventory">
+      <details class="case-inventory" phx-mounted={keep_open()}>
         <summary>Explore the {@case_count} historical cases</summary><div class="case-grid">
           <article :for={spec <- @cases}>
             <span class="eyebrow">{spec["id"]}</span><h3>{spec["title"]}</h3><a
