@@ -33,40 +33,15 @@
     }
     if (release.note) bar.append(node("span", "release-note", release.note));
   }
-  // A context size narrows every score to the attempts that fit inside it (ADR 0022). A case then counts only
-  // if the agent finished on its own, its whole attempt stayed inside that many tokens of context, and its patch
-  // passes. One run at the largest window gives the score at every smaller size: nothing is run or graded again.
-  // Series whose runs did not record each attempt's peak context have no score at a size and are left out.
+  // A context size narrows a score to the attempts that fit inside it (ADR 0022). A case then counts only if the
+  // agent finished on its own, its whole attempt stayed inside that many tokens of context, and its patch passes.
+  // One run at the largest window gives the score at every smaller size: nothing is run or graded again. A series
+  // whose runs did not record each attempt's peak context has no score at a size.
   const sizes = release.context_sizes || [];
-  const size = sizes.find(s => String(s) === new URLSearchParams(location.search).get("context")) || null;
   const sized = release.results.filter(r => r.by_context);
   const tokensText = tokens => tokens.toLocaleString("en-US");
-  if (sizes.length && sized.length) {
-    const bar = $("contexts");
-    bar.append(node("span", "release-title", "Context size"));
-    const chip = (label, value, title) => {
-      const link = node("a", "chip" + (value === size ? " on" : ""), label), query = new URLSearchParams(location.search);
-      if (value) query.set("context", value); else query.delete("context");
-      link.href = query.toString() ? `?${query}` : location.pathname;
-      link.title = title;
-      if (value === size) link.setAttribute("aria-current", "page");
-      return link;
-    };
-    bar.append(chip("As run", null, "Every series as it was run and scored, within its own context window"));
-    for (const s of sizes) bar.append(chip(tokensText(s),
-      s, `Count a case only if the agent finished with its whole attempt inside ${tokensText(s)} tokens of context`));
-    const missing = release.results.length - sized.length;
-    bar.append(node("span", "release-note", size ?
-      `Showing what each model solved inside ${tokensText(size)} tokens of context: a case counts only if the agent finished on its own, ` +
-      "its largest prompt and reply together stayed inside that size, and its patch passes. It is read from the runs as they were made, " +
-      "so a model was not told about this size." +
-      (missing ? ` ${missing} series did not record ${missing === 1 ? "its" : "their"} context sizes and ${missing === 1 ? "is" : "are"} not shown.` : "") :
-      "Pick a size to see what each model solves with less context."));
-  }
-  // At a size, a series carries that size's score, interval and per-case pass counts in place of its own.
-  const records = size ? sized.map(r => ({...r, ...r.by_context[size], context_size: size, own: r})) : release.results;
-  const fits = (r, c) => r.context_size ? c.passed && !c.cutoff && Number.isInteger(c.peak_context_tokens) &&
-    c.peak_context_tokens <= r.context_size : c.passed;
+  const inside = (c, tokens) => c.passed && !c.cutoff && Number.isInteger(c.peak_context_tokens) && c.peak_context_tokens <= tokens;
+  const records = release.results;
   if (records.length === 0) {
     document.querySelector("footer").remove();
     $("chart").append(node("p", "empty", "No benchmark results yet."));
@@ -376,8 +351,7 @@
       const over = run.cases.filter(c => overBudget(r, c)).length, cut = run.cases.filter(c => c.cutoff);
       const late = run.cases.filter(outside).length;
       block.append(node("div", "run-block-head", `Run ${i + 1} · ${runName(run)}` + (run.seed != null ? ` · seed ${run.seed}` : "")));
-      const outcome = node("span", "", `${run.cases.filter(c => fits(r, c)).length}/${run.cases.length} ` +
-        (r.context_size ? `finished inside ${tokensText(r.context_size)} tokens of context` : "passed") + ` · ${cut.length} cut off · ` +
+      const outcome = node("span", "", `${run.cases.filter(c => c.passed).length}/${run.cases.length} passed · ${cut.length} cut off · ` +
         (allowed(r) ? `${late} with a passing patch outside the allowance · ` : "") +
         `${tokens == null ? "—" : fmt(tokens)} output tokens · ${calls == null ? "—" : fmt(calls)} model calls`);
       if (cut.length) outcome.title = Object.keys(cutoffs).map(kind => [kind, cut.filter(c => c.cutoff === kind).length])
@@ -440,9 +414,7 @@
     const head = node("thead"), hr = node("tr");
     // Each attempt's peak context, where the series recorded it: the largest prompt and reply any model call held.
     const peaks = Boolean(r.by_context);
-    if (r.context_size) outcomes.append(node("p", "detail-note", `At ${tokensText(r.context_size)} tokens of context: a case counts only if the agent ` +
-      "finished on its own and its peak context stayed inside that size. Peak context is the largest prompt and reply any model call held."));
-    for (const title of ["Case", r.context_size ? "Runs inside" : "Runs passed", ...(peaks ? ["Peak context"] : []),
+    for (const title of ["Case", "Runs passed", ...(peaks ? ["Peak context"] : []),
       ...(allowed(r) ? ["Output tokens", "Allowance"] : []),
       ...(timed(r) ? ["Time", "Generation tok/s"] : [])]) hr.append(node("th", "", title));
     head.append(hr); table.append(head);
@@ -558,7 +530,6 @@
     const top = members => Math.max(...members.map(r => r.score_percent));
     return [...groups].sort(([an, a], [bn, b]) => top(b) - top(a) || an.localeCompare(bn));
   };
-  // From the release's own scores, so a family keeps its colour whichever context size is shown.
   const familyColors = (() => {
     let slot = 0;
     return new Map(grouped(release.results).map(([name, members]) =>
@@ -704,6 +675,11 @@
     ["maker", "Quantized by", r => r.model.quantized_by || "", r => r.model.quantized_by || (hosted(r) ? "API" : "—")],
     ["harness", "Harness", r => harness(r), r => harness(r)],
     ["cases", "Cases passed", r => r.score_percent, r => `${casesText(r)} (${scoreText(r)})`],
+    // Where the release recorded peak context: the cases solved with the whole attempt inside each size, as a count.
+    ...(sized.length ? sizes.map(tokens => [`inside-${tokens}`, `In ${tokensText(tokens)}`,
+      r => r.by_context ? r.by_context[tokens].score_percent : -1,
+      r => r.by_context ? fmt(Math.round(r.by_context[tokens].score_percent * r.total / 10) / 10) : "—",
+      `Cases solved with the whole attempt inside ${tokensText(tokens)} tokens of context`]) : []),
     ["memory", "Peak VRAM + RAM", r => required(r) ?? Infinity, r => required(r) != null ? gb(required(r)) : hosted(r) ? "API" : "Not measured"],
     ["runs", "Runs", r => r.run_count, r => runsText(r)],
   ];
@@ -713,8 +689,9 @@
     view.addEventListener("toggle", () => { tableOpen = view.open; });
     view.append(node("summary", "", "Table view"));
     const grid = node("table", "case-table sortable"), head = node("thead"), row = node("tr");
-    for (const [key, title] of columns) {
+    for (const [key, title, , , hint] of columns) {
       const th = node("th");
+      if (hint) th.title = hint;
       th.setAttribute("aria-sort", sortBy === key ? (sortDown ? "descending" : "ascending") : "none");
       const button = node("button", "sort", title + (sortBy === key ? (sortDown ? " ↓" : " ↑") : ""));
       button.addEventListener("click", () => { sortDown = sortBy === key ? !sortDown : key === "cases"; sortBy = key; render(); });
@@ -787,7 +764,7 @@
   const largestSize = sizes.at(-1);
   function steps(r) {
     const counted = [];
-    for (const run of r.runs) for (const c of run.cases) if (fits({context_size: largestSize}, c)) counted.push(c.peak_context_tokens);
+    for (const run of r.runs) for (const c of run.cases) if (inside(c, largestSize)) counted.push(c.peak_context_tokens);
     counted.sort((a, b) => a - b);
     let solved = 0, d = "M0,100";
     for (const tokens of counted) {
@@ -814,7 +791,7 @@
       area.append(line);
     }
     for (const tokens of [0, ...sizes]) {
-      const line = node("div", "grid-col" + (tokens === size ? " chosen" : ""));
+      const line = node("div", "grid-col");
       line.style.left = `${tokens / largestSize * 100}%`;
       line.append(node("span", "x-tick" + (tokens === largestSize ? " end" : ""), tokens ? tokensText(tokens) : "0"));
       area.append(line);
@@ -836,11 +813,7 @@
     const strip = node("div", "asrun-strip");
     strip.append(node("span", "strip-title", "As run"));
     // Spread across the strip in score order; a series' own score has no context size to place it by.
-    shown.forEach((r, i) => {
-      const own = r.own || r;
-      strip.append(point(r, (i + 1) / (shown.length + 1), false, number(r), 0,
-        {score_percent: own.score_percent, interval_percent: own.interval_percent, tip_note: "as run"}));
-    });
+    shown.forEach((r, i) => strip.append(point(r, (i + 1) / (shown.length + 1), false, number(r), 0, {tip_note: "as run"})));
     body.append(strip);
     const tipBox = node("div", "chart-tip");
     tipBox.hidden = true;
@@ -907,7 +880,6 @@
     const active = shown.find(r => r.series_id === selected);
     if (active) $("chart").append(details(active)); else selected = null;
     $("result-status").textContent = `${records.length} run series in ${families.size} families` +
-      (size ? ` · scored inside ${tokensText(size)} tokens of context` : "") +
       (chosen.size ? ` · showing ${[...chosen].join(", ")}` : "");
   }
   window.addEventListener("resize", placeLabels);

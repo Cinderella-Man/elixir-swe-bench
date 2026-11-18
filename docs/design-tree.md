@@ -291,6 +291,14 @@ Overnight into 2026-11-18, at the user's request, the solver session ran unatten
 
 On 2026-11-18 the user pointed out that cases against peak memory no longer fits a benchmark that scores by context: the memory is measured with a 262,144-token window reserved even when the work fits in 65,536. The chart of a release with recorded peaks now plots cases solved against the context the whole attempt must fit in, one line per series, with a strip beside it for each series' own score. Memory stays in the table and in each series' details, and a release without recorded peaks, such as v5, keeps the memory chart ([ADR 0022](adr/0022-score-runs-at-context-sizes.md)).
 
+The same day the user noticed that the Context size switches above the chart no longer did anything a reader would see: the lines already show every size. They were removed. The table view now has a column for each of the five sizes, and a series without recorded peaks shows a dash there.
+
+The user then asked whether DeepSeek's scores at the sizes could be had without running it again. Its run of 2026-11-13 was made by a controller on another machine, which still held every model call's token counts. Read from them, DeepSeek V4.1 Flash solves 4, 10, 15, 16 and 17 cases inside the five sizes and 17 as run, so every v6 series now has a line. At 131,072 tokens it solves the most of any series ([record](../verification/local-series-2026-11-18/README.md#deepseeks-peak-context)).
+
+That controller also held a finished v6 run nobody had published: the same DeepSeek model in ISTA DASLab's GSQ-RCO-Coder IQ2_XXS quant, 15 of 20 as run and 3, 5, 10, 14 and 14 inside the sizes. The user asked for it to be added, and for every model's runs to keep their full logs as the Claude Code runs do, so that later questions can be answered from data already held. The four local runs on v6 now have every model call's tokens, the agent's event stream, the controller's log, the grade and the patch of each attempt in `verification/runs/`.
+
+The user then asked whether **Add to results page** saved all of that, and it did not: it wrote only the series file. It now saves the run's full logs as well, into `verification/runs/run-<id>/` with a manifest of every file's hash, replacing the Claude account's identifiers and the model host's names ([ADR 0023](adr/0023-keep-every-published-runs-full-logs.md)). Trying it on a real Haiku run caught a rule that was too broad: it had taken the word after `claude-code://` for a machine name and replaced "subscription" throughout the logs. The output now matches the copies made by hand byte for byte. The second controller was busy with a run and was left alone; the user rebuilds it afterwards and carries its files over.
+
 ## Selecting future new cases — 2026-10-18
 
 Status: closed at the user's request. No case-selection or combined-result feature is being pursued from this discussion.

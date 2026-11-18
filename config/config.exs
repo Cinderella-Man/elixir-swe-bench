@@ -32,7 +32,9 @@ config :logger, level: :info
 if config_env() == :test do
   config :eab,
     cache_reserve_bytes: 0,
-    data_dir: Path.join(System.tmp_dir!(), "eab-tests-#{System.pid()}")
+    data_dir: Path.join(System.tmp_dir!(), "eab-tests-#{System.pid()}"),
+    # Never the checkout's verification folder; a test that saves run logs names its own.
+    run_logs_root: Path.join(System.tmp_dir!(), "eab-tests-#{System.pid()}-logs/runs")
 
   config :logger, level: :warning
 end

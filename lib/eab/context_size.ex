@@ -22,17 +22,27 @@ defmodule Eab.ContextSize do
   tokens. The gateway's usage records already hold the whole prompt as `input_tokens`, and
   mark that with `uncached_input_tokens` where they keep the split beside it.
   """
-  def of_call(usage) when is_map(usage) do
-    keys =
-      if Map.has_key?(usage, "uncached_input_tokens"),
-        do: ~w(input_tokens output_tokens),
-        else: ~w(input_tokens cache_creation_input_tokens cache_read_input_tokens output_tokens)
-
-    parts = Enum.map(keys, &(usage[&1] || 0))
-    if Enum.all?(parts, &(is_integer(&1) and &1 >= 0)), do: Enum.sum(parts), else: 0
+  def of_call(usage) do
+    {prompt, reply} = split(usage)
+    prompt + reply
   end
 
-  def of_call(_), do: 0
+  # A call's prompt and reply tokens; zeros when its usage record is not one.
+  defp split(usage) when is_map(usage) do
+    keys =
+      if Map.has_key?(usage, "uncached_input_tokens"),
+        do: ~w(input_tokens),
+        else: ~w(input_tokens cache_creation_input_tokens cache_read_input_tokens)
+
+    prompt = Enum.map(keys, &(usage[&1] || 0))
+    reply = usage["output_tokens"] || 0
+
+    if Enum.all?([reply | prompt], &(is_integer(&1) and &1 >= 0)),
+      do: {Enum.sum(prompt), reply},
+      else: {0, 0}
+  end
+
+  defp split(_), do: {0, 0}
 
   @doc "The larger of the peak so far and this call's context."
   def peak(previous, usage), do: max(previous || 0, of_call(usage))
@@ -54,45 +64,63 @@ defmodule Eab.ContextSize do
   end
 
   defp from_files(run_id, case_id) do
+    case run_id |> calls(case_id) |> Enum.map(fn {prompt, reply} -> prompt + reply end) do
+      [] -> nil
+      contexts -> if Enum.max(contexts) > 0, do: Enum.max(contexts)
+    end
+  end
+
+  @doc """
+  Every model call of an attempt as `{prompt_tokens, reply_tokens}`, in call order, read from
+  the Claude Code transcript or the per-call usage records its folder holds. Empty when it
+  holds neither.
+  """
+  def calls(run_id, case_id) do
     directory = Store.path("runs/#{run_id}/#{case_id}")
     transcript = Path.join(directory, "claude-transcript.jsonl")
 
-    calls =
-      if File.regular?(transcript) do
-        from_transcript(transcript)
-      else
-        for path <- Path.wildcard(Path.join(directory, "usage-*.json")),
-            {:ok, usage} <- [Jason.decode(File.read!(path))],
-            do: of_call(usage)
-      end
-
-    case Enum.max(calls, fn -> 0 end) do
-      0 -> nil
-      peak -> peak
+    if File.regular?(transcript) do
+      transcript_calls(transcript)
+    else
+      for path <- Enum.sort(Path.wildcard(Path.join(directory, "usage-*.json"))),
+          {:ok, usage} <- [Jason.decode(File.read!(path))],
+          do: split(usage)
     end
   end
 
   @doc false
-  # Streaming writes one record per content block with the same message id; the one with the
-  # most output is the complete call. Synthetic error messages made no model call.
-  def from_transcript(path) do
-    path
-    |> File.stream!()
-    |> Stream.flat_map(fn line ->
-      case Jason.decode(line) do
-        {:ok, %{"type" => "assistant", "message" => %{"usage" => usage} = message} = record}
-        when is_map(usage) ->
-          if message["model"] == "<synthetic>",
-            do: [],
-            else: [{message["id"] || record["uuid"], usage}]
+  def from_transcript(path),
+    do: path |> transcript_calls() |> Enum.map(fn {prompt, reply} -> prompt + reply end)
 
-        _ ->
-          []
-      end
-    end)
-    |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
-    |> Enum.map(fn {_id, usages} -> usages |> Enum.map(&of_call/1) |> Enum.max() end)
+  @doc false
+  # Streaming writes one record per content block with the same message id; the one holding
+  # the most is the complete call. Synthetic error messages made no model call.
+  def transcript_calls(path) do
+    {order, calls} =
+      path
+      |> File.stream!()
+      |> Enum.reduce({[], %{}}, fn line, {order, calls} = seen ->
+        case Jason.decode(line) do
+          {:ok, %{"type" => "assistant", "message" => %{"usage" => usage} = message} = record}
+          when is_map(usage) ->
+            if message["model"] == "<synthetic>" do
+              seen
+            else
+              id = message["id"] || record["uuid"]
+              call = split(usage)
+              order = if Map.has_key?(calls, id), do: order, else: [id | order]
+              {order, Map.update(calls, id, call, &larger(&1, call))}
+            end
+
+          _ ->
+            seen
+        end
+      end)
+
+    order |> Enum.reverse() |> Enum.map(&calls[&1])
   end
+
+  defp larger({p1, r1} = one, {p2, r2} = other), do: if(p2 + r2 > p1 + r1, do: other, else: one)
 
   @doc "Whether a published case counts at a context size: finished on its own, inside it, and right."
   def fits?(published_case, size) do

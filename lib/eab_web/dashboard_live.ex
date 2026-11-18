@@ -13,6 +13,7 @@ defmodule EabWeb.DashboardLive do
     Readiness,
     Results,
     Retention,
+    RunLogs,
     Runner,
     Runs,
     Series,
@@ -109,6 +110,7 @@ defmodule EabWeb.DashboardLive do
         publishing: nil,
         publication_message: nil,
         result_added: false,
+        logs_saved: false,
         cases: Enum.map(Inventory.all(), &Inventory.spec/1)
       )
       |> load_log()
@@ -548,9 +550,20 @@ defmodule EabWeb.DashboardLive do
        |> assign(publishing: id, publication_message: nil)
        |> start_async({:add_result, id}, fn ->
          try do
-           {:ok, Results.publish!(Store.run(id))}
+           run = Store.run(id)
+           # A run already on the page keeps its record; only its logs may still be owed.
+           unless Results.added?(id), do: Results.publish!(run)
+
+           # The run's full logs are kept with its result (ADR 0023).
+           case RunLogs.save(run) do
+             {:ok, _} ->
+               :ok
+
+             {:error, message} ->
+               {:error, "The result is on the page, but its logs were not saved: #{message}"}
+           end
          rescue
-           error -> {:error, Exception.message(error)}
+           error -> {:error, "Could not add result: #{Exception.message(error)}"}
          end
        end)}
     else
@@ -811,19 +824,25 @@ defmodule EabWeb.DashboardLive do
   def handle_async(:storage, {:ok, {:ok, storage}}, socket),
     do: {:noreply, assign(socket, storage: storage, storage_busy: false)}
 
-  def handle_async({:add_result, _id}, {:ok, {:ok, _status}}, socket),
+  def handle_async({:add_result, _id}, {:ok, :ok}, socket),
     do: {:noreply, socket |> assign(publishing: nil, publication_message: nil) |> load_log()}
 
   def handle_async({:add_result, id}, {:ok, {:error, message}}, socket),
     do:
-      {:noreply, assign(socket, publishing: nil, publication_message: %{id: id, error: message})}
+      {:noreply,
+       socket
+       |> assign(publishing: nil, publication_message: %{id: id, error: message})
+       |> load_log()}
 
   def handle_async({:add_result, id}, {:exit, _}, socket),
     do:
       {:noreply,
        assign(socket,
          publishing: nil,
-         publication_message: %{id: id, error: "Adding the result stopped. Try again."}
+         publication_message: %{
+           id: id,
+           error: "Could not add result: adding it stopped. Try again."
+         }
        )}
 
   def handle_async(:storage, {:ok, {:error, error}}, socket),
@@ -1013,7 +1032,8 @@ defmodule EabWeb.DashboardLive do
       assign(socket,
         evidence_links: if(run && id, do: Evidence.links(run["id"], id), else: []),
         report_available: run && match?({:ok, _}, Store.artifact(run["id"], "report.md")),
-        result_added: run && Results.added?(run["id"])
+        result_added: run && Results.added?(run["id"]),
+        logs_saved: run && RunLogs.saved?(run["id"])
       )
 
     case run && id && Store.artifact(run["id"], "#{id}/activity.log") do
@@ -1965,7 +1985,7 @@ defmodule EabWeb.DashboardLive do
                   phx-click="add_result"
                   disabled={
                     @publishing != nil ||
-                      (@result_added &&
+                      (@result_added && @logs_saved &&
                          !(@publication_message && @publication_message.id == @run["id"]))
                   }
                 >
@@ -1974,10 +1994,13 @@ defmodule EabWeb.DashboardLive do
                       "Adding…"
 
                     @publication_message && @publication_message.id == @run["id"] ->
-                      "Retry adding result"
+                      if(@result_added, do: "Retry saving logs", else: "Retry adding result")
+
+                    @result_added && @logs_saved ->
+                      "Added to results page"
 
                     @result_added ->
-                      "Added to results page"
+                      "Save run logs"
 
                     Results.speed_run?(@run) ->
                       "Add speed run to results page"
@@ -1992,6 +2015,12 @@ defmodule EabWeb.DashboardLive do
               Added to the local results page.
               <a href="/results/" target="_blank" rel="noopener">View results ↗</a>
               · Push the result file to GitHub to update the public page.
+              <span :if={@logs_saved} id="result-logs">
+                The run's full logs are in <code>verification/runs/run-{@run["id"]}/</code>; push them with it.
+              </span>
+              <span :if={!@logs_saved} id="result-logs-missing">
+                The run's full logs are not saved yet.
+              </span>
             </p>
             <p
               :if={@publication_message && @publication_message.id == @run["id"]}
@@ -1999,7 +2028,7 @@ defmodule EabWeb.DashboardLive do
               class="notice error"
               role="alert"
             >
-              Could not add result: {@publication_message.error}
+              {@publication_message.error}
             </p>
             <div class="cases-heading">
               <h3>Cases <span>{@score["planned"]}</span></h3>

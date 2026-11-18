@@ -1,0 +1,585 @@
+diff --git a/lib/ash/filter/filter.ex b/lib/ash/filter/filter.ex
+index 901ca99..461fba5 100644
+--- a/lib/ash/filter/filter.ex
++++ b/lib/ash/filter/filter.ex
+@@ -3256,11 +3256,12 @@ defmodule Ash.Filter do
+           resource_calculation when tuple_size(args) == 2 ->
+             {args, nested_statement} = args
+ 
+-            with {:ok, args} <-
+-                   Ash.Query.validate_calculation_arguments(resource_calculation, args || %{}),
+-                 {:ok, calculation} <-
+-                   Calculation.from_resource_calculation(context.resource, resource_calculation,
+-                     args: args
++            with {:ok, calculation} <-
++                   Calculation.from_resource_calculation(
++                     context.resource,
++                     resource_calculation,
++                     args: args,
++                     allow_expr?: !context[:input?]
+                    ) do
+               calculation = %{calculation | load: calculation.name}
+ 
+@@ -3471,17 +3472,12 @@ defmodule Ash.Filter do
+               end)
+           end
+ 
+-        with {:ok, args} <-
+-               Ash.Query.validate_calculation_arguments(
+-                 resource_calculation,
+-                 input,
+-                 !context[:input?]
+-               ),
+-             {:ok, calculation} <-
++        with {:ok, calculation} <-
+                Calculation.from_resource_calculation(
+                  context.resource,
+                  resource_calculation,
+-                 args: args
++                 args: input,
++                 allow_expr?: !context[:input?]
+                ) do
+           calculation = %{calculation | load: calculation.name}
+ 
+@@ -3894,14 +3890,12 @@ defmodule Ash.Filter do
+ 
+     cond do
+       resource_calculation ->
+-        with {:ok, args} <-
+-               Ash.Query.validate_calculation_arguments(
++        with {:ok, calculation} <-
++               Calculation.from_resource_calculation(
++                 context.resource,
+                  resource_calculation,
+-                 Map.new(Enum.at(args, 0) || [])
+-               ),
+-             {:ok, calculation} <-
+-               Calculation.from_resource_calculation(context.resource, resource_calculation,
+-                 args: args
++                 args: Enum.at(args, 0),
++                 allow_expr?: !context[:input?]
+                ) do
+           {:ok,
+            %Ref{
+diff --git a/lib/ash/query/calculation.ex b/lib/ash/query/calculation.ex
+index 3aafdfb..afe5a3a 100644
+--- a/lib/ash/query/calculation.ex
++++ b/lib/ash/query/calculation.ex
+@@ -161,6 +161,12 @@ defmodule Ash.Query.Calculation do
+       doc: "Arguments to pass to the calculation",
+       default: %{}
+     ],
++    allow_expr?: [
++      type: :boolean,
++      default: true,
++      doc:
++        "Whether or not expression arguments may be passed to the calculation. Disable for user-facing input, where expressions are not accepted."
++    ],
+     source_context: [
+       type: :map,
+       doc: "Context from the source query or changeset.",
+@@ -222,9 +228,22 @@ defmodule Ash.Query.Calculation do
+ 
+     %{calculation: {module, calc_opts}} = resource_calculation
+ 
+-    with {:ok, opts} <- FromResourceOpts.validate(opts),
+-         {:ok, args} <-
+-           Ash.Query.validate_calculation_arguments(resource_calculation, opts.args),
++    # The argument container may be a map, a keyword list or `nil` (omitted
++    # arguments), so it is normalized and validated on its own — casting each
++    # literal argument exactly once — before the remaining options are
++    # validated. The validated arguments are a plain map, so the `:map`
++    # option accepts them.
++    {args_input, opts} = Keyword.pop(opts, :args, nil)
++    allow_expr? = Keyword.get(opts, :allow_expr?, true)
++
++    with {:ok, args} <-
++           Ash.Query.validate_calculation_arguments(
++             resource_calculation,
++             args_input,
++             allow_expr?
++           ),
++         {:ok, opts} <-
++           FromResourceOpts.validate(Keyword.put(opts, :args, args)),
+          {:ok, calculation} <-
+            new(
+              name,
+diff --git a/lib/ash/query/function/type.ex b/lib/ash/query/function/type.ex
+index f5f94a1..6327251 100644
+--- a/lib/ash/query/function/type.ex
++++ b/lib/ash/query/function/type.ex
+@@ -25,12 +25,24 @@ defmodule Ash.Query.Function.Type do
+   end
+ 
+   def evaluate(%{arguments: [val, type, constraints]}) do
+-    case Ash.Type.coerce(type, val, constraints) do
+-      {:ok, value} ->
+-        {:known, value}
+-
+-      {:error, error} ->
+-        {:error, error}
++    # A value that is already in the type's canonical internal representation
++    # — for example a calculation argument literal that has already been cast
++    # and constrained exactly once — is used as-is. A type's cast need not
++    # accept or preserve its own output, so coercing such a value a second
++    # time must not happen.
++    #
++    # The check only applies to plain, resolvable Ash types; anything else
++    # (e.g. a type the value is merely hinted with) falls back to coercion.
++    if val != nil and Ash.Type.ash_type?(type) and Ash.Type.matches_type?(type, val, constraints || []) do
++      {:known, val}
++    else
++      case Ash.Type.coerce(type, val, constraints) do
++        {:ok, value} ->
++          {:known, value}
++
++        {:error, error} ->
++          {:error, error}
++      end
+     end
+   end
+ end
+diff --git a/lib/ash/query/query.ex b/lib/ash/query/query.ex
+index 441ee8a..3226e5e 100644
+--- a/lib/ash/query/query.ex
++++ b/lib/ash/query/query.ex
+@@ -2554,171 +2554,242 @@ defmodule Ash.Query do
+ 
+   @doc false
+   def validate_calculation_arguments(calculation, args, allow_expr? \\ true) do
+-    args =
+-      if Keyword.keyword?(args) do
+-        Map.new(args)
+-      else
++    case normalize_calculation_arguments(calculation, args) do
++      {:error, error} ->
++        {:error, error}
++
++      {:ok, args, has_one_expr?} ->
+         args
+-      end
++        |> Enum.reduce_while({:ok, %{}}, fn {key, value}, {:ok, arg_values} ->
++          validate_calculation_argument(
++            calculation,
++            key,
++            value,
++            arg_values,
++            has_one_expr?,
++            allow_expr?
++          )
++        end)
++        |> set_defaults(calculation)
++    end
++  end
+ 
++  # Coerce the raw argument container into a map of `{key, value}` pairs.
++  #
++  # A `nil` container means "no arguments were provided" (as in the tuple
++  # filter form, where `calc(nil) == value` omits the arguments); it is
++  # treated as an empty map so that argument defaults still apply.
++  #
++  # Both maps (atom or string keys) and keyword lists are accepted. Anything
++  # else is a malformed container and produces a structured input error rather
++  # than crashing.
++  defp normalize_calculation_arguments(_calculation, nil), do: {:ok, %{}, false}
++
++  defp normalize_calculation_arguments(
++         _calculation,
++         args
++       )
++       when is_map(args) and not is_struct(args) do
+     args = Map.delete(args, :as)
+-
+     has_one_expr? = Enum.any?(args, fn {_, value} -> Ash.Expr.expr?(value) end)
++    {:ok, args, has_one_expr?}
++  end
+ 
+-    args
+-    |> Enum.reduce_while({:ok, %{}}, fn {key, value}, {:ok, arg_values} ->
+-      argument =
+-        if is_binary(key) do
+-          Enum.find(calculation.arguments, fn arg -> to_string(arg.name) == key end)
+-        else
+-          Enum.find(calculation.arguments, fn arg -> arg.name == key end)
+-        end
++  defp normalize_calculation_arguments(calculation, args) when is_list(args) do
++    if Keyword.keyword?(args) do
++      args =
++        args
++        |> Map.new()
++        |> Map.delete(:as)
+ 
+-      value =
+-        if argument do
+-          Ash.Type.Helpers.handle_indexed_maps(argument.type, value)
+-        else
+-          value
+-        end
++      has_one_expr? = Enum.any?(args, fn {_, value} -> Ash.Expr.expr?(value) end)
++      {:ok, args, has_one_expr?}
++    else
++      {:error, invalid_calculation_arguments_container(calculation, args)}
++    end
++  end
+ 
+-      cond do
+-        !argument ->
+-          error_calc =
+-            case calculation do
+-              %{calc_name: calc_name} ->
+-                calc_name
++  defp normalize_calculation_arguments(calculation, args) do
++    {:error, invalid_calculation_arguments_container(calculation, args)}
++  end
+ 
+-              %Ash.Resource.Calculation{name: name} ->
+-                name
++  defp invalid_calculation_arguments_container(calculation, args) do
++    InvalidCalculationArgument.exception(
++      calculation: calculation_name(calculation),
++      field: nil,
++      message: "arguments must be provided as a map or a keyword list",
++      value: args
++    )
++  end
+ 
+-              calc ->
+-                calc
+-            end
++  defp validate_calculation_argument(
++         calculation,
++         key,
++         value,
++         arg_values,
++         has_one_expr?,
++         allow_expr?
++       ) do
++    argument =
++      if is_binary(key) do
++        Enum.find(calculation.arguments, fn arg -> to_string(arg.name) == key end)
++      else
++        Enum.find(calculation.arguments, fn arg -> arg.name == key end)
++      end
+ 
+-          {:halt,
+-           {:error,
+-            Ash.Error.Invalid.NoSuchInput.exception(
+-              calculation: error_calc,
+-              input: key,
+-              inputs: Enum.map(calculation.arguments, & &1.name)
+-            )}}
+-
+-        Ash.Expr.expr?(value) && argument.allow_expr? && allow_expr? ->
+-          {:cont,
+-           {:ok,
+-            Map.put(
+-              arg_values,
+-              argument.name,
+-              %Ash.Query.Function.Type{
+-                arguments: [value, argument.type, argument.constraints]
+-              }
+-            )}}
+-
+-        Ash.Expr.expr?(value) ->
+-          {:halt,
+-           {:error,
+-            InvalidCalculationArgument.exception(
+-              field: argument.name,
+-              calculation: calculation.name,
+-              message: "does not support expressions",
+-              value: value
+-            )}}
+-
+-        is_nil(value) && argument.allow_nil? ->
+-          {:cont, {:ok, Map.put(arg_values, argument.name, nil)}}
+-
+-        is_nil(value) && is_nil(argument.default) ->
+-          {:halt,
+-           {:error,
+-            InvalidCalculationArgument.exception(
+-              field: argument.name,
+-              calculation: calculation.name,
+-              message: "is required",
+-              value: value
+-            )}}
+-
+-        is_nil(Map.get(args, argument.name, Map.get(args, to_string(argument.name)))) &&
+-            not is_nil(value) ->
+-          if has_one_expr? do
+-            {:cont,
+-             {:ok,
+-              Map.put(
+-                arg_values,
+-                argument.name,
+-                %Ash.Query.Function.Type{
+-                  arguments: [value, argument.type, argument.constraints]
+-                }
+-              )}}
+-          else
+-            {:cont,
+-             {:ok,
+-              Map.put(
+-                arg_values,
+-                argument.name,
++    case argument do
++      nil ->
++        {:halt,
++         {:error,
++          Ash.Error.Invalid.NoSuchInput.exception(
++            calculation: calculation_name(calculation),
++            input: key,
++            inputs: Enum.map(calculation.arguments, & &1.name)
++          )}}
++
++      argument ->
++        value = Ash.Type.Helpers.handle_indexed_maps(argument.type, value)
++
++        cond do
++          # An expression value (including one that is the product of a
++          # previous `validate_calculation_arguments/3` call for this same
++          # argument) that the argument and the context both allow.
++          # A value that was already wrapped for this argument is kept as-is,
++          # so that validating the same arguments twice is a no-op: the value
++          # was already cast and constrained exactly once.
++          Ash.Expr.expr?(value) && argument.allow_expr? && allow_expr? ->
++            value =
++              if already_validated_argument?(argument, value) do
+                 value
++              else
++                typed_argument_value(value, argument)
++              end
++
++            {:cont, {:ok, Map.put(arg_values, argument.name, value)}}
++
++          Ash.Expr.expr?(value) ->
++            {:halt,
++             {:error,
++              InvalidCalculationArgument.exception(
++                field: argument.name,
++                calculation: calculation_name(calculation),
++                message: "does not support expressions",
++                value: value
+               )}}
+-          end
+ 
+-        true ->
+-          with {:ok, casted} <- Ash.Type.cast_input(argument.type, value, argument.constraints),
+-               {:ok, casted} <-
+-                 Ash.Type.apply_constraints(argument.type, casted, argument.constraints) do
+-            if has_one_expr? do
+-              {:cont,
+-               {:ok,
+-                Map.put(
+-                  arg_values,
+-                  argument.name,
+-                  %Ash.Query.Function.Type{
+-                    arguments: [value, argument.type, argument.constraints]
+-                  }
+-                )}}
+-            else
+-              cond do
+-                is_nil(casted) && argument.allow_nil? ->
+-                  {:cont, {:ok, Map.put(arg_values, argument.name, nil)}}
+-
+-                is_nil(casted) && is_nil(argument.default) ->
+-                  {:halt,
+-                   {:error,
+-                    InvalidCalculationArgument.exception(
+-                      field: argument.name,
+-                      calculation: calculation.name,
+-                      message: "is required",
+-                      value: value
+-                    )}}
+-
+-                is_nil(Map.get(args, argument.name, Map.get(args, to_string(argument.name)))) &&
+-                    not is_nil(value) ->
+-                  {:cont,
+-                   {:ok,
+-                    Map.put(
+-                      arg_values,
+-                      argument.name,
+-                      value
+-                    )}}
+-
+-                true ->
+-                  {:cont, {:ok, Map.put(arg_values, argument.name, casted)}}
+-              end
+-            end
+-          else
+-            {:error, error} when is_binary(error) ->
+-              {:halt,
+-               {:error,
+-                InvalidCalculationArgument.exception(
+-                  field: argument.name,
+-                  calculation: calculation.name,
+-                  message: error,
+-                  value: value
+-                )}}
++          is_nil(value) && argument.allow_nil? ->
++            {:cont, {:ok, Map.put(arg_values, argument.name, nil)}}
+ 
+-            {:error, error} ->
+-              {:halt, {:error, Ash.Error.to_ash_error(error)}}
+-          end
++          is_nil(value) ->
++            # An explicit `nil` for an argument that does not allow `nil` is
++            # an error, even when a default exists: defaults fill in omitted
++            # arguments, not ones that were provided as `nil`.
++            {:halt,
++             {:error,
++              InvalidCalculationArgument.exception(
++                field: argument.name,
++                calculation: calculation_name(calculation),
++                message: "is required",
++                value: value
++              )}}
++
++          true ->
++            cast_literal_argument(calculation, argument, value, arg_values, has_one_expr?)
++        end
++    end
++  end
++
++  # When the calculation also receives an expression argument, its literal
++  # arguments are cast and constrained exactly once (here) and carried beside
++  # the expression as a `type(...)` value. The *cast* value — not the raw
++  # input — is what the calculation uses, and it must not be cast, constrained
++  # or coerced again downstream (including by typed comparisons within the
++  # calculation expression), because a type's cast need not accept or preserve
++  # its own output.
++  defp cast_literal_argument(calculation, argument, value, arg_values, has_one_expr?) do
++    with {:ok, casted} <- Ash.Type.cast_input(argument.type, value, argument.constraints),
++         {:ok, casted} <-
++           Ash.Type.apply_constraints(argument.type, casted, argument.constraints) do
++      if has_one_expr? do
++        {:cont,
++         {:ok, Map.put(arg_values, argument.name, typed_argument_value(casted, argument))}}
++      else
++        cond do
++          is_nil(casted) && argument.allow_nil? ->
++            {:cont, {:ok, Map.put(arg_values, argument.name, nil)}}
++
++          is_nil(casted) ->
++            {:halt,
++             {:error,
++              InvalidCalculationArgument.exception(
++                field: argument.name,
++                calculation: calculation_name(calculation),
++                message: "is required",
++                value: value
++              )}}
++
++          true ->
++            {:cont, {:ok, Map.put(arg_values, argument.name, casted)}}
++        end
+       end
+-    end)
+-    |> set_defaults(calculation)
++    else
++      :error ->
++        {:halt,
++         {:error,
++          calculation_argument_cast_error(calculation, argument, value, "is invalid")}}
++
++      {:error, error} ->
++        {:halt,
++         {:error, calculation_argument_cast_error(calculation, argument, value, error)}}
++    end
++  end
++
++  defp typed_argument_value(value, argument) do
++    %Ash.Query.Function.Type{
++      arguments: [value, argument.type, argument.constraints]
++    }
++  end
++
++  defp already_validated_argument?(argument, %Ash.Query.Function.Type{arguments: [_, type | _]}) do
++    type == argument.type
++  end
++
++  defp already_validated_argument?(_, _), do: false
++
++  # Preserve a useful message from a type-callback rejection. Callbacks may
++  # return `{:error, binary}`, `{:error, [message: ..., ...]}` or `:error`.
++  defp calculation_argument_cast_error(calculation, argument, value, error) do
++    message =
++      case error do
++        binary when is_binary(binary) ->
++          binary
++
++        keyword when is_list(keyword) ->
++          Keyword.get(keyword, :message) || "is invalid"
++
++        _ ->
++          "is invalid"
++      end
++
++    InvalidCalculationArgument.exception(
++      field: argument.name,
++      calculation: calculation_name(calculation),
++      message: message,
++      value: value
++    )
++  end
++
++  defp calculation_name(calculation) do
++    case calculation do
++      %{calc_name: calc_name} ->
++        calc_name
++
++      %Ash.Resource.Calculation{name: name} ->
++        name
++
++      calc ->
++        calc
++    end
+   end
+ 
+   defp set_defaults({:ok, inputs}, calculation) do
+@@ -2736,7 +2807,7 @@ defmodule Ash.Query do
+              {:error,
+               InvalidCalculationArgument.exception(
+                 field: argument.name,
+-                calculation: calculation.name,
++                calculation: calculation_name(calculation),
+                 message: "is required",
+                 value: nil
+               )}}
+@@ -2752,7 +2823,7 @@ defmodule Ash.Query do
+              {:error,
+               InvalidCalculationArgument.exception(
+                 field: argument.name,
+-                calculation: calculation.name,
++                calculation: calculation_name(calculation),
+                 message: "is required",
+                 value: value
+               )}}
+diff --git a/lib/ash/type/union.ex b/lib/ash/type/union.ex
+index 61bd547..c3bb46a 100644
+--- a/lib/ash/type/union.ex
++++ b/lib/ash/type/union.ex
+@@ -429,7 +429,23 @@ defmodule Ash.Type.Union do
+ 
+   @impl true
+   def matches_type?(%Ash.Union{type: type, value: value}, constraints) do
+-    Ash.Type.matches_type?(constraints[:types][type], value)
++    case constraints[:types][type] do
++      nil ->
++        false
++
++      config ->
++        member_type = config[:type]
++        member_constraints = config[:constraints] || []
++
++        if Ash.Type.ash_type?(member_type) do
++          Ash.Type.matches_type?(member_type, value, member_constraints)
++        else
++          # The member is not itself an Ash type (e.g. an embedded resource or
++          # other Ecto-backed struct); a best-effort structural check is all
++          # that is possible.
++          is_struct(value, member_type)
++        end
++    end
+   end
+ 
+   ## Find the minimal supported type?

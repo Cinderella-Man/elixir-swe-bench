@@ -1,0 +1,127 @@
+diff --git a/lib/plausible/application.ex b/lib/plausible/application.ex
+index 2bae31a..0fc99be 100644
+--- a/lib/plausible/application.ex
++++ b/lib/plausible/application.ex
+@@ -164,7 +164,7 @@ defmodule Plausible.Application do
+           adapter_opts: [
+             n_lock_partitions: 1,
+             ttl_check_interval: false,
+-            ets_options: [:bag, read_concurrency: true]
++            ets_options: [read_concurrency: true]
+           ],
+           warmers: [
+             refresh_all:
+diff --git a/lib/plausible/cache.ex b/lib/plausible/cache.ex
+index c03c96b..82451d4 100644
+--- a/lib/plausible/cache.ex
++++ b/lib/plausible/cache.ex
+@@ -69,9 +69,20 @@ defmodule Plausible.Cache do
+         cache_name = Keyword.get(opts, :cache_name, name())
+         multicall_timeout = Keyword.get(opts, :multicall_timeout, :timer.seconds(5))
+ 
++        # Update the local cache synchronously, so that a write is immediately
++        # visible on the node that handled it. The remote nodes are notified
++        # asynchronously.
++        Adapter.put(cache_name, key, value, opts)
++
+         {:ok, _} =
+           Task.start(fn ->
+-            :rpc.multicall(Adapter, :put, [cache_name, key, value, opts], multicall_timeout)
++            :rpc.multicall(
++              Node.list(),
++              Adapter,
++              :put,
++              [cache_name, key, value, opts],
++              multicall_timeout
++            )
+           end)
+ 
+         :ok
+diff --git a/test/plausible_web/plugs/tracker_plug_test.exs b/test/plausible_web/plugs/tracker_plug_test.exs
+index 488b5b2..833fa5a 100644
+--- a/test/plausible_web/plugs/tracker_plug_test.exs
++++ b/test/plausible_web/plugs/tracker_plug_test.exs
+@@ -135,3 +135,83 @@ defmodule PlausibleWeb.TrackerPlugTest do
+     |> response(200)
+   end
+ end
++
++defmodule PlausibleWeb.TrackerPlugCacheEnabledTest do
++  use PlausibleWeb.ConnCase, async: false
++
++  alias PlausibleWeb.Tracker
++  alias PlausibleWeb.TrackerScriptCache
++
++  test "dedicated scripts follow writes and cache refreshes", %{conn: conn} do
++    patch_env(Plausible.Cache, enabled: true)
++
++    site1 = new_site(domain: "dedicated-script-one.example.com")
++    site2 = new_site(domain: "dedicated-script-two.example.com")
++
++    config1 = update_config(site1, file_downloads: true, outbound_links: false)
++    config2 = update_config(site2, file_downloads: false, outbound_links: true)
++
++    assert_script(conn, config1, site1.domain, file_downloads: true, outbound_links: false)
++    assert_script(conn, config2, site2.domain, file_downloads: false, outbound_links: true)
++
++    config1 = update_config(site1, file_downloads: false, outbound_links: true)
++    assert_script(conn, config1, site1.domain, file_downloads: false, outbound_links: true)
++
++    config1 = update_config(site1, file_downloads: true, outbound_links: false)
++    assert_script(conn, config1, site1.domain, file_downloads: true, outbound_links: false)
++
++    # Updating one site must not change the script of another site.
++    assert_script(conn, config2, site2.domain, file_downloads: false, outbound_links: true)
++
++    # Simulate a configuration changed directly in the database (or by another node),
++    # without broadcasting the change through `PlausibleWeb.Tracker`.
++    config1
++    |> Ecto.Changeset.change(
++      file_downloads: false,
++      outbound_links: true,
++      updated_at: NaiveDateTime.truncate(NaiveDateTime.utc_now(), :second)
++    )
++    |> Plausible.Repo.update!()
++
++    :ok = TrackerScriptCache.refresh_updated_recently()
++    assert_script(conn, config1, site1.domain, file_downloads: false, outbound_links: true)
++
++    # Repeated refreshes must not corrupt the cached scripts.
++    for _ <- 1..3 do
++      :ok = TrackerScriptCache.refresh_all()
++      assert_script(conn, config1, site1.domain, file_downloads: false, outbound_links: true)
++      assert_script(conn, config2, site2.domain, file_downloads: false, outbound_links: true)
++    end
++
++    conn
++    |> get("/js/pa-task-regression-unknown.js")
++    |> response(404)
++  end
++
++  defp update_config(site, opts) do
++    Tracker.update_script_configuration!(
++      site,
++      Map.merge(%{installation_type: :manual}, Map.new(opts)),
++      :installation
++    )
++  end
++
++  defp assert_script(conn, config, domain, opts) do
++    body = conn |> get("/js/#{config.id}.js") |> response(200)
++
++    assert String.starts_with?(body, "!function(){var")
++    assert String.contains?(body, ~s(domain:"#{domain}"))
++
++    if opts[:file_downloads] do
++      assert String.contains?(body, "fileDownloads:!0")
++    else
++      refute String.contains?(body, "fileDownloads:!0")
++    end
++
++    if opts[:outbound_links] do
++      assert String.contains?(body, "outboundLinks:!0")
++    else
++      refute String.contains?(body, "outboundLinks:!0")
++    end
++  end
++end

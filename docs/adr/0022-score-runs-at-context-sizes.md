@@ -9,7 +9,7 @@ Every attempt now records its **peak context**: the largest prompt any of its mo
 - **The rule.** At a size, a case counts only if the agent finished on its own, its peak context is within that size, and its patch passes.
 - **The sizes.** 65,536, 98,304, 131,072, 196,608 and 262,144 tokens: from what a small local setup holds to the largest window local runs use.
 - **One run, every size.** Nothing is run or graded again. One run at the largest window gives the score at every smaller size, because each case's peak context is one recorded number.
-- **The results page.** A **Context size** selector shows every series at the chosen size. **As run** stays the default and is each series' score as it was run, unchanged. Since 2026-11-18 the chart of a release with recorded peaks plots cases solved against context, one line per series, in place of cases against peak memory: that memory is measured with the whole window reserved, whatever the work needed, and hosted models have none. Memory stays in the table and the details.
+- **The results page.** Every series' own score, **as run**, stays unchanged and stays the page's headline number. The table view adds one column per size. A **Context size** selector first switched the whole page to one size; it was removed on 2026-11-18, once the chart showed every size at once. Since that day the chart of a release with recorded peaks plots cases solved against context, one line per series, in place of cases against peak memory: that memory is measured with the whole window reserved, whatever the work needed, and hosted models have none. Memory stays in the table and the details.
 - **What it measures.** How much room a model needs to do the work. Someone choosing hardware can read off what a model solves in the context they can afford.
 
 This replaces ADR 0021's allowance as the benchmark's measure of economy. The allowance stays implemented and no release declares it. It derived a number per case from the validator's usage; a context size is the same for every model and every case, and needs none.
@@ -24,6 +24,8 @@ Read from the runs that exist (cases solved, of 20):
 | Haiku 5.5 at max, its two v6 runs | 0, 0 | 0, 0 | 2, 2 | 5, 5 | 10, 10 | 19, 19 |
 | Qwen3.8-27B UD-Q4_K_XL, v6 | 5 | 9 | 13 | 16 | 16 | 18 |
 | Qwen3.8-27B UD-Q6_K_L, v6 | 2 | 7 | 11 | 14 | 15 | 16 |
+| DeepSeek V4.1 Flash UD-IQ1_M, v6 | 4 | 10 | 15 | 16 | 17 | 17 |
+| DeepSeek V4.1 Flash GSQ-RCO-Coder IQ2_XXS, v6 | 3 | 5 | 10 | 14 | 14 | 15 |
 
 ## Consequences
 
@@ -34,9 +36,9 @@ Read from the runs that exist (cases solved, of 20):
 - **Token units differ a little.** A hosted model's context is counted in its own tokens, a local model's in its own. A case near a size's edge can fall either side.
 - **Reasoning a chat template drops costs no context.** Such a model fits more work into a size than one that keeps its reasoning in the conversation. Output tokens stay published beside the score.
 - **Public schema 12.** Each case adds `peak_context_tokens`, null where the run did not record it. A series whose attempts all recorded it gets a score at every size; any other series is left out of a size's view. Series published earlier keep their files and are upgraded when they take another run.
-- **Series already published.** The two Qwen3.8-27B v6 series had their peaks read from the per-call usage records their runs saved, and took schema 12. The DeepSeek v6 series' run logs are not on the controller's machine, so it has no scores at a size. The v5 series are left as published.
+- **Series already published.** The two Qwen3.8-27B v6 series had their peaks read from the per-call usage records their runs saved, and took schema 12. The DeepSeek v6 series' run was made by a controller on another machine, which still held its files; on 2026-11-18 its peaks were read from that run's per-call usage records the same way ([record](../../verification/local-series-2026-11-18/README.md#deepseeks-peak-context)). A second finished v6 run that controller held, of the same model in ISTA DASLab's IQ2_XXS quant, was published the same day with its peaks. The v5 series are left as published.
 - **Opus and Sonnet on v6.** Neither has a full run on v6. At the user's request each has a v6 series assembled from its v5 runs and four single-case attempts, with its peaks read from their transcripts ([ADR 0012](0012-rebuild-release-and-validate-with-unpublished-opus-runs.md), amendments of 2026-11-17 and 18). Haiku 5.5's v6 series is two ordinary full runs, the first to record their peaks as they ran.
-- **It does not separate economical models.** As run, every series above scores 16 to 20, and a size pulls the heavy users of context far below the rest: at 262,144 Sonnet and Haiku at max effort solve 7 to 10. But Opus and the two Qwen series still sit between 15 and 18 there. That needs cases that good models get wrong, which is a matter of what the cases ask, not of how they are scored.
+- **It does not separate economical models.** As run, every series above scores 15 to 20, and a size pulls the heavy users of context far below the rest: at 262,144 Sonnet and Haiku at max effort solve 7 to 10. But Opus, DeepSeek UD-IQ1_M and the two Qwen series still sit between 15 and 18 there. That needs cases that good models get wrong, which is a matter of what the cases ask, not of how they are scored.
 
 ## Considered options
 

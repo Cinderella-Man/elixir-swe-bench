@@ -46,6 +46,9 @@ defmodule Eab.ContextSizeTest do
     end
 
     assert ContextSize.of_attempt(run, "case-a", %{}) == 10_200
+    # The calls themselves, prompt and reply, in the order they were made.
+    assert ContextSize.calls(run, "case-a") == [{2070, 86}, {9000, 1200}, {9800, 40}]
+    assert ContextSize.calls(run, "case-none") == []
 
     # A Claude Code run has its transcript; streaming repeats a call's record per content block.
     usage = fn output ->
@@ -72,6 +75,8 @@ defmodule Eab.ContextSizeTest do
 
     Store.write_text("runs/#{run}/case-b/claude-transcript.jsonl", lines <> "\nnot json\n")
     assert ContextSize.of_attempt(run, "case-b", %{}) == 1093
+    # One call per message, taken from its fullest record.
+    assert ContextSize.calls(run, "case-b") == [{1053, 40}, {1053, 20}]
   end
 
   defp record(runs) do

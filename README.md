@@ -1,6 +1,6 @@
 # Elixir Agent Benchmark
 
-The standalone **Elixir SWE Bench** [results page](results-page/README.md) displays published runs. Click **Add to results page** on a completed full run to export it and rebuild the local page. Push the resulting public JSON file to GitHub to deploy through GitHub Pages.
+The standalone **Elixir SWE Bench** [results page](results-page/README.md) displays published runs. Click **Add to results page** on a completed full run to export it and rebuild the local page. The run's full logs are saved to `verification/runs/` at the same time ([ADR 0023](docs/adr/0023-keep-every-published-runs-full-logs.md)). Push the resulting public JSON file and the logs folder to GitHub; the page deploys through GitHub Pages.
 
 A local Elixir website that evaluates coding models against historical PR tasks. During the [sequential curation loop](docs/case-curation-loop.md), approved cases are temporarily parked in `cases_approved/`. Only case folders inside `cases/` are run. Moving folders back into `cases/` restores them automatically, with no inventory or configuration edits.
 

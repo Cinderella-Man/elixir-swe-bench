@@ -1,6 +1,6 @@
 # How scores at context sizes work
 
-The results page can show every run series at a chosen **context size**: what the model solved when the whole attempt had to fit in that many tokens. This page explains the rule, how to read it, and how the benchmark got there on 2026-11-17. The decision itself is [ADR 0022](adr/0022-score-runs-at-context-sizes.md).
+The results page shows every run series at each **context size**: what the model solved when the whole attempt had to fit in that many tokens. This page explains the rule, how to read it, and how the benchmark got there on 2026-11-17. The decision itself is [ADR 0022](adr/0022-score-runs-at-context-sizes.md).
 
 ## The rule
 
@@ -24,10 +24,10 @@ The sizes are 65,536, 98,304, 131,072, 196,608 and 262,144 tokens. One run at th
 
 - **The chart** of a release with recorded peaks plots cases solved against context. Each series is a line; its height at any point is how many cases the model solves when the whole attempt must fit in that much context. Higher and further left is better. A strip at the right holds each series' own score.
 - **Memory is not an axis there.** A model's peak VRAM + RAM is measured with the whole 262,144-token window reserved, so it says how large the window was, not how much room the work needed. It stays in the table and in each series' details.
-- **As run** is the default. It is each series' score exactly as it was run: for a local model, inside its own context window.
-- **A size** replaces every score, interval and per-case count with that size's. The details then list each attempt's peak context beside its case.
+- **As run** is each series' score exactly as it was run: for a local model, inside its own context window. It is the strip beside the chart, the **Cases passed** column of the table view and the score in a series' details.
+- **The table view** has one column per size, holding the cases the series solves inside it. A series' details list each attempt's peak context beside its case.
 - **A size is stricter than the run.** A local attempt that filled its window is cut off and its patch is still graded, so it can pass in the run's own score. At a size it never counts, because the agent did not finish. That is why Qwen3.8-27B UD-Q4_K_XL scores 18 as run and 16 at 262,144.
-- **Series without recorded peaks are not shown at a size.** A note says how many.
+- **Series without recorded peaks have no line.** They keep their dot in the strip and show a dash in the size columns.
 - **These are "would have fit" scores.** The runs were made with a 262,144-token window, and the model was told that window. A model told it has 65,536 tokens might behave differently.
 - **Token units differ a little.** Claude's tokens and a local model's are not the same unit, so a case near a size's edge can fall either side.
 
@@ -45,16 +45,19 @@ Cases solved, of 20, in the v6 series.
 | Haiku 5.5 at max, run 2 | 0 | 0 | 2 | 5 | 10 | 19 |
 | Qwen3.8-27B UD-Q4_K_XL | 5 | 9 | 13 | 16 | 16 | 18 |
 | Qwen3.8-27B UD-Q6_K_L | 2 | 7 | 11 | 14 | 15 | 16 |
+| DeepSeek V4.1 Flash UD-IQ1_M | 4 | 10 | 15 | 16 | 17 | 17 |
+| DeepSeek V4.1 Flash GSQ-RCO-Coder IQ2_XXS | 3 | 5 | 10 | 14 | 14 | 15 |
 
-- **As run, every series scores 16 to 20.** That column alone says every model is good enough.
-- **A size tells them apart.** At 131,072 Opus and Qwen Q4 solve 13, Qwen Q6 11, and Sonnet and Haiku at most 2.
+- **As run, every series scores 15 to 20.** That column alone says every model is good enough.
+- **A size tells them apart.** At 131,072 DeepSeek UD-IQ1_M solves 15, its IQ2_XXS sibling 10, Opus and Qwen Q4 13, Qwen Q6 11, and Sonnet and Haiku at most 2.
+- **DeepSeek fits a case Opus does not.** It solves absinthe-pr-1176 at a peak of 243,275 tokens, where Opus needs about 300,000. It is the only series whose score at 262,144 equals its score as run.
 - **Sonnet and Haiku at max effort need a great deal of room.** Haiku's median attempt peaks near 280,000 tokens and its largest at 570,000, so half its passes disappear at 262,144.
 - **Opus fails like any other model.** It never fits absinthe-pr-1176 or ash-pr-3031 in 262,144, so it solves 19 or 20 as run and 17 or 18 at that size.
 - **The economical models still cluster.** See [what this does not fix](#what-this-does-not-fix).
 
 Haiku's series is two ordinary full runs on v6. Opus's and Sonnet's are assembled from attempts that already existed, not run as one. See [Opus and Sonnet on v6](#opus-and-sonnet-on-v6).
 
-The DeepSeek V4.1 Flash v6 series has no row. Its run was recorded on another machine, and only its published summary is here. An estimate from that summary puts it at about 4, 10, 15, 16 and 17, but the estimate can run 20% high per case, so it is not published.
+DeepSeek's run was made on 2026-11-13 by a controller on another machine, before attempts recorded their peak context. That machine still held the run's files, and on 2026-11-18 its peaks were read from the token counts of its 1,248 model calls ([record](../verification/local-series-2026-11-18/README.md#deepseeks-peak-context)). They confirm an earlier estimate from the published summary, which had put it at about 4, 10, 15, 16 and 17. That controller also held a finished v6 run of the same model in ISTA DASLab's IQ2_XXS quant, which had never been published. It was added the same day, with its peaks ([record](../verification/local-series-2026-11-18/README.md#the-ista-run)).
 
 ## How the benchmark got here
 
@@ -98,7 +101,7 @@ The user proposed holding every model to the same context, Opus included, and sh
 
 ## What this does not fix
 
-A context size shows economy. It does not tell economical models apart: at 262,144 Opus and the two Qwen series sit between 15 and 18 of 20, and as run all eight rows above sit between 16 and 20.
+A context size shows economy. It does not tell economical models apart: at 262,144 Opus, DeepSeek UD-IQ1_M and the two Qwen series sit between 15 and 18 of 20, and as run all ten rows above sit between 15 and 20.
 
 Models separate at full size only on cases they get wrong, and the release has few of those. The ones it has are subtle, not large:
 
@@ -118,7 +121,9 @@ New cases should be chosen for that kind of difficulty, and sized so that Opus's
 | The built page data | `by_context`: each series' score, interval and per-case counts at every size |
 | `Eab.ContextSize` | The sizes, the rule and the calculation |
 
-A run made before peaks were recorded can still supply them while its logs exist: a Pi run saved one usage record per model call, and a Claude Code run saved its transcript. That is how the two Qwen v6 series got theirs.
+A run made before peaks were recorded can still supply them while its logs exist: a Pi run saved one usage record per model call, and a Claude Code run saved its transcript. That is how the two Qwen v6 series and the two DeepSeek ones got theirs.
+
+The full logs of every v6 run are in `verification/`: the Claude Code runs with their transcripts, and since 2026-11-18 the [local models' runs](../verification/local-series-2026-11-18/README.md) with every model call's tokens and the agent's event stream. From that day adding a run to the results page saves its logs to `verification/runs/` by itself ([ADR 0023](adr/0023-keep-every-published-runs-full-logs.md)). A question nobody planned for can be answered from them without running a model again.
 
 ## Opus and Sonnet on v6
 
@@ -139,6 +144,5 @@ Haiku 5.5 needed none of this. Its series is [two full runs on v6](../verificati
 
 - **Full Opus and Sonnet runs on v6.** They would replace the assembled series with real ones.
 - **Haiku's third run.** Its series has two of three.
-- **DeepSeek's peaks.** They need its run's logs from the machine that recorded it, or a new run.
 - **The other v6 seeds.** Each local series still has one run of three.
 - **Harder cases.** See above.

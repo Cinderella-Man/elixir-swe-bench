@@ -1,0 +1,294 @@
+diff --git a/lib/livebook/runtime/evaluator.ex b/lib/livebook/runtime/evaluator.ex
+index 2343b84..d5579ea 100644
+--- a/lib/livebook/runtime/evaluator.ex
++++ b/lib/livebook/runtime/evaluator.ex
+@@ -343,9 +343,12 @@ defmodule Livebook.Runtime.Evaluator do
+   end
+ 
+   defp initial_context() do
++    %{id: random_long_id(), binding: [], env: initial_env(), pdict: %{}}
++  end
++
++  defp initial_env() do
+     env = Code.env_for_eval([])
+-    env = Macro.Env.prepend_tracer(env, Evaluator.Tracer)
+-    %{id: random_long_id(), binding: [], env: env, pdict: %{}}
++    Macro.Env.prepend_tracer(env, Evaluator.Tracer)
+   end
+ 
+   defp handle_cast({:evaluate_code, language, code, ref, parent_refs, opts}, state) do
+@@ -468,8 +471,19 @@ defmodule Livebook.Runtime.Evaluator do
+           identifiers_used = :unknown
+           identifiers_defined = %{}
+           identifier_definitions = []
+-          # Empty context
+-          new_context = initial_context()
++          # The failed evaluation contributes no state to the context:
++          # no bindings, aliases, requires, versioned variables or
++          # defined modules. However, we keep the imports (functions
++          # and macros) and the process dictionary that were in effect
++          # before the evaluation ran, so that later evaluations which
++          # use this evaluation as a parent can still use them
++          new_context = %{
++            id: random_long_id(),
++            binding: [],
++            env: failed_env(context.env),
++            pdict: context.pdict
++          }
++
+           {new_context, result, identifiers_used, identifiers_defined, identifier_definitions}
+       end
+ 
+@@ -587,6 +601,10 @@ defmodule Livebook.Runtime.Evaluator do
+         into: %{}
+   end
+ 
++  defp failed_env(parent_env) do
++    %{initial_env() | functions: parent_env.functions, macros: parent_env.macros}
++  end
++
+   defp prune_env(env, tracer_info) do
+     env
+     |> Map.replace!(:aliases, Map.to_list(tracer_info.aliases_defined))
+diff --git a/test/livebook/runtime/evaluator_test.exs b/test/livebook/runtime/evaluator_test.exs
+index 6d2fe89..b59f897 100644
+--- a/test/livebook/runtime/evaluator_test.exs
++++ b/test/livebook/runtime/evaluator_test.exs
+@@ -50,6 +50,8 @@ defmodule Livebook.Runtime.EvaluatorTest do
+ 
+   defmacrop ansi_number(number), do: "\e[34m#{number}\e[0m"
+   defmacrop ansi_string(string), do: "\e[32m\"#{string}\"\e[0m"
++  defmacrop ansi_true, do: "\e[35mtrue\e[0m"
++  defmacrop ansi_nil, do: "\e[35mnil\e[0m"
+ 
+   defmacrop error(message) do
+     quote do
+@@ -362,6 +364,228 @@ defmodule Livebook.Runtime.EvaluatorTest do
+                       metadata()}
+     end
+ 
++    test "keeps imports and process dictionary of earlier cells when a later cell fails",
++         %{evaluator: evaluator} do
++      code1 = """
++      import ExUnit.Assertions
++
++      Process.put(:pd_key, 42)
++
++      x = 2
++      """
++
++      code2 = "assert false"
++
++      Evaluator.evaluate_code(evaluator, :elixir, code1, :code_1, [])
++
++      assert_receive {:runtime_evaluation_response, :code_1, terminal_text(ansi_number(2)),
++                      metadata()}
++
++      Evaluator.evaluate_code(evaluator, :elixir, code2, :code_2, [:code_1])
++
++      assert_receive {:runtime_evaluation_response, :code_2, error(_), metadata()}
++
++      # The process dictionary of the earlier successful evaluation is kept
++      Evaluator.evaluate_code(evaluator, :elixir, "Process.get(:pd_key)", :code_3, [
++        :code_2,
++        :code_1
++      ])
++
++      assert_receive {:runtime_evaluation_response, :code_3, terminal_text(ansi_number(42)),
++                      metadata()}
++
++      # The imports and the bindings of the earlier successful evaluation are kept
++      Evaluator.evaluate_code(evaluator, :elixir, "assert x == 2", :code_4, [:code_2, :code_1])
++
++      assert_receive {:runtime_evaluation_response, :code_4, terminal_text(ansi_true()),
++                      metadata()}
++    end
++
++    test "in case of an error keeps the parent context imports and process dictionary in the evaluation context",
++         %{evaluator: evaluator} do
++      code1 = """
++      import ExUnit.Assertions
++
++      Process.put(:pd_key, 42)
++
++      alias String
++
++      require IEx.Helpers
++
++      x = 2
++      """
++
++      code2 = """
++      defmodule Livebook.Runtime.EvaluatorTest.FailedContext do
++      end
++
++      alias Enum
++
++      require IEx.Helpers
++
++      import ExUnit.CaptureIO
++
++      y = 3
++
++      raise "failed"
++      """
++
++      Evaluator.evaluate_code(evaluator, :elixir, code1, :code_1, [])
++
++      assert_receive {:runtime_evaluation_response, :code_1, terminal_text(ansi_number(2)),
++                      metadata()}
++
++      Evaluator.evaluate_code(evaluator, :elixir, code2, :code_2, [:code_1])
++
++      assert_receive {:runtime_evaluation_response, :code_2, error(_), metadata()}
++
++      refute Code.ensure_loaded?(Livebook.Runtime.EvaluatorTest.FailedContext)
++
++      context = Evaluator.get_evaluation_context(evaluator, [:code_2])
++
++      # The failed evaluation contributes no state to the context, neither its
++      # own nor the state of the earlier evaluations
++      assert context.binding == []
++      assert context.env.versioned_vars == %{}
++      assert context.env.aliases == []
++      assert context.env.requires == [Application, Kernel]
++      assert context.env.context_modules == []
++
++      # However, it keeps the imports and the process dictionary that were in
++      # effect before the evaluation ran
++      assert Keyword.has_key?(context.env.functions, ExUnit.Assertions)
++      assert Keyword.has_key?(context.env.macros, ExUnit.Assertions)
++      refute Keyword.has_key?(context.env.functions, ExUnit.CaptureIO)
++      refute Keyword.has_key?(context.env.macros, ExUnit.CaptureIO)
++      assert context.pdict == %{pd_key: 42}
++    end
++
++    test "given only a failed evaluation as parent sees its imports and process dictionary",
++         %{evaluator: evaluator} do
++      code1 = """
++      import ExUnit.Assertions
++
++      Process.put(:pd_key, 42)
++      """
++
++      Evaluator.evaluate_code(evaluator, :elixir, code1, :code_1, [])
++
++      assert_receive {:runtime_evaluation_response, :code_1, terminal_text(ansi_nil()),
++                      metadata()}
++
++      Evaluator.evaluate_code(evaluator, :elixir, "assert false", :code_2, [:code_1])
++
++      assert_receive {:runtime_evaluation_response, :code_2, error(_), metadata()}
++
++      Evaluator.evaluate_code(evaluator, :elixir, "assert Process.get(:pd_key) == 42", :code_3, [
++        :code_2
++      ])
++
++      assert_receive {:runtime_evaluation_response, :code_3, terminal_text(ansi_true()),
++                      metadata()}
++    end
++
++    test "in case of an error does not apply the changes made by the failed evaluation",
++         %{evaluator: evaluator} do
++      code1 = "Process.put(:pd_key, 42)"
++
++      code2 = """
++      Process.put(:pd_added, :added)
++
++      Process.delete(:pd_key)
++
++      alias Livebook.Runtime.Evaluator
++
++      require IEx.Helpers
++
++      import ExUnit.Assertions
++
++      y = 3
++
++      raise "failed"
++      """
++
++      Evaluator.evaluate_code(evaluator, :elixir, code1, :code_1, [])
++
++      assert_receive {:runtime_evaluation_response, :code_1, terminal_text(ansi_nil()),
++                      metadata()}
++
++      Evaluator.evaluate_code(evaluator, :elixir, code2, :code_2, [:code_1])
++
++      assert_receive {:runtime_evaluation_response, :code_2, error(_), metadata()}
++
++      # Process dictionary changes made by the failed evaluation are rolled back:
++      # deleted keys are restored, added keys are removed
++      Evaluator.evaluate_code(
++        evaluator,
++        :elixir,
++        "Process.get(:pd_key) == 42 and Process.get(:pd_added) == nil",
++        :code_3,
++        [:code_2, :code_1]
++      )
++
++      assert_receive {:runtime_evaluation_response, :code_3, terminal_text(ansi_true()),
++                      metadata()}
++
++      # The bindings, aliases, requires and imports made by the failed
++      # evaluation do not apply
++      Evaluator.evaluate_code(evaluator, :elixir, "y", :code_4, [:code_2, :code_1])
++
++      assert_receive {:runtime_evaluation_response, :code_4, error(_), metadata()}
++
++      Evaluator.evaluate_code(evaluator, :elixir, "Evaluator.intellisense_context()", :code_5, [
++        :code_2,
++        :code_1
++      ])
++
++      assert_receive {:runtime_evaluation_response, :code_5, error(_), metadata()}
++
++      Evaluator.evaluate_code(evaluator, :elixir, "IEx.Helpers.h(\"String\")", :code_6, [
++        :code_2,
++        :code_1
++      ])
++
++      assert_receive {:runtime_evaluation_response, :code_6, error(_), metadata()}
++
++      Evaluator.evaluate_code(evaluator, :elixir, "assert true", :code_7, [:code_2, :code_1])
++
++      assert_receive {:runtime_evaluation_response, :code_7, error(_), metadata()}
++    end
++
++    test "keeps random seed state intact when the evaluation fails", %{evaluator: evaluator} do
++      # Seed the random generator and consume one random number as part of
++      # a failed evaluation
++      Evaluator.evaluate_code(evaluator, :elixir, ":rand.seed(:default, 0)", :code_1, [])
++
++      assert_receive {:runtime_evaluation_response, :code_1, _, metadata()}
++
++      Evaluator.evaluate_code(evaluator, :elixir, ":rand.uniform(); raise \"failed\"", :code_2, [
++        :code_1
++      ])
++
++      assert_receive {:runtime_evaluation_response, :code_2, error(_), metadata()}
++
++      # The random seed state is shared by all evaluations and is not
++      # rolled back when an evaluation fails, so the next random number is
++      # the one following the one consumed by the failed evaluation
++      code3 = """
++      a = :rand.uniform()
++
++      :rand.seed(:default, 0)
++
++      _b = :rand.uniform()
++
++      c = :rand.uniform()
++
++      a == c
++      """
++
++      Evaluator.evaluate_code(evaluator, :elixir, code3, :code_3, [:code_2, :code_1])
++
++      assert_receive {:runtime_evaluation_response, :code_3, terminal_text(ansi_true()),
++                      metadata()}
++    end
++
+     test "given file option sets it in evaluation environment", %{evaluator: evaluator} do
+       code = """
+       __DIR__

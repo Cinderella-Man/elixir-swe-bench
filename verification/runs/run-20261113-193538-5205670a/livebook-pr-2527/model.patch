@@ -1,0 +1,155 @@
+diff --git a/lib/livebook/live_markdown/import.ex b/lib/livebook/live_markdown/import.ex
+index af8a195..d7997b4 100644
+--- a/lib/livebook/live_markdown/import.ex
++++ b/lib/livebook/live_markdown/import.ex
+@@ -632,8 +632,9 @@ defmodule Livebook.LiveMarkdown.Import do
+ 
+     {stamp_verified?, notebook, messages} =
+       with %{"offset" => offset, "stamp" => stamp} <- stamp_data,
+-           {:ok, notebook_source} <- safe_binary_slice(notebook_source, 0, offset),
+-           {:ok, metadata} <- Livebook.Hubs.verify_notebook_stamp(hub, notebook_source, stamp) do
++           {:ok, signed_source} <- safe_binary_slice(notebook_source, 0, offset),
++           true <- stamp_directly_follows?(notebook_source, offset, stamp_data),
++           {:ok, metadata} <- Livebook.Hubs.verify_notebook_stamp(hub, signed_source, stamp) do
+         notebook = apply_stamp_metadata(notebook, metadata)
+         {true, notebook, []}
+       else
+@@ -658,6 +659,27 @@ defmodule Livebook.LiveMarkdown.Import do
+     {%{notebook | teams_enabled: teams_enabled}, stamp_verified?, messages}
+   end
+ 
++  # Content between the signed source and the stamp would not be covered by
++  # the stamp signature. We allow only whitespace there, so that adding blank
++  # lines does not invalidate the stamp, but any actual content does.
++  defp stamp_directly_follows?(notebook_source, offset, stamp_data) do
++    case safe_binary_slice(notebook_source, offset, byte_size(notebook_source) - offset) do
++      {:ok, rest} ->
++        rest = String.trim_leading(rest)
++
++        with true <- String.starts_with?(rest, "<!-- livebook:"),
++             [_, json] <- Regex.run(~r/\A<!-- livebook:(.*?) -->/s, rest),
++             {:ok, data} <- Jason.decode(json) do
++          data["offset"] == stamp_data["offset"] and data["stamp"] == stamp_data["stamp"]
++        else
++          _ -> false
++        end
++
++      :error ->
++        false
++    end
++  end
++
+   defp safe_binary_slice(binary, start, size)
+        when byte_size(binary) < start + size,
+        do: :error
+diff --git a/test/livebook/live_markdown/import_test.exs b/test/livebook/live_markdown/import_test.exs
+index 928fadc..ed99c7d 100644
+--- a/test/livebook/live_markdown/import_test.exs
++++ b/test/livebook/live_markdown/import_test.exs
+@@ -3,6 +3,7 @@ defmodule Livebook.LiveMarkdown.ImportTest do
+ 
+   import Livebook.TestHelpers
+ 
++  alias Livebook.LiveMarkdown.Export
+   alias Livebook.LiveMarkdown.Import
+   alias Livebook.Notebook
+   alias Livebook.Notebook.Cell
+@@ -1274,6 +1275,70 @@ defmodule Livebook.LiveMarkdown.ImportTest do
+ 
+       Livebook.Hubs.delete_hub(hub.id)
+     end
++
++    test "does not verify notebook stamp when content is added before the stamp" do
++      {markdown, []} = signed_notebook_markdown("My Notebook")
++
++      additions = [
++        {"an Elixir code cell", "```elixir\nIO.puts(\"added\")\n```\n\n", "IO.puts(\"added\")"},
++        {"an Erlang code cell", "```erlang\nio:format(\"added\").\n```\n\n",
++         "io:format(\"added\")"},
++        {"a markdown paragraph", "Added paragraph.\n\n", "Added paragraph."},
++        {"a new section", "## Added Section\n\n```elixir\nIO.puts(\"added\")\n```\n\n",
++         "IO.puts(\"added\")"}
++      ]
++
++      for {description, addition, expected_source} <- additions do
++        modified_markdown = insert_before_stamp(markdown, addition)
++
++        {notebook, %{warnings: warnings, stamp_verified?: false}} =
++          Import.notebook_from_livemd(modified_markdown)
++
++        assert %Notebook{hub_secret_names: []} = notebook
++
++        assert [message] = warnings
++
++        assert message ==
++                 "this notebook can only access environment variables defined in this machine (the notebook was either authored in another machine or changed outside of Livebook)"
++
++        sources = for section <- notebook.sections, cell <- section.cells, do: cell.source
++
++        assert Enum.any?(sources, &String.contains?(&1, "IO.puts(\"hey\")")),
++               "expected the original code cell to be imported after adding #{description}"
++
++        assert Enum.any?(sources, &String.contains?(&1, expected_source)),
++               "expected the added content to be imported after adding #{description}"
++
++        if description == "a new section" do
++          assert Enum.any?(notebook.sections, &(&1.name == "Added Section"))
++        end
++      end
++    end
++
++    test "verifies a freshly exported and signed notebook with a non-ASCII name" do
++      {markdown, []} = signed_notebook_markdown("Notebook with üñïçødé 😀")
++
++      {notebook, %{warnings: [], stamp_verified?: true}} =
++        Import.notebook_from_livemd(markdown)
++
++      assert %Notebook{
++               name: "Notebook with üñïçødé 😀",
++               hub_secret_names: ["DB_PASSWORD"]
++             } = notebook
++    end
++
++    test "keeps the stamp valid with blank lines between signed content and stamp" do
++      {markdown, []} = signed_notebook_markdown("My Notebook")
++      markdown = insert_before_stamp(markdown, "\n   \n\t\n \t \n")
++
++      {notebook, %{warnings: [], stamp_verified?: true}} =
++        Import.notebook_from_livemd(markdown)
++
++      assert %Notebook{name: "My Notebook", hub_secret_names: ["DB_PASSWORD"]} = notebook
++
++      assert [%Cell.Code{source: "IO.puts(\"hey\")"}] =
++               notebook.sections |> hd() |> Map.get(:cells)
++    end
+   end
+ 
+   describe "file entries" do
+@@ -1403,4 +1468,27 @@ defmodule Livebook.LiveMarkdown.ImportTest do
+       assert notebook.quarantine_file_entry_names == MapSet.new(["document1.pdf"])
+     end
+   end
++
++  defp signed_notebook(name) do
++    %{
++      Notebook.new()
++      | name: name,
++        sections: [
++          %{
++            Notebook.Section.new()
++            | name: "Section 1",
++              cells: [%{Notebook.Cell.new(:code) | source: "IO.puts(\"hey\")"}]
++          }
++        ],
++        hub_secret_names: ["DB_PASSWORD"]
++    }
++  end
++
++  defp signed_notebook_markdown(name) do
++    Export.notebook_to_livemd(signed_notebook(name))
++  end
++
++  defp insert_before_stamp(markdown, content) do
++    String.replace(markdown, "<!-- livebook:", content <> "<!-- livebook:", global: false)
++  end
+ end

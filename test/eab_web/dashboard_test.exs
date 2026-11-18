@@ -343,6 +343,13 @@ defmodule EabWeb.DashboardTest do
     assert has_element?(view, "#result-publication a[href='/results/']")
     assert render(view) =~ "Push the result file to GitHub"
 
+    # The run's full logs are saved with it (ADR 0023).
+    logs = Path.join(page, "verification/runs/run-#{run["id"]}")
+    assert has_element?(view, "#result-logs", "verification/runs/run-#{run["id"]}/")
+    assert File.regular?(Path.join(logs, "manifest.json"))
+    assert Eab.Results.read!(Path.join(logs, "run-summary.json"))["run_id"] == run["id"]
+    refute File.read!(Path.join(logs, "run-summary.json")) =~ "private-host"
+
     [public] = Eab.Results.load!(Path.join(page, "results"))
     assert public == Eab.Results.export!(run, inventory: run["protocol"]["inventory"])
     current = fn payload -> Enum.find(payload["releases"], & &1["current"])["results"] end
@@ -372,6 +379,34 @@ defmodule EabWeb.DashboardTest do
 
     assert get(build_conn(), "/results/README.md").status == 404
     assert get(build_conn(), "/results/results/#{run["id"]}.json").status == 404
+  end
+
+  test "a run already on the page can still have its logs saved, and a failure can be retried" do
+    run = publication_run()
+    page = publication_page(run)
+    assert Eab.Results.publish!(run, page_root: page) == :added
+    [record] = Path.wildcard(Path.join(page, "results/*.json"))
+    published = File.read!(record)
+
+    # Nowhere to keep them: the result stays, and the button says what is owed.
+    File.rmdir!(Path.join(page, "verification"))
+    {:ok, view, _} = live(build_conn(), "/")
+    assert has_element?(view, "#add-result:not([disabled])", "Save run logs")
+    assert has_element?(view, "#result-logs-missing")
+    view |> element("#add-result") |> render_click()
+    render_async(view)
+    assert has_element?(view, "#result-publication-error", "its logs were not saved")
+    assert has_element?(view, "#add-result:not([disabled])", "Retry saving logs")
+
+    File.mkdir_p!(Path.join(page, "verification"))
+    view |> element("#add-result") |> render_click()
+    render_async(view)
+    refute has_element?(view, "#result-publication-error")
+    assert has_element?(view, "#add-result[disabled]", "Added to results page")
+    assert has_element?(view, "#result-logs")
+    assert Eab.RunLogs.saved?(run["id"])
+    # The published record was not written again.
+    assert File.read!(record) == published
   end
 
   test "publication rejects unfinished or selected-case runs, including forged events" do
@@ -939,6 +974,9 @@ defmodule EabWeb.DashboardTest do
 
     previous = Application.get_env(:eab, :results_page_root)
     Application.put_env(:eab, :results_page_root, page)
+    logs = Application.get_env(:eab, :run_logs_root)
+    File.mkdir_p!(Path.join(page, "verification"))
+    Application.put_env(:eab, :run_logs_root, Path.join(page, "verification/runs"))
     Eab.Store.write("runs/#{run["id"]}/run.json", run)
 
     on_exit(fn ->
@@ -946,6 +984,7 @@ defmodule EabWeb.DashboardTest do
         do: Application.put_env(:eab, :results_page_root, previous),
         else: Application.delete_env(:eab, :results_page_root)
 
+      Application.put_env(:eab, :run_logs_root, logs)
       File.rm_rf!(page)
       File.rm_rf!(Eab.Store.path("runs/#{run["id"]}"))
     end)

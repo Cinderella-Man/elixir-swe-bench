@@ -38,6 +38,9 @@ _Avoid_: repeats, trial set, epochs
 
 **Published result**: Outcomes for the current admitted cases from one run series, with matching case fixture hashes, model identity, harness and recorded evaluation conditions. Rejected cases are omitted. Each published result is one run series, not a single run: its score is the mean of the runs it has so far, it states how many of the three required runs that is, and each case shows how many of those runs passed. Rows may have different effective settings. Each run also states the case times and model speed it recorded, which belong to that run alone.
 
+**Run logs**: The record of what happened in a run, kept in the repository beside its published result: for every attempt the instructions the agent was given, its whole conversation, the controller's log, the grader's output and the submitted patch, and for the run the tokens of every model call. Account identifiers and machine names are replaced.
+_Avoid_: evidence dump, artifacts
+
 **Machine**: Where a run's model was served: the model host's GPUs with their memory, CPU, system RAM, the model server and its build, the KV cache type and the server's speed-related flags. Runs of one run series may use different machines; each published run states its own.
 _Avoid_: hardware profile, rig
 

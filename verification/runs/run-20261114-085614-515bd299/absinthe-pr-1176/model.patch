@@ -1,0 +1,529 @@
+diff --git a/lib/absinthe/blueprint/schema.ex b/lib/absinthe/blueprint/schema.ex
+index cbaedb4..ee6b61d 100644
+--- a/lib/absinthe/blueprint/schema.ex
++++ b/lib/absinthe/blueprint/schema.ex
+@@ -117,7 +117,8 @@ defmodule Absinthe.Blueprint.Schema do
+     Schema.InterfaceTypeDefinition,
+     Schema.UnionTypeDefinition,
+     Schema.EnumValueDefinition,
+-    Schema.TypeExtensionDefinition
++    Schema.TypeExtensionDefinition,
++    Schema.SchemaDeclaration
+   ]
+ 
+   defp build_types([%module{} = type | rest], stack, buff) when module in @simple_open do
+@@ -196,7 +197,8 @@ defmodule Absinthe.Blueprint.Schema do
+     Schema.InterfaceTypeDefinition,
+     Schema.ObjectTypeDefinition,
+     Schema.ScalarTypeDefinition,
+-    Schema.UnionTypeDefinition
++    Schema.UnionTypeDefinition,
++    Schema.SchemaDeclaration
+   ]
+   defp build_types(
+          [:close | rest],
+@@ -211,14 +213,21 @@ defmodule Absinthe.Blueprint.Schema do
+   end
+ 
+   defp build_types([:close | rest], [%Schema.FieldDefinition{} = field, obj | stack], buff) do
+-    field =
+-      field
+-      |> Map.update!(:middleware, &Enum.reverse/1)
+-      |> Map.update!(:arguments, &Enum.reverse/1)
+-      |> Map.update!(:triggers, &{:%{}, [], &1})
+-      |> Map.put(:function_ref, {obj.identifier, field.identifier})
++    case obj do
++      %Schema.SchemaDeclaration{} = declaration ->
++        declaration = push(declaration, :field_definitions, field)
++        build_types(rest, [declaration | stack], buff)
+ 
+-    build_types(rest, [push(obj, :fields, field) | stack], buff)
++      _ ->
++        field =
++          field
++          |> Map.update!(:middleware, &Enum.reverse/1)
++          |> Map.update!(:arguments, &Enum.reverse/1)
++          |> Map.update!(:triggers, &{:%{}, [], &1})
++          |> Map.put(:function_ref, {obj.identifier, field.identifier})
++
++        build_types(rest, [push(obj, :fields, field) | stack], buff)
++    end
+   end
+ 
+   defp build_types(
+@@ -271,6 +280,11 @@ defmodule Absinthe.Blueprint.Schema do
+     build_types(rest, [schema | stack], buff)
+   end
+ 
++  defp build_types([:close | rest], [%Schema.SchemaDeclaration{} = declaration, %Schema.SchemaDefinition{} = schema | stack], buff) do
++    declaration = Map.update!(declaration, :field_definitions, &Enum.reverse/1)
++    build_types(rest, [push(schema, :type_definitions, declaration) | stack], buff)
++  end
++
+   defp build_types([:close | rest], [%Schema.SchemaDefinition{} = schema, bp], buff) do
+     bp = push(bp, :schema_definitions, schema)
+     build_types(rest, [bp], buff)
+diff --git a/lib/absinthe/blueprint/transform.ex b/lib/absinthe/blueprint/transform.ex
+index 3b4bbe2..31c0b0d 100644
+--- a/lib/absinthe/blueprint/transform.ex
++++ b/lib/absinthe/blueprint/transform.ex
+@@ -90,7 +90,12 @@ defmodule Absinthe.Blueprint.Transform do
+       :directive_definitions,
+       :type_definitions,
+       :type_extensions,
+-      :directives
++      :directives,
++      :schema_declaration
++    ],
++    Blueprint.Schema.SchemaDeclaration => [
++      :directives,
++      :field_definitions
+     ],
+     Blueprint.Schema.TypeExtensionDefinition => [:definition],
+     Blueprint.Schema.UnionTypeDefinition => [:directives, :types]
+diff --git a/lib/absinthe/phase/schema/apply_declaration.ex b/lib/absinthe/phase/schema/apply_declaration.ex
+index f0b4e58..1dd512e 100644
+--- a/lib/absinthe/phase/schema/apply_declaration.ex
++++ b/lib/absinthe/phase/schema/apply_declaration.ex
+@@ -3,10 +3,11 @@ defmodule Absinthe.Phase.Schema.ApplyDeclaration do
+ 
+   use Absinthe.Phase
+   alias Absinthe.Blueprint
++  alias Absinthe.Blueprint.Schema
+ 
+   @type operation :: :query | :mutation | :subscription
+ 
+-  @type root_mappings :: %{operation() => Blueprint.TypeReference.Name.t()}
++  @type root_mappings :: %{operation() => Blueprint.TypeReference.t() | atom}
+ 
+   def run(blueprint, _opts) do
+     blueprint = process(blueprint)
+@@ -22,7 +23,9 @@ defmodule Absinthe.Phase.Schema.ApplyDeclaration do
+     }
+   end
+ 
+-  # Strip the schema declaration out of the schema's type definitions and apply it
++  # Strip the schema declaration out of the schema's type definitions and apply
++  # any schema extensions to it.  If no declaration was written, an inferred
++  # declaration is created from the roots the schema defines.
+   @spec process_schema_definition(schema_definition :: Blueprint.Schema.SchemaDefinition.t()) ::
+           Blueprint.Schema.SchemaDefinition.t()
+   defp process_schema_definition(schema_definition) do
+@@ -32,32 +35,56 @@ defmodule Absinthe.Phase.Schema.ApplyDeclaration do
+         &match?(%Blueprint.Schema.SchemaDeclaration{}, &1)
+       )
+ 
+-    # Remove declaration
+-    schema_definition = %{schema_definition | type_definitions: type_defs}
++    schema_extensions =
++      schema_definition.type_extensions
++      |> Enum.filter(fn extension ->
++        match?(%{definition: %Schema.SchemaDeclaration{}}, extension)
++      end)
+ 
+-    case declarations do
+-      [declaration] ->
+-        root_mappings =
++    type_extensions =
++      schema_definition.type_extensions
++      |> Enum.reject(fn extension ->
++        match?(%{definition: %Schema.SchemaDeclaration{}}, extension)
++      end)
++
++    schema_definition =
++      %{
++        schema_definition
++        | type_definitions: type_defs,
++          type_extensions: type_extensions
++      }
++
++    declaration =
++      case declarations do
++        [] ->
++          inferred_declaration(type_defs, schema_definition.__reference__)
++
++        [declaration] ->
+           declaration
+-          |> extract_root_mappings
+ 
+-        %{
+-          schema_definition
+-          | type_definitions:
+-              Enum.map(schema_definition.type_definitions, &maybe_mark_root(&1, root_mappings)),
+-            schema_declaration: declaration
+-        }
++        [first | extra_declarations] ->
++          extra_declarations
++          |> Enum.reduce(first, fn declaration, acc ->
++            acc
++            |> put_error(error(declaration))
++          end)
++      end
+ 
+-      [] ->
+-        schema_definition
++    declaration =
++      declaration
++      |> put_field_references(declaration.__reference__)
++      |> apply_schema_extensions(schema_extensions)
+ 
+-      [_first | extra_declarations] ->
+-        extra_declarations
+-        |> Enum.reduce(schema_definition, fn declaration, acc ->
+-          acc
+-          |> put_error(error(declaration))
+-        end)
+-    end
++    root_mappings =
++      declaration
++      |> extract_root_mappings
++
++    %{
++      schema_definition
++      | type_definitions:
++          Enum.map(type_defs, &maybe_mark_root(&1, root_mappings)),
++        schema_declaration: declaration
++    }
+   end
+ 
+   # Generate an error for extraneous schema declarations
+@@ -71,20 +98,62 @@ defmodule Absinthe.Phase.Schema.ApplyDeclaration do
+     }
+   end
+ 
+-  # Extract the declared root type names
+-  @spec extract_root_mappings(declaration :: Blueprint.Schema.SchemaDeclaration.t()) ::
+-          root_mappings()
++  # Add references to declaration fields if SDL did not provide them
++  @spec put_field_references(
++          declaration :: Blueprint.Schema.SchemaDeclaration.t(),
++          ref :: Blueprint.t()
++        ) :: Blueprint.Schema.SchemaDeclaration.t()
++  defp put_field_references(declaration, ref) do
++    declaration
++    |> Map.update!(:field_definitions, fn fields ->
++      Enum.map(fields, fn field ->
++        case field.__reference__ do
++          nil ->
++            %{field | __reference__: ref}
++
++          _ ->
++            field
++        end
++      end)
++    end)
++  end
++
++  # Apply schema extensions to the declaration.  Extensions never change the
++  # declaration's description.
++  @spec apply_schema_extensions(
++          declaration :: Blueprint.Schema.SchemaDeclaration.t(),
++          extensions :: [Blueprint.Schema.TypeExtensionDefinition.t()]
++        ) :: Blueprint.Schema.SchemaDeclaration.t()
++  defp apply_schema_extensions(declaration, extensions) do
++    Enum.reduce(extensions, declaration, fn extension, declaration ->
++      extension_declaration =
++        extension.definition
++        |> put_field_references(extension.__reference__)
++
++      %{
++        declaration
++        | directives: declaration.directives ++ extension_declaration.directives,
++          field_definitions:
++            declaration.field_definitions ++ extension_declaration.field_definitions
++      }
++    end)
++  end
++
++  # Roots are the operation identifiers used by the schema
++  @roots [:query, :mutation, :subscription]
++
++  # Extract the declared root type references
++  @spec extract_root_mappings(declaration :: Blueprint.Schema.SchemaDeclaration.t()) :: root_mappings()
+   defp extract_root_mappings(declaration) do
+     for field_def <- declaration.field_definitions,
+-        field_def.identifier in ~w(query mutation subscription)a,
++        field_def.identifier in @roots,
+         into: %{} do
+       {field_def.identifier, field_def.type}
+     end
+   end
+ 
+-  # If the type definition is declared as a root type, set the identifier appropriately
+-  @spec maybe_mark_root(type_def :: Blueprint.Schema.t(), root_mappings :: root_mappings()) ::
+-          Blueprint.Schema.t()
++  # If the type definition is declared as a root type, set the identifier
++  @spec maybe_mark_root(type_def :: Blueprint.Schema.t(), root_mappings :: root_mappings()) :: Blueprint.Schema.t()
+   defp maybe_mark_root(%Blueprint.Schema.ObjectTypeDefinition{} = type_def, root_mappings) do
+     case operation_root_identifier(type_def, root_mappings) do
+       nil ->
+@@ -97,20 +166,61 @@ defmodule Absinthe.Phase.Schema.ApplyDeclaration do
+ 
+   defp maybe_mark_root(type_def, _root_mappings), do: type_def
+ 
+-  # Determine which, if any, root identifier should be applied to an object type definition
++  # Determine which, if any, root identifier should be applied to an object type
+   @spec operation_root_identifier(
+           type_def :: Blueprint.Schema.ObjectTypeDefinition.t(),
+           root_mappings :: root_mappings()
+         ) :: nil | operation()
+   defp operation_root_identifier(type_def, root_mappings) do
+     match_name = type_def.name
++    match_identifier = type_def.identifier
+ 
+     Enum.find_value(root_mappings, fn
+-      {ident, %{name: ^match_name}} ->
+-        ident
+-
+-      _ ->
+-        false
++      {ident, reference} ->
++        if is_atom(reference) do
++          reference == match_identifier && ident
++        else
++          case reference do
++            %Blueprint.TypeReference.Name{name: name} ->
++              name == match_name && ident
++
++            %Blueprint.TypeReference.Identifier{id: id} ->
++              id == match_identifier && ident
++
++            _ ->
++              false
++          end
++        end
+     end)
+   end
++
++
++  @spec inferred_declaration(
++          type_defs :: [Blueprint.Schema.t()],
++          ref :: Blueprint.t()
++        ) :: Blueprint.Schema.SchemaDeclaration.t()
++  defp inferred_declaration(type_defs, ref) do
++    field_definitions =
++      for type_def <- type_defs do
++        case type_def.identifier in @roots do
++          true ->
++            %Blueprint.Schema.FieldDefinition{
++              name: Atom.to_string(type_def.identifier),
++              identifier: type_def.identifier,
++              type: %Blueprint.TypeReference.Name{name: type_def.name},
++              __reference__: ref
++            }
++
++          _ ->
++            nil
++        end
++      end
++      |> Enum.reject(fn definition -> definition == nil end)
++
++    %Blueprint.Schema.SchemaDeclaration{
++      description: nil,
++      field_definitions: field_definitions,
++      __reference__: ref
++    }
++  end
+ end
+diff --git a/lib/absinthe/schema/notation.ex b/lib/absinthe/schema/notation.ex
+index 5c8c488..c9c84eb 100644
+--- a/lib/absinthe/schema/notation.ex
++++ b/lib/absinthe/schema/notation.ex
+@@ -155,6 +155,43 @@ defmodule Absinthe.Schema.Notation do
+     |> record_trigger!(List.wrap(mutations), attrs)
+   end
+ 
++  # SCHEMA DECLARATION
++
++  @placement {:schema, [toplevel: true, extend: true]}
++  @doc """
++  Declare a schema.
++
++  A top-level `schema do ... end` block declares the schema's description,
++  directives and operation entries.  Inside an `extend schema do ... end` block
++  it declares an extension to that schema declaration.
++
++  ## Placement
++
++  #{Utils.placement_docs(@placement)}
++
++  ## Examples
++  ```
++  schema do
++    description "Catalog API"
++    directive :feature, name: "catalog"
++    field :query, :query
++    field :mutation, :mutation
++  end
++  ```
++
++  ```
++  extend schema do
++    directive :feature, name: "extended"
++    field :subscription, :subscription
++  end
++  ```
++  """
++  defmacro schema(do: block) do
++    __CALLER__
++    |> recordable!(:schema, @placement[:schema])
++    |> record_schema!(block)
++  end
++
+   # OBJECT
+ 
+   @placement {:object, [toplevel: true, extend: true]}
+@@ -188,10 +225,20 @@ defmodule Absinthe.Schema.Notation do
+   @reserved_identifiers ~w(query mutation subscription)a
+   defmacro object(identifier, attrs \\ [], block)
+ 
+-  defmacro object(identifier, _attrs, _block) when identifier in @reserved_identifiers do
+-    raise Absinthe.Schema.Notation.Error,
+-          "Invalid schema notation: cannot create an `object` " <>
+-            "with reserved identifier `#{identifier}`"
++  defmacro object(identifier, attrs, block) when identifier in @reserved_identifiers do
++    attrs = attrs || []
++
++    case Module.get_attribute(__CALLER__.module, :absinthe_scope_stack) |> List.first() do
++      :extend ->
++        __CALLER__
++        |> recordable!(:object, @placement[:object])
++        |> record!(Schema.ObjectTypeDefinition, identifier, attrs, block)
++
++      _ ->
++        raise Absinthe.Schema.Notation.Error,
++              "Invalid schema notation: cannot create an `object` " <>
++                "with reserved identifier `#{identifier}`"
++    end
+   end
+ 
+   defmacro object(identifier, attrs, do: block) do
+@@ -279,7 +326,8 @@ defmodule Absinthe.Schema.Notation do
+     :interface,
+     :object,
+     :scalar,
+-    :union
++    :union,
++    :schema
+   ]
+   defmacro extend({type, meta, [attr]}, attrs, do: block)
+            when type in @extendable_types and is_list(attrs) do
+@@ -300,6 +348,14 @@ defmodule Absinthe.Schema.Notation do
+     |> record_extend!([], block, [])
+   end
+ 
++  defmacro extend({type, meta, nil}, do: block) when type in @extendable_types do
++    block = {type, meta, [[do: block]]}
++
++    __CALLER__
++    |> recordable!(:extend, @placement[:extend])
++    |> record_extend!([], block, [])
++  end
++
+   @placement {:deprecate, [under: [:field]]}
+   @doc """
+   Mark a field as deprecated
+@@ -477,7 +533,7 @@ defmodule Absinthe.Schema.Notation do
+   end
+ 
+   # FIELDS
+-  @placement {:field, [under: [:input_object, :interface, :object]]}
++  @placement {:field, [under: [:input_object, :interface, :object, :schema_declaration]]}
+   @doc """
+   Defines a GraphQL field
+ 
+@@ -933,6 +989,7 @@ defmodule Absinthe.Schema.Notation do
+                   :object,
+                   :scalar,
+                   :union,
++                  :schema_declaration,
+                   :value
+                 ]
+               ]}
+@@ -1573,6 +1630,23 @@ defmodule Absinthe.Schema.Notation do
+     scoped_def(env, Schema.DirectiveDefinition, identifier, attrs, block)
+   end
+ 
++  def record_schema!(caller, block) do
++    definition = %Schema.SchemaDeclaration{
++      module: caller.module,
++      __reference__: build_reference(caller)
++    }
++
++    ref = put_attr(caller.module, definition)
++
++    push_stack(caller.module, :absinthe_scope_stack, :schema_declaration)
++
++    [
++      get_desc(ref),
++      block,
++      quote(do: unquote(__MODULE__).close_scope())
++    ]
++  end
++
+   def record_extend!(caller, attrs, type_block, extend_block) do
+     attrs =
+       attrs
+diff --git a/lib/absinthe/schema/notation/sdl_render.ex b/lib/absinthe/schema/notation/sdl_render.ex
+index bacf1d2..725b178 100644
+--- a/lib/absinthe/schema/notation/sdl_render.ex
++++ b/lib/absinthe/schema/notation/sdl_render.ex
+@@ -40,11 +40,12 @@ defmodule Absinthe.Schema.Notation.SDL.Render do
+ 
+     schema_declaration =
+       schema_declaration ||
++        Enum.find(type_definitions, &match?(%Blueprint.Schema.SchemaDeclaration{}, &1)) ||
+         %{
+           query: Enum.find(type_definitions, &(&1.identifier == :query)),
+           mutation: Enum.find(type_definitions, &(&1.identifier == :mutation)),
+           subscription: Enum.find(type_definitions, &(&1.identifier == :subscription)),
+-          description: Enum.find(type_definitions, &(&1.identifier == :__schema)).description
++          description: nil
+         }
+ 
+     directive_definitions =
+diff --git a/lib/absinthe/type/built_ins/introspection.ex b/lib/absinthe/type/built_ins/introspection.ex
+index 2ff90d1..6839568 100644
+--- a/lib/absinthe/type/built_ins/introspection.ex
++++ b/lib/absinthe/type/built_ins/introspection.ex
+@@ -2,13 +2,14 @@ defmodule Absinthe.Type.BuiltIns.Introspection do
+   @moduledoc false
+ 
+   use Absinthe.Schema.Notation
++  alias Absinthe.Blueprint
+ 
+   object :__schema do
+     description "Represents a schema"
+ 
+     field :description, :string do
+       resolve(fn _, %{schema: schema} ->
+-        {:ok, Absinthe.Schema.lookup_type(schema, :__schema).description}
++        {:ok, schema_description(schema)}
+       end)
+     end
+ 
+@@ -323,6 +324,24 @@ defmodule Absinthe.Type.BuiltIns.Introspection do
+       end
+   end
+ 
++  def schema_description(schema) do
++    %{schema_definitions: definitions} = schema.__absinthe_blueprint__()
++
++    declaration =
++      definitions
++      |> List.wrap()
++      |> Enum.flat_map(&(&1.type_definitions))
++      |> Enum.find(nil, &match?(%Blueprint.Schema.SchemaDeclaration{}, &1))
++
++    case declaration do
++      nil ->
++        nil
++
++      declaration ->
++        declaration.description
++    end
++  end
++
+   def render_default_value(schema, adapter, type, value) do
+     case Absinthe.Schema.lookup_type(schema, type, unwrap: false) do
+       %Absinthe.Type.InputObject{fields: fields} ->
