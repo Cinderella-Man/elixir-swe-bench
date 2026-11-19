@@ -73,11 +73,11 @@ defmodule Eab.PiTest do
     assert Enum.at(inputs, 0) == Enum.at(inputs, 1)
   end
 
-  test "real Pi reconnects during token counting and finishes using both native adapters",
+  test "real Pi reconnects during token counting and finishes using each native adapter",
        %{prefix: prefix} do
     parent = self()
 
-    for backend <- ["llama_cpp", "strata"] do
+    for backend <- ["llama_cpp", "strata", "maya"] do
       model = endpoint(backend)
       settings = Model.settings(model)
       path = "#{prefix}/#{backend}"
@@ -103,7 +103,7 @@ defmodule Eab.PiTest do
 
           if :counters.get(counts, 1) == 1,
             do: {:error, %Req.TransportError{reason: :timeout}},
-            else: {:ok, %{status: 200, body: %{"input_tokens" => 42}}}
+            else: {:ok, %{status: 200, body: count_reply(backend, 42)}}
         else
           send(parent, {:generation, backend, payload})
 
@@ -157,6 +157,8 @@ defmodule Eab.PiTest do
         refute Map.has_key?(first, "output_config")
         refute Map.has_key?(first, "reasoning_budget_tokens")
       end
+
+      if backend == "maya", do: assert(first["loop_guard"] == false)
 
       assert Jason.encode!(first["messages"]) =~ "Write repaired.txt"
       refute Jason.encode!(first["messages"]) =~ "echo with value ready"
@@ -554,12 +556,12 @@ defmodule Eab.PiTest do
     assert survivors == []
   end
 
-  test "both adapters continue past 32 calls and stop exactly at the generation budget", %{
+  test "each adapter continues past 32 calls and stops exactly at the generation budget", %{
     prefix: prefix
   } do
     parent = self()
 
-    for backend <- ["llama_cpp", "strata"] do
+    for backend <- ["llama_cpp", "strata", "maya"] do
       model = endpoint(backend)
       settings = Model.settings(model, %{"max_tokens" => 473, "response_tokens" => 12})
 
@@ -573,7 +575,7 @@ defmodule Eab.PiTest do
 
       Application.put_env(:eab, :http_request, fn opts ->
         if String.ends_with?(opts[:url], "tokens") do
-          {:ok, %{status: 200, body: %{"input_tokens" => 42}}}
+          {:ok, %{status: 200, body: count_reply(backend, 42)}}
         else
           allowance = opts[:json]["max_tokens"]
           send(parent, {:allowance, allowance})
@@ -753,7 +755,15 @@ defmodule Eab.PiTest do
 
   defp sse(events), do: Enum.map_join(events, fn e -> "data: " <> Jason.encode!(e) <> "\n\n" end)
 
+  defp count_reply("maya", tokens),
+    do: %{"tokens" => tokens, "images" => 0, "approximate" => false}
+
+  defp count_reply(_backend, tokens), do: %{"input_tokens" => tokens}
+
   defp response(backend, done, tokens \\ 12)
+
+  # Project Maya answers in the OpenAI dialect, as llama.cpp does.
+  defp response("maya", done, tokens), do: response("llama_cpp", done, tokens)
 
   defp response("llama_cpp", done, tokens) do
     delta =

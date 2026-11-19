@@ -304,7 +304,7 @@ defmodule Eab.Results do
         "code_version" =>
           List.last(run["code_versions"] || [get_in(run, ["protocol", "implementation"])]),
         "deployment" => %{
-          "server_build" => profile["build_info"],
+          "server_build" => Eab.Model.build(profile),
           "total_slots" => profile["total_slots"],
           "parallel_attempts" => run["parallel_attempts"] || 1
         },
@@ -338,7 +338,7 @@ defmodule Eab.Results do
       _ ->
         tokens = attempt["generated_tokens"]
 
-        if backend in ~w(llama_cpp strata) and is_integer(max_tokens) and is_integer(tokens) and
+        if backend in ~w(llama_cpp strata maya) and is_integer(max_tokens) and is_integer(tokens) and
              tokens >= max_tokens,
            do: "generation_budget"
     end

@@ -45,12 +45,12 @@ defmodule Eab.ReportTest do
 
     assert report =~
              "| failed | Failed | 0 | 2.5 s | generation 20.0 tok/s · prompt 600.0 tok/s · " <>
-               "reported by llama.cpp over 3 model calls |"
+               "reported by the model server over 3 model calls |"
 
     assert report =~ "| legacy | Failed | 0 | Not measured | Not measured |"
 
     assert report =~
-             "- Model speed: generation 20.0 tok/s · prompt 600.0 tok/s · reported by llama.cpp over 3 model calls\n"
+             "- Model speed: generation 20.0 tok/s · prompt 600.0 tok/s · reported by the model server over 3 model calls\n"
   end
 
   test "a run's parallel attempts are reported, and parallel runs record no times" do

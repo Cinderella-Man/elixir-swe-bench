@@ -357,16 +357,8 @@ defmodule Eab.MemoryCollector do
     %{
       "model_artifact" => Path.basename(Map.fetch!(props, "model_path")),
       "context_tokens" => get_in(props, ["default_generation_settings", "n_ctx"]),
-      # Maya's wrapper reports its Strata engine in /props but not /health.
-      # Keep this detection aligned with Eab.Model.discover/2.
-      "backend" =>
-        if(
-          health["service"] == "strata" or
-            String.contains?(String.downcase(to_string(props["build_info"])), "strata"),
-          do: "strata",
-          else: "llama_cpp"
-        ),
-      "backend_version" => props["build_info"]
+      "backend" => Eab.ModelServer.kind(health, props),
+      "backend_version" => Eab.ModelServer.build(health, props)
     }
   end
 

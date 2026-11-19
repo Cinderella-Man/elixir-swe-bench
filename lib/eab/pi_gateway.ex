@@ -141,9 +141,22 @@ defmodule Eab.PiGateway do
       |> Eab.Thinking.payload(state.settings)
 
     payload =
-      if state.endpoint["backend"] == "strata",
-        do: Map.delete(payload, "tool_choice"),
-        else: Map.put(payload, "stream_options", %{"include_usage" => true})
+      case state.endpoint["backend"] do
+        "strata" ->
+          Map.delete(payload, "tool_choice")
+
+        # Project Maya's loop guard edits a conversation that repeats itself, after the prompt
+        # was counted, and answers some repeated tool calls itself. Every request turns it off,
+        # so the model sees Pi's conversation as sent.
+        "maya" ->
+          Map.merge(payload, %{
+            "stream_options" => %{"include_usage" => true},
+            "loop_guard" => false
+          })
+
+        _ ->
+          Map.put(payload, "stream_options", %{"include_usage" => true})
+      end
 
     step = state.calls |> Integer.to_string() |> String.pad_leading(4, "0")
     Store.write("#{state.prefix}/request-#{step}.json", payload, state.key)

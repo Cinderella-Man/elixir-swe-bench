@@ -1325,7 +1325,7 @@ defmodule EabWeb.DashboardLive do
               <div class="provider-tabs">
                 <label
                   class={["provider-option", @provider == "local" && "is-selected"]}
-                  title="Local server: llama.cpp or Strata"
+                  title="Local server: llama.cpp, Strata or Project Maya"
                 >
                   <input type="radio" name="provider" value="local" checked={@provider == "local"} />
                   <svg
@@ -1412,7 +1412,7 @@ defmodule EabWeb.DashboardLive do
               phx-change="connect"
               phx-submit="connect"
             >
-              <p class="muted">Connect to a llama.cpp or Strata server you run.</p>
+              <p class="muted">Connect to a llama.cpp, Strata or Project Maya server you run.</p>
               <label for="endpoint">Server endpoint</label>
               <div class="input-row">
                 <input
@@ -1614,6 +1614,7 @@ defmodule EabWeb.DashboardLive do
                 "anthropic" -> "CLAUDE API"
                 "claude_code" -> "CLAUDE CODE"
                 "strata" -> "STRATA"
+                "maya" -> "PROJECT MAYA"
                 _ -> "LLAMA.CPP"
               end}</span>
               <h3>{Eab.ModelIdentity.label(@endpoint)}</h3>

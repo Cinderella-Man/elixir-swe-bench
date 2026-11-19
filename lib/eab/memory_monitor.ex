@@ -111,10 +111,17 @@ defmodule Eab.MemoryMonitor do
     host = URI.parse(endpoint["url"] || "").host
 
     cond do
-      endpoint["backend"] not in ["strata", "llama_cpp"] or host in [nil, ""] -> :unsupported
-      is_nil(config) -> :disabled
-      config[:hosts] && host not in config[:hosts] -> {:unlisted_host, host}
-      true -> trusted(Keyword.put(config, :target, config[:target] || "root@" <> host))
+      endpoint["backend"] not in ["strata", "llama_cpp", "maya"] or host in [nil, ""] ->
+        :unsupported
+
+      is_nil(config) ->
+        :disabled
+
+      config[:hosts] && host not in config[:hosts] ->
+        {:unlisted_host, host}
+
+      true ->
+        trusted(Keyword.put(config, :target, config[:target] || "root@" <> host))
     end
   end
 

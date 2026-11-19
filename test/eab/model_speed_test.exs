@@ -109,7 +109,7 @@ defmodule Eab.ModelSpeedTest do
 
     assert ModelSpeed.label(speed) ==
              "generation 50.0 tok/s · prompt 500.0 tok/s · 40% of draft tokens accepted · " <>
-               "reported by llama.cpp over 2 model calls"
+               "reported by the model server over 2 model calls"
   end
 
   test "the controller times Strata from request to its first and last token events", %{
@@ -223,7 +223,7 @@ defmodule Eab.ModelSpeedTest do
     }
 
     assert ModelSpeed.label(ModelSpeed.of_run(run)) ==
-             "generation 50.0 tok/s · prompt 50.0 tok/s · reported by llama.cpp over 4 model calls"
+             "generation 50.0 tok/s · prompt 50.0 tok/s · reported by the model server over 4 model calls"
 
     mixed =
       put_in(run, ["attempts", "b", "measurement", "model_speed", "source"], "controller_timed")

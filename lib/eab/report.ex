@@ -76,7 +76,7 @@ defmodule Eab.Report do
     #{Jason.encode!(run["settings"] || %{}, pretty: true)}
     ```
 
-    Case time covers Pi startup, model calls and tools through completion, excluding fixture preparation and independent grading. Model speed is tokens per second while the server processed prompts and generated output, summed over a case's model calls: llama.cpp reports its own timings, and the controller times Strata's streamed tokens, network included. Claude Code attempts and runs with more than one parallel attempt store no timing. Missing timings are not reconstructed from logs.
+    Case time covers Pi startup, model calls and tools through completion, excluding fixture preparation and independent grading. Model speed is tokens per second while the server processed prompts and generated output, summed over a case's model calls: llama.cpp and Project Maya report their own timings, and the controller times Strata's streamed tokens, network included. Claude Code attempts and runs with more than one parallel attempt store no timing. Missing timings are not reconstructed from logs.
 
     | Case | Result | Model calls | Case time | Model speed | Explanation |
     | --- | --- | ---: | ---: | --- | --- |

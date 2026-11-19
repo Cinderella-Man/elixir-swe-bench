@@ -130,6 +130,34 @@ defmodule Eab.MemoryCollectorTest do
     assert elem(Collector.sample(state), 0)["vram_bytes"] == 300 * 1_048_576
   end
 
+  test "Project Maya's own health reply identifies it, with its version as the server build",
+       ctx do
+    original = ctx.opts[:http]
+
+    http = fn endpoint, key, route ->
+      case route do
+        "/health" ->
+          %{"status" => "ok", "model_label" => "GLM-5.3-Flash · Maya-M", "version" => "1.1.67"}
+
+        "/props" ->
+          Map.delete(original.(endpoint, key, route), "build_info")
+
+        _ ->
+          original.(endpoint, key, route)
+      end
+    end
+
+    opts = Keyword.put(ctx.opts, :http, http)
+
+    assert_raise Collector.Error, ~r/runtime differs/, fn -> Collector.open(ctx.request, opts) end
+
+    state = Collector.open(Map.put(ctx.request, "backend", "maya"), opts)
+    identity = Collector.identity(state)
+    assert identity["backend"] == "maya"
+    assert identity["backend_version"] == "Project Maya 1.1.67"
+    assert elem(Collector.sample(state), 0)["vram_bytes"] == 300 * 1_048_576
+  end
+
   test "the model server's key comes with the request; a key file on the host is the fallback",
        ctx do
     parent = self()

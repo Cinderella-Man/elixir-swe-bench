@@ -155,6 +155,127 @@ defmodule Eab.ModelTest do
     end
   end
 
+  # Project Maya 1.1.67's replies, shortened: /health has no service field, and /props names a
+  # Strata build only when its engine reports a version.
+  defp maya_server(parent, overrides \\ %{}) do
+    Application.put_env(:eab, :http_request, fn opts ->
+      send(parent, {:request, opts})
+      route = URI.parse(opts[:url]).path
+
+      body =
+        Map.get_lazy(overrides, route, fn ->
+          case route do
+            "/health" ->
+              %{
+                "status" => "ok",
+                "max_context" => 262_144,
+                "model" => "glm-5.3-flash",
+                "model_label" => "GLM-5.3-Flash · Maya-M",
+                "defaults" => %{
+                  "temperature" => 1.0,
+                  "top_p" => 0.95,
+                  "reasoning_effort" => "max"
+                },
+                "version" => "1.1.67",
+                "unloaded" => false
+              }
+
+            "/v1/models" ->
+              %{"data" => [%{"id" => "glm-5.3-flash", "status" => %{"value" => "loaded"}}]}
+
+            "/props" ->
+              %{
+                "model_alias" => "glm-5.3-flash",
+                "model_path" => "pack/full",
+                "default_generation_settings" => %{"n_ctx" => 262_144},
+                "models_autoload" => false,
+                "total_slots" => 1
+              }
+
+            "/v1/status" ->
+              %{"service" => "maya", "model" => "glm-5.3-flash", "engine" => nil}
+
+            "/settings" ->
+              %{"shared" => false, "defaults" => %{}}
+          end
+        end)
+
+      {:ok, %{status: 200, body: body}}
+    end)
+  end
+
+  test "discovery recognises Project Maya and records its own serving settings" do
+    maya_server(self())
+    endpoint = Model.discover("http://fixture", "secret-token")
+
+    assert endpoint["backend"] == "maya"
+    assert endpoint["profile"]["maya"]["version"] == "1.1.67"
+    assert endpoint["profile"]["maya"]["shared_settings"] == %{}
+    assert Eab.Thinking.reported(endpoint) == "max"
+    assert Model.build(endpoint["profile"]) == "Project Maya 1.1.67"
+    assert Model.local?(endpoint)
+
+    routes =
+      for _ <- 1..5 do
+        assert_receive {:request, opts}
+        assert opts[:method] == :get
+        URI.parse(opts[:url]).path
+      end
+
+    assert routes == ~w(/health /v1/models /props /v1/status /settings)
+    refute_receive {:request, _}
+
+    # A Maya whose engine reports a version names a Strata build in /props; it is still Maya.
+    maya_server(self(), %{
+      "/props" => %{
+        "model_alias" => "glm-5.3-flash",
+        "build_info" => "Strata 0.2.16",
+        "default_generation_settings" => %{"n_ctx" => 262_144}
+      }
+    })
+
+    endpoint = Model.discover("http://fixture", "")
+    assert endpoint["backend"] == "maya"
+    assert Model.build(endpoint["profile"]) == "Project Maya 1.1.67 · Strata 0.2.16"
+  end
+
+  test "discovery refuses a Maya whose shared thinking level its token count would miss" do
+    maya_server(self(), %{
+      "/settings" => %{"shared" => true, "defaults" => %{"reasoning_effort" => "high"}}
+    })
+
+    assert_raise RuntimeError, ~r/shared Chat settings set a thinking level/, fn ->
+      Model.discover("http://fixture", "")
+    end
+
+    maya_server(self(), %{"/v1/status" => %{"service" => "other"}})
+
+    assert_raise RuntimeError, ~r/does not say so/, fn -> Model.discover("http://fixture", "") end
+  end
+
+  test "Maya counting is non-generating and only an exact count is accepted" do
+    parent = self()
+
+    Application.put_env(:eab, :http_request, fn opts ->
+      send(parent, {:request, opts})
+
+      {:ok, %{status: 200, body: %{"tokens" => 42, "images" => 0, "approximate" => false}}}
+    end)
+
+    assert Model.count(endpoint("maya"), "", %{"messages" => []}) == 42
+    assert_receive {:request, opts}
+    assert opts[:url] == "http://fixture/api/tokens"
+    assert opts[:method] == :post
+
+    Application.put_env(:eab, :http_request, fn _ ->
+      {:ok, %{status: 200, body: %{"tokens" => 42, "images" => 1, "approximate" => true}}}
+    end)
+
+    assert_raise RuntimeError, ~r/exact prompt count/, fn ->
+      Model.count(endpoint("maya"), "", %{"messages" => []})
+    end
+  end
+
   test "URL parsing forbids embedded secrets and Strata counting is non-generating" do
     assert_raise ArgumentError, fn -> Model.normalize_url!("http://user:secret@host") end
     parent = self()

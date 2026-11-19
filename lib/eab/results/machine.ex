@@ -176,7 +176,7 @@ defmodule Eab.Results.Machine do
     for key <- ~w(cpu server_build),
         do: require!(is_nil(machine[key]) or text?(machine[key]), "Invalid #{key}")
 
-    require!(machine["server"] in ~w(llama_cpp strata), "Unknown model server")
+    require!(machine["server"] in ~w(llama_cpp strata maya), "Unknown model server")
 
     require!(
       is_nil(machine["ram_bytes"]) or positive?(machine["ram_bytes"]),

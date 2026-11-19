@@ -1,7 +1,7 @@
 defmodule Eab.ModelIdentity do
   @moduledoc "Human-readable artifact identity, separate from the API routing alias."
   @quant ~r/(?:^|[-.])((?:UD-)?(?:IQ|Q|TQ|MXFP|NVFP|BF|FP|F)\d[A-Z0-9_]*)(?:$)/i
-  @local ~w(llama_cpp strata)
+  @local ~w(llama_cpp strata maya)
 
   # Identities saved before pack folders were recognised named the model after the folder.
   def details(%{"identity" => %{"version" => 1} = identity} = endpoint) do

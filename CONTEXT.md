@@ -29,7 +29,7 @@ _Avoid_: model source (the dashboard's choice of local server, ChatGPT or Claude
 
 **Deployment memory observation**: A dated sample of an identified inference process's GPU allocation, RAM and serving configuration. Process/service lifetime peaks do not establish the peak during a particular benchmark run or the minimum hardware required.
 
-**Attempt measurement**: A Pi attempt's elapsed time from startup through completion, with its **model speed**: the prompt tokens processed and tokens generated per second, summed over its model calls. llama.cpp reports its own timings; the controller times Strata's streamed tokens, network included. Both are recorded only when parallel attempts is 1, for a model served on another machine. Generated-token accounting remains available without timing. A published run states its own case times and model speed; they are never averaged across a run series or scored.
+**Attempt measurement**: A Pi attempt's elapsed time from startup through completion, with its **model speed**: the prompt tokens processed and tokens generated per second, summed over its model calls. llama.cpp and Project Maya report their own timings; the controller times Strata's streamed tokens, network included. Both are recorded only when parallel attempts is 1, for a model served on another machine. Generated-token accounting remains available without timing. A published run states its own case times and model speed; they are never averaged across a run series or scored.
 
 **Run**: An evaluation of one model profile through one harness across a frozen selection of cases, using fixed inputs and the budgets and seed that harness supports.
 
@@ -46,7 +46,7 @@ _Avoid_: hardware profile, rig
 
 **Speed cases**: A few current cases of a benchmark release on which model speed is compared, ranging from short to long conversations. A model generates more slowly as its conversation grows, so only measurements on the same cases compare.
 
-**Speed run**: A run of only the speed cases, one at a time, on a model served by llama.cpp or Strata, published for its case times, model speed and machine. It is never scored and joins no run series, so any quantization or machine of a model can be measured. A full run timed on every speed case also counts as a speed measurement.
+**Speed run**: A run of only the speed cases, one at a time, on a model served by llama.cpp, Strata or Project Maya, published for its case times, model speed and machine. It is never scored and joins no run series, so any quantization or machine of a model can be measured. A full run timed on every speed case also counts as a speed measurement.
 _Avoid_: speed benchmark, speed series
 
 **Attempt**: One agent's investigation, edits, tool calls and submission for a case. A run records one scored attempt per case and retains interrupted work separately.

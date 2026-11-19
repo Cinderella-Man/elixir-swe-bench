@@ -1,5 +1,5 @@
 defmodule Eab.Model do
-  @moduledoc "Discovery and native request/accounting adapters for llama.cpp and stock Strata."
+  @moduledoc "Discovery and native request/accounting adapters for llama.cpp, stock Strata and Project Maya."
   @retry_delays [1_000, 2_000, 4_000, 8_000, 16_000]
   @connect_errors [:econnrefused, :nxdomain, :enetunreach, :ehostunreach]
   @transient_errors @connect_errors ++ [:timeout, :closed, :econnreset]
@@ -43,12 +43,7 @@ defmodule Eab.Model do
     health = http(url, key, :get, "/health")
     models = http(url, key, :get, "/v1/models")
     props = http(url, key, :get, "/props")
-
-    backend =
-      if health["service"] == "strata" or
-           String.contains?(String.downcase(to_string(props["build_info"])), "strata"),
-         do: "strata",
-         else: "llama_cpp"
+    backend = Eab.ModelServer.kind(health, props)
 
     alias_name = props["model_alias"]
 
@@ -78,6 +73,7 @@ defmodule Eab.Model do
         ] ++ Eab.Thinking.profile_fields()
       )
 
+    profile = if backend == "maya", do: maya_profile(profile, url, key, health), else: profile
     row = Enum.find(models["data"], &(&1["id"] == alias_name))
 
     %{
@@ -93,6 +89,49 @@ defmodule Eab.Model do
     |> Eab.ModelIdentity.attach()
     |> Eab.Store.scrub(key)
   end
+
+  # Project Maya reports its run config's thinking level and sampling in /health, not /props.
+  # It also applies the Chat settings it shares with every client to each request that leaves
+  # them out. Its token count applies the run config's level but not a shared one, so a shared
+  # level would make every count differ from the prompt Maya generates from.
+  defp maya_profile(profile, url, key, health) do
+    status = http(url, key, :get, "/v1/status")
+
+    unless status["service"] == "maya",
+      do: raise("Endpoint looks like Project Maya, but its /v1/status does not say so")
+
+    shared = http(url, key, :get, "/settings")["defaults"] || %{}
+
+    if Map.has_key?(shared, "reasoning_effort"),
+      do:
+        raise(
+          "Project Maya's shared Chat settings set a thinking level, which its token count " <>
+            "does not apply. Clear Maya's shared Chat settings, or set the level in its run " <>
+            "config, and connect again."
+        )
+
+    defaults = health["defaults"] || %{}
+
+    profile
+    |> Map.put("maya", %{
+      "version" => health["version"],
+      "model_label" => health["model_label"],
+      "engine" => status["engine"],
+      "defaults" => defaults,
+      "shared_settings" => shared
+    })
+    |> then(fn profile ->
+      if is_binary(defaults["reasoning_effort"]),
+        do: Map.put(profile, "reasoning_effort", defaults["reasoning_effort"]),
+        else: profile
+    end)
+  end
+
+  @doc "The server build a profile records, or nil."
+  def build(%{"maya" => %{"version" => version}} = profile) when is_binary(version),
+    do: Enum.join(["Project Maya " <> version | List.wrap(profile["build_info"])], " · ")
+
+  def build(profile), do: (profile || %{})["build_info"]
 
   def settings(endpoint, input \\ %{})
   def settings(%{"backend" => "openai_subscription"}, input), do: Eab.OpenAI.settings(input)
@@ -139,19 +178,24 @@ defmodule Eab.Model do
     |> Map.merge(Eab.Thinking.settings(endpoint, input))
   end
 
-  @doc "A model server the gateway counts and limits itself: llama.cpp or Strata."
+  @doc "A model server the gateway counts and limits itself: llama.cpp, Strata or Project Maya."
   def local?(endpoint),
     do: endpoint["backend"] not in ~w(openai_subscription anthropic claude_code)
 
   def count(endpoint, key, payload) do
-    route =
-      if endpoint["backend"] == "strata",
-        do: "/v1/messages/count_tokens",
-        else: "/v1/chat/completions/input_tokens"
+    {route, field} =
+      case endpoint["backend"] do
+        "strata" -> {"/v1/messages/count_tokens", "input_tokens"}
+        # Maya renders a chat request's prompt as its generation does, and runs nothing.
+        "maya" -> {"/api/tokens", "tokens"}
+        _ -> {"/v1/chat/completions/input_tokens", "input_tokens"}
+      end
 
-    count = http(endpoint["url"], key, :post, route, payload)["input_tokens"]
+    reply = http(endpoint["url"], key, :post, route, payload)
+    count = reply[field]
 
-    unless is_integer(count) and count > 0,
+    # Maya counts a picture as its marker and says the count is then approximate.
+    unless is_integer(count) and count > 0 and reply["approximate"] != true,
       do: raise("Endpoint did not return an exact prompt count")
 
     count
@@ -439,7 +483,11 @@ defmodule Eab.Model do
     non_generating =
       method == :get or
         (method == :post and
-           route in ["/v1/messages/count_tokens", "/v1/chat/completions/input_tokens"])
+           route in [
+             "/v1/messages/count_tokens",
+             "/v1/chat/completions/input_tokens",
+             "/api/tokens"
+           ])
 
     # A generation timeout/reset may follow a submitted request even before the
     # first response chunk. Only definite connection failures are safe to replay.

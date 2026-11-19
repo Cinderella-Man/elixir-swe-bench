@@ -2,15 +2,15 @@ defmodule Eab.ModelSpeed do
   @moduledoc """
   Prompt and generation speed of a Pi attempt's model calls, summed per attempt and run.
 
-  llama.cpp reports its own timings in each stream's final event, excluding the network.
-  Strata reports none, so the controller times its stream: from sending the request to the
-  first token event, then from the first to the last. Speed is recorded only with the
-  attempt's elapsed time (ADR 0014), which assumes a model served on another machine.
+  llama.cpp and Project Maya report their own timings in each stream's final event, excluding
+  the network. Strata reports none, so the controller times its stream: from sending the
+  request to the first token event, then from the first to the last. Speed is recorded only
+  with the attempt's elapsed time (ADR 0014), which assumes a model served on another machine.
   """
   alias Eab.Model
 
   @doc "One call's speed from its event stream and Strata token times, or nil."
-  def call(%{"backend" => "llama_cpp"}, body, _timing) do
+  def call(%{"backend" => backend}, body, _timing) when backend in ~w(llama_cpp maya) do
     body
     |> Model.events()
     |> Enum.map(& &1["timings"])
@@ -112,7 +112,7 @@ defmodule Eab.ModelSpeed do
       do: "#{name} #{Float.round(speed[tokens] * 1000 / speed[ms], 1)} tok/s"
   end
 
-  defp source("server_reported"), do: "reported by llama.cpp"
+  defp source("server_reported"), do: "reported by the model server"
   defp source("controller_timed"), do: "timed by the controller, network included"
   defp source(_), do: "from mixed sources"
 end

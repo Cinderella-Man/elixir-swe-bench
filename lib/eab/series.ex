@@ -269,7 +269,7 @@ defmodule Eab.Series do
   def closed_reason(%{
         "setup" => %{"server_type" => type, "settings" => %{"response_tokens" => cap}}
       })
-      when type in ~w(llama_cpp strata) and is_integer(cap),
+      when type in ~w(llama_cpp strata maya) and is_integer(cap),
       do:
         "It was made with a #{cap}-token cap on each reply, which new runs no longer have " <>
           "(ADR 0015). A run of this model starts a new series."
@@ -277,7 +277,7 @@ defmodule Eab.Series do
   def closed_reason(%{
         "setup" => %{"server_type" => type, "settings" => %{"max_tokens" => budget}}
       })
-      when type in ~w(llama_cpp strata) and is_integer(budget),
+      when type in ~w(llama_cpp strata maya) and is_integer(budget),
       do:
         "It was made with a #{budget}-token generation budget, which new local runs no longer " <>
           "have (ADR 0016). A run of this model starts a new series."

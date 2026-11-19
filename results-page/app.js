@@ -159,7 +159,7 @@
   };
   const seconds = ms => `${fmt(Math.round(ms / 1000))} s`;
   const rate = (tokens, ms) => ms > 0 && tokens > 0 ? (tokens * 1000 / ms).toFixed(1) : null;
-  const speedSource = {server_reported: "reported by llama.cpp, network excluded",
+  const speedSource = {server_reported: "reported by the model server, network excluded",
     controller_timed: "timed by the benchmark, network included", mixed: "from mixed sources"};
   const speedText = s => !s ? "No model speed recorded" : [
     rate(s.generated_tokens, s.generation_ms) && `generation ${rate(s.generated_tokens, s.generation_ms)} tok/s`,
@@ -266,7 +266,7 @@
   const cpuText = m => m.cpu && m.cpu.replace(/\((R|TM)\)/g, "").replace(/\s+\d+-Core Processor$/, "").trim();
   const machineText = m => [gpusText(m), cpuText(m), m.ram_bytes && `${Math.round(m.ram_bytes / 2**30)} GB RAM`].filter(Boolean).join(" · ");
   const serverText = m => {
-    const name = {llama_cpp: "llama.cpp", strata: "Strata"}[m.server] || m.server;
+    const name = {llama_cpp: "llama.cpp", strata: "Strata", maya: "Project Maya"}[m.server] || m.server;
     const build = !m.server_build ? name : m.server_build.startsWith(name) ? m.server_build : `${name} ${m.server_build}`;
     return [build, m.kv_cache && `KV cache ${m.kv_cache}`]
       .filter(Boolean).join(" · ");
@@ -308,7 +308,7 @@
   }
   const speedNote = () => `Tokens per second on the same ${speedCases.length} speed cases (${speedCases.join(", ")}), so every row ` +
     "covers the same work: a full run counts its times on these cases, and a speed run runs only these, one at a time. " +
-    "llama.cpp reports its own timings, network excluded; Strata is timed by the benchmark, network included. " +
+    "llama.cpp and Project Maya report their own timings, network excluded; Strata is timed by the benchmark, network included. " +
     "Pass counts show whether a setup still solves the cases; speed is never scored. Hover a server for its flags.";
   function speedTable(rows, {showModel} = {}) {
     const table = node("table", "case-table speed-table"), head = node("thead"), headRow = node("tr");

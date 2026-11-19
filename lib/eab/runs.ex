@@ -699,8 +699,8 @@ defmodule Eab.Runs do
 
   # Speed runs time a local model server one case at a time (ADRs 0014 and 0020).
   defp speed(run, endpoint, settings, release) do
-    unless endpoint["backend"] in ~w(llama_cpp strata),
-      do: raise("Speed runs are for a model served by llama.cpp or Strata")
+    unless endpoint["backend"] in ~w(llama_cpp strata maya),
+      do: raise("Speed runs are for a model served by llama.cpp, Strata or Project Maya")
 
     cases = Eab.Inventory.speed_cases(release["protocol"]["inventory"])
     selection = %{"kind" => "speed", "cases" => cases}
