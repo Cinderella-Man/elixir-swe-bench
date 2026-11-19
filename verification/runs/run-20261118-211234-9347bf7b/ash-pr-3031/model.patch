@@ -1,0 +1,547 @@
+diff --git a/lib/ash/filter/filter.ex b/lib/ash/filter/filter.ex
+index 901ca99..292c610 100644
+--- a/lib/ash/filter/filter.ex
++++ b/lib/ash/filter/filter.ex
+@@ -3256,11 +3256,10 @@ defmodule Ash.Filter do
+           resource_calculation when tuple_size(args) == 2 ->
+             {args, nested_statement} = args
+ 
+-            with {:ok, args} <-
+-                   Ash.Query.validate_calculation_arguments(resource_calculation, args || %{}),
+-                 {:ok, calculation} <-
++            with {:ok, calculation} <-
+                    Calculation.from_resource_calculation(context.resource, resource_calculation,
+-                     args: args
++                     args: normalize_args(args),
++                     allow_expr?: !context[:input?]
+                    ) do
+               calculation = %{calculation | load: calculation.name}
+ 
+@@ -3471,17 +3470,12 @@ defmodule Ash.Filter do
+               end)
+           end
+ 
+-        with {:ok, args} <-
+-               Ash.Query.validate_calculation_arguments(
+-                 resource_calculation,
+-                 input,
+-                 !context[:input?]
+-               ),
+-             {:ok, calculation} <-
++        with {:ok, calculation} <-
+                Calculation.from_resource_calculation(
+                  context.resource,
+                  resource_calculation,
+-                 args: args
++                 args: normalize_args(input),
++                 allow_expr?: !context[:input?]
+                ) do
+           calculation = %{calculation | load: calculation.name}
+ 
+@@ -3894,14 +3888,10 @@ defmodule Ash.Filter do
+ 
+     cond do
+       resource_calculation ->
+-        with {:ok, args} <-
+-               Ash.Query.validate_calculation_arguments(
+-                 resource_calculation,
+-                 Map.new(Enum.at(args, 0) || [])
+-               ),
+-             {:ok, calculation} <-
++        with {:ok, calculation} <-
+                Calculation.from_resource_calculation(context.resource, resource_calculation,
+-                 args: args
++                 args: normalize_args(Enum.at(args, 0) || []),
++                 allow_expr?: !context[:input?]
+                ) do
+           {:ok,
+            %Ref{
+@@ -5233,6 +5223,12 @@ defmodule Ash.Filter do
+ 
+   def get_operator(_), do: nil
+ 
++  # Normalizes a calculation argument container (keyword list, map or `nil`) into a map,
++  # as expected by `Ash.Query.Calculation.from_resource_calculation/3`.
++  defp normalize_args(nil), do: %{}
++  defp normalize_args(args) when is_list(args), do: Map.new(args)
++  defp normalize_args(args), do: args
++
+   defimpl Inspect do
+     import Inspect.Algebra
+ 
+diff --git a/lib/ash/query/calculation.ex b/lib/ash/query/calculation.ex
+index 3aafdfb..f175926 100644
+--- a/lib/ash/query/calculation.ex
++++ b/lib/ash/query/calculation.ex
+@@ -165,6 +165,11 @@ defmodule Ash.Query.Calculation do
+       type: :map,
+       doc: "Context from the source query or changeset.",
+       default: %{}
++    ],
++    allow_expr?: [
++      type: :boolean,
++      doc: "Whether or not expression arguments are allowed.",
++      default: true
+     ]
+   ]
+ 
+@@ -222,9 +227,16 @@ defmodule Ash.Query.Calculation do
+ 
+     %{calculation: {module, calc_opts}} = resource_calculation
+ 
++    opts =
++      Enum.map(opts, fn
++        {key, value} when key == :args -> {:args, normalize_arg_keys(value)}
++
++        other -> other
++      end)
++
+     with {:ok, opts} <- FromResourceOpts.validate(opts),
+          {:ok, args} <-
+-           Ash.Query.validate_calculation_arguments(resource_calculation, opts.args),
++           Ash.Query.validate_calculation_arguments(resource_calculation, opts.args, opts.allow_expr?),
+          {:ok, calculation} <-
+            new(
+              name,
+@@ -246,6 +258,20 @@ defmodule Ash.Query.Calculation do
+     end
+   end
+ 
++  # Argument containers may use string keys (e.g. coming from a filter statement or
++  # an external source). Normalize them to the atom keys expected by the options
++  # validator; `Ash.Query.validate_calculation_arguments/3` performs the actual
++  # argument lookup and reports unknown arguments.
++  defp normalize_arg_keys(args) when is_list(args), do: normalize_arg_keys(Map.new(args))
++
++  defp normalize_arg_keys(args) when is_map(args) do
++    Map.new(args, fn {key, value} ->
++      {if(is_binary(key), do: String.to_atom(key), else: key), value}
++    end)
++  end
++
++  defp normalize_arg_keys(args), do: args
++
+   defimpl Inspect do
+     import Inspect.Algebra
+ 
+diff --git a/lib/ash/query/query.ex b/lib/ash/query/query.ex
+index 441ee8a..5e8a11b 100644
+--- a/lib/ash/query/query.ex
++++ b/lib/ash/query/query.ex
+@@ -2663,44 +2663,26 @@ defmodule Ash.Query do
+           with {:ok, casted} <- Ash.Type.cast_input(argument.type, value, argument.constraints),
+                {:ok, casted} <-
+                  Ash.Type.apply_constraints(argument.type, casted, argument.constraints) do
+-            if has_one_expr? do
+-              {:cont,
+-               {:ok,
+-                Map.put(
+-                  arg_values,
+-                  argument.name,
+-                  %Ash.Query.Function.Type{
+-                    arguments: [value, argument.type, argument.constraints]
+-                  }
+-                )}}
+-            else
+-              cond do
+-                is_nil(casted) && argument.allow_nil? ->
+-                  {:cont, {:ok, Map.put(arg_values, argument.name, nil)}}
+-
+-                is_nil(casted) && is_nil(argument.default) ->
+-                  {:halt,
+-                   {:error,
+-                    InvalidCalculationArgument.exception(
+-                      field: argument.name,
+-                      calculation: calculation.name,
+-                      message: "is required",
+-                      value: value
+-                    )}}
+-
+-                is_nil(Map.get(args, argument.name, Map.get(args, to_string(argument.name)))) &&
+-                    not is_nil(value) ->
+-                  {:cont,
+-                   {:ok,
+-                    Map.put(
+-                      arg_values,
+-                      argument.name,
+-                      value
+-                    )}}
+-
+-                true ->
+-                  {:cont, {:ok, Map.put(arg_values, argument.name, casted)}}
+-              end
++            cond do
++              is_nil(casted) && argument.allow_nil? ->
++                {:cont, {:ok, Map.put(arg_values, argument.name, nil)}}
++
++              is_nil(casted) && is_nil(argument.default) ->
++                {:halt,
++                 {:error,
++                  InvalidCalculationArgument.exception(
++                    field: argument.name,
++                    calculation: calculation.name,
++                    message: "is required",
++                    value: value
++                  )}}
++
++              true ->
++                # The value has been cast and constrained exactly once. Store it as-is so
++                # that it is not cast, constrained or coerced a second time (e.g. when the
++                # calculation is evaluated as an expression beside an expression argument,
++                # or when the arguments are validated more than once).
++                {:cont, {:ok, Map.put(arg_values, argument.name, casted)}}
+             end
+           else
+             {:error, error} when is_binary(error) ->
+diff --git a/test/calculations/calculation_arguments_test.exs b/test/calculations/calculation_arguments_test.exs
+new file mode 100644
+index 0000000..a909be9
+--- /dev/null
++++ b/test/calculations/calculation_arguments_test.exs
+@@ -0,0 +1,346 @@
++# SPDX-FileCopyrightText: 2025 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Test.CalculationArgumentsTest do
++  @moduledoc """
++  Regression tests for calculation arguments.
++
++  These verify that valid scalar/array calculation arguments (including atom/string
++  names and expression arguments) behave consistently across loads, filters and
++  sorts, that a literal argument beside an expression argument is cast and
++  constrained exactly once (and is never cast/constrained/coerced again), and that
++  malformed inputs, unknown arguments and custom-type rejections produce structured
++  input errors.
++  """
++  use ExUnit.Case, async: false
++  require Ash.Query
++  import Ash.Expr
++  alias Ash.Test.Domain, as: Domain
++
++  # A custom type whose cast is *not* idempotent and whose constraints transform the
++  # value. This lets us detect a value that was cast/constrained more (or fewer) than
++  # once:
++  #   * cast marks the value:        "hello" -> "C[hello]"
++  #   * apply_constraints prepends:  "C[hello]" + [prefix: "P"] -> "PC[hello]"
++  # A value that was coerced a second time would read "PC[PC[hello]]", and a value
++  # that skipped the constraint would read "C[hello]".
++  defmodule ArgType do
++    use Ash.Type
++
++    def storage_type(_), do: :string
++
++    def constraints do
++      [
++        prefix: [type: :string, default: "", doc: "Prefix to prepend to the value"]
++      ]
++    end
++
++    def init(constraints), do: {:ok, constraints}
++
++    def cast_input(nil, _), do: {:ok, nil}
++
++    def cast_input(value, _constraints) when is_binary(value),
++      do: {:ok, "C[" <> value <> "]"}
++
++    def cast_input(value, _constraints),
++      do: {:error, "expected a string, got #{inspect(value)}"}
++
++    def cast_stored(nil, _), do: {:ok, nil}
++    def cast_stored(value, _), do: {:ok, value}
++    def dump_to_native(nil, _), do: {:ok, nil}
++    def dump_to_native(value, _), do: {:ok, value}
++
++    def apply_constraints(nil, _constraints), do: {:ok, nil}
++
++    def apply_constraints(value, constraints),
++      do: {:ok, Keyword.get(constraints, :prefix, "") <> value}
++
++    def equal?(left, right), do: left == right
++  end
++
++  defmodule ResultCalc do
++    @moduledoc false
++    use Ash.Resource.Calculation
++
++    # Typed comparison: the literal argument `x` is compared with the `attr`
++    # attribute (both `ArgType`), combined with the expression argument `y`.
++    def expression(_opts, %{arguments: arguments}) do
++      expr(^arguments.x == attr and ^arguments.y)
++    end
++  end
++
++  defmodule FirstItemCalc do
++    @moduledoc false
++    use Ash.Resource.Calculation
++
++    # Uses an array argument beside an expression argument.
++    def expression(_opts, %{arguments: arguments}) do
++      expr(is_nil(at(^arguments.items, 0)) or ^arguments.y)
++    end
++  end
++
++  defmodule Rec do
++    @moduledoc false
++    use Ash.Resource, domain: Domain, data_layer: Ash.DataLayer.Ets
++
++    ets do
++      private?(true)
++    end
++
++    actions do
++      defaults([:read, :create, :destroy])
++      default_accept :*
++    end
++
++    attributes do
++      uuid_primary_key(:id)
++      attribute(:attr, Ash.Test.CalculationArgumentsTest.ArgType, public?: true,
++        constraints: [prefix: "P"]
++      )
++
++      attribute(:flag, :boolean, public?: true, allow_nil?: false, default: false)
++    end
++
++    calculations do
++      calculate :result, :boolean, ResultCalc do
++        public?(true)
++        argument(:x, Ash.Test.CalculationArgumentsTest.ArgType, constraints: [prefix: "P"])
++        argument(:y, :boolean, allow_expr?: true)
++      end
++
++      calculate :first_item, :boolean, FirstItemCalc do
++        public?(true)
++        argument(:items, {:array, Ash.Test.CalculationArgumentsTest.ArgType},
++          constraints: [items: [prefix: "P"]]
++        )
++
++        argument(:y, :boolean, allow_expr?: true)
++      end
++
++      calculate :required_check, :boolean do
++        public?(true)
++
++        calculation(fn records, _context ->
++          Enum.map(records, fn _record -> true end)
++        end)
++
++        argument(:req, :string, allow_nil?: false)
++      end
++
++      calculate :default_check, :string do
++        public?(true)
++
++        calculation(fn records, %{arguments: %{greeting: greeting}} ->
++          Enum.map(records, fn _record -> greeting end)
++        end)
++
++        argument(:greeting, :string, default: "hi")
++      end
++    end
++  end
++
++  setup do
++    {:ok, records} = Ash.read(Rec)
++    Enum.each(records, fn record -> Ash.destroy!(record) end)
++    :ok
++  end
++
++  # ---------------------------------------------------------------------------
++  # valid-arguments
++  # ---------------------------------------------------------------------------
++
++  test "load: a literal argument beside an expression argument is cast and constrained once" do
++    record = Ash.create!(Rec, %{attr: "hello", flag: true})
++    # The attribute was cast + constrained once when stored.
++    assert record.attr == "PC[hello]"
++
++    {:ok, loaded} = Ash.load(record, [result: %{x: "hello", y: expr(flag)}])
++
++    # `x` must be the once-cast/constrained value ("PC[hello]") so that the typed
++    # comparison `x == attr` holds. If `x` were coerced a second time it would be
++    # "PC[PC[hello]]" (or "C[hello]" if the constraint were dropped) and this fails.
++    assert loaded.result == true
++  end
++
++  test "load: argument values are used exactly as cast (inspect the normalized value)" do
++    calc =
++      Ash.Query.Calculation.from_resource_calculation!(Rec, :result,
++        args: %{x: "hello", y: expr(flag)}
++      )
++
++    # The literal argument is stored as the once-cast/constrained value, not wrapped
++    # in a re-coercing `type(...)` node.
++    assert calc.context.arguments[:x] == "PC[hello]"
++  end
++
++  test "filter (map form): literal argument beside an expression argument" do
++    Ash.create!(Rec, %{attr: "hello", flag: true})
++    Ash.create!(Rec, %{attr: "world", flag: true})
++
++    results =
++      Rec
++      |> Ash.Query.filter(result: %{input: %{x: "hello", y: expr(flag)}, eq: true})
++      |> Ash.read!()
++      |> Enum.map(& &1.attr)
++      |> Enum.sort()
++
++    assert results == ["PC[hello]"]
++  end
++
++  test "filter (tuple form): literal argument beside an expression argument" do
++    Ash.create!(Rec, %{attr: "hello", flag: true})
++    Ash.create!(Rec, %{attr: "world", flag: true})
++
++    results =
++      Rec
++      |> Ash.Query.filter(result: {%{x: "hello", y: expr(flag)}, [eq: true]})
++      |> Ash.read!()
++      |> Enum.map(& &1.attr)
++      |> Enum.sort()
++
++    assert results == ["PC[hello]"]
++  end
++
++  test "sort: literal argument beside an expression argument is consistent" do
++    hello = Ash.create!(Rec, %{attr: "hello", flag: true})
++    world = Ash.create!(Rec, %{attr: "world", flag: true})
++
++    results =
++      Rec
++      |> Ash.Query.load(result: %{x: "hello", y: expr(flag)})
++      |> Ash.Query.sort(result: {%{x: "hello", y: expr(flag)}, :asc})
++      |> Ash.read!()
++      |> Enum.map(&{&1.id, &1.result})
++      |> Map.new()
++
++    # `x` ("PC[hello]") matches only the "hello" record's attribute, so only that
++    # record's calculation is `true`.
++    assert results[hello.id] == true
++    assert results[world.id] == false
++  end
++
++  test "load: string argument names are accepted" do
++    record = Ash.create!(Rec, %{attr: "hello", flag: true})
++
++    {:ok, loaded} = Ash.load(record, [result: %{"x" => "hello", "y" => expr(flag)}])
++    assert loaded.result == true
++  end
++
++  test "load: array argument beside an expression argument is cast once per item" do
++    record = Ash.create!(Rec, %{attr: "hello", flag: true})
++
++    # Each item is cast + constrained once: "a" -> "PC[a]". The first item
++    # ("PC[a]") is not nil, so the calculation is `true` only when `y` is `true`.
++    {:ok, loaded} =
++      Ash.load(record, [first_item: %{items: ["a", "b"], y: expr(flag)}])
++
++    assert loaded.first_item == true
++
++    calc =
++      Ash.Query.Calculation.from_resource_calculation!(Rec, :first_item,
++        args: %{items: ["a", "b"], y: expr(flag)}
++      )
++
++    assert calc.context.arguments[:items] == ["PC[a]", "PC[b]"]
++  end
++
++  # ---------------------------------------------------------------------------
++  # input-errors
++  # ---------------------------------------------------------------------------
++
++  test "unknown argument produces a structured input error" do
++    error =
++      Ash.Filter.parse_input(Rec, [result: %{input: %{z: "hello", y: true}, eq: true}])
++      |> case do
++        {:error, error} -> error
++        other -> flunk("expected an error, got: #{inspect(other)}")
++      end
++
++    assert %Ash.Error.Invalid.NoSuchInput{input: :z, inputs: [:x, :y]} = error
++  end
++
++  test "custom type callback rejection is surfaced with its message" do
++    error =
++      Ash.Filter.parse_input(Rec, [result: %{input: %{x: 123, y: true}, eq: true}])
++      |> case do
++        {:error, error} -> error
++        other -> flunk("expected an error, got: #{inspect(other)}")
++      end
++
++    assert %Ash.Error.Query.InvalidCalculationArgument{field: :x, message: message} = error
++    assert message =~ "expected a string, got 123"
++  end
++
++  test "a malformed argument container produces a structured error" do
++    assert {:error, %Spark.Options.ValidationError{key: :args}} =
++             Ash.Query.Calculation.from_resource_calculation(Rec, :result, args: 123)
++  end
++
++  # ---------------------------------------------------------------------------
++  # preserve-boundaries
++  # ---------------------------------------------------------------------------
++
++  test "filter_input rejects expression arguments in the map form" do
++    error =
++      Ash.Filter.parse_input(Rec, [result: %{input: %{x: "hello", y: expr(flag)}, eq: true}])
++      |> case do
++        {:error, error} -> error
++        other -> flunk("expected an error, got: #{inspect(other)}")
++      end
++
++    assert %Ash.Error.Query.InvalidCalculationArgument{
++             field: :y,
++             message: "does not support expressions"
++           } = error
++  end
++
++  test "filter_input rejects expression arguments in the tuple form" do
++    error =
++      Ash.Filter.parse_input(Rec, [result: {%{x: "hello", y: expr(flag)}, [eq: true]}])
++      |> case do
++        {:error, error} -> error
++        other -> flunk("expected an error, got: #{inspect(other)}")
++      end
++
++    assert %Ash.Error.Query.InvalidCalculationArgument{
++             field: :y,
++             message: "does not support expressions"
++           } = error
++  end
++
++  test "a nil argument container in a tuple filter means omitted arguments (defaults apply)" do
++    record = Ash.create!(Rec, %{attr: "hello", flag: true})
++
++    # A `nil` argument container means the arguments were omitted, so the
++    # `greeting` default ("hi") is used. The record matches `greeting == "hi"`.
++    results =
++      Rec
++      |> Ash.Query.filter(default_check: {nil, [eq: "hi"]})
++      |> Ash.read!()
++      |> Enum.map(& &1.id)
++
++    assert record.id in results
++  end
++
++  test "omitted arguments use their defaults" do
++    calc =
++      Ash.Query.Calculation.from_resource_calculation!(Rec, :default_check, args: %{})
++
++    assert calc.context.arguments == %{greeting: "hi"}
++  end
++
++  test "a required argument without a default errors when omitted" do
++    assert {:error, %Ash.Error.Query.InvalidCalculationArgument{message: "is required"}} =
++             Ash.Query.Calculation.from_resource_calculation(Rec, :required_check, args: %{})
++  end
++
++  test "a required argument is accepted when provided" do
++    assert {:ok, calc} =
++             Ash.Query.Calculation.from_resource_calculation(Rec, :required_check,
++               args: %{req: "present"}
++             )
++
++    assert calc.context.arguments == %{req: "present"}
++  end
++end

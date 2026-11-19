@@ -1,0 +1,165 @@
+diff --git a/lib/plausible/application.ex b/lib/plausible/application.ex
+index 2bae31a..0fc99be 100644
+--- a/lib/plausible/application.ex
++++ b/lib/plausible/application.ex
+@@ -164,7 +164,7 @@ defmodule Plausible.Application do
+           adapter_opts: [
+             n_lock_partitions: 1,
+             ttl_check_interval: false,
+-            ets_options: [:bag, read_concurrency: true]
++            ets_options: [read_concurrency: true]
+           ],
+           warmers: [
+             refresh_all:
+diff --git a/test/plausible_web/plugs/tracker_plug_test.exs b/test/plausible_web/plugs/tracker_plug_test.exs
+index 488b5b2..1c09c67 100644
+--- a/test/plausible_web/plugs/tracker_plug_test.exs
++++ b/test/plausible_web/plugs/tracker_plug_test.exs
+@@ -13,10 +13,11 @@ defmodule PlausibleWeb.TrackerPlugTest do
+   If you're making changes in the tracker template files (`src/plausible.js`, `compile.js`),
+   do regenerate the files before running tests, so they're up to date.
+   """
+-  use PlausibleWeb.ConnCase, async: true
++  use PlausibleWeb.ConnCase, async: false
+   import Plug.Test
+ 
+   alias PlausibleWeb.Tracker
++  alias PlausibleWeb.TrackerScriptCache
+ 
+   describe "plausible-web.js" do
+     @example_config %{
+@@ -73,6 +74,134 @@ defmodule PlausibleWeb.TrackerPlugTest do
+     end
+   end
+ 
++  describe "plausible-web.js with the application cache enabled" do
++    # Simulates a running Community Edition instance: the cache is enabled and
++    # the :tracker_script_cache ConCache process is started under
++    # Plausible.Application with the production adapter options. This module is
++    # not async, so the cache toggle below never overlaps with other requests
++    # served through the router.
++    setup do
++      previous_enabled = Application.get_env(:plausible, Plausible.Cache)[:enabled]
++
++      Application.put_env(:plausible, Plausible.Cache, enabled: true)
++
++      on_exit(fn ->
++        Application.put_env(:plausible, Plausible.Cache, enabled: previous_enabled || false)
++      end)
++    end
++
++    test "serves the latest dedicated script after creation and each update", %{conn: conn} do
++      site = new_site()
++      other_site = new_site()
++
++      config = Tracker.update_script_configuration!(site, @example_config, :installation)
++
++      other_config =
++        Tracker.update_script_configuration!(other_site, @example_config, :installation)
++
++      # The upsert is broadcast asynchronously, wait for it to land in the cache
++      wait_until_cached(config.id, fn value -> is_binary(value) end)
++
++      # a newly created dedicated tracker script is served with 200
++      response = get(conn, "/js/#{config.id}.js") |> response(200)
++
++      assert String.contains?(response, "domain:\"#{site.domain}\"")
++      refute String.contains?(response, "fileDownloads:!0")
++      refute String.contains?(response, "outboundLinks:!0")
++
++      # each subsequent update is reflected immediately, without a restart or a
++      # manual cache refresh
++      Tracker.update_script_configuration!(
++        site,
++        Map.merge(@example_config, %{file_downloads: true, outbound_links: true}),
++        :installation
++      )
++
++      wait_until_cached(config.id, fn value ->
++        is_binary(value) and String.contains?(value, "fileDownloads:!0")
++      end)
++
++      response = get(conn, "/js/#{config.id}.js") |> response(200)
++
++      assert String.contains?(response, "domain:\"#{site.domain}\"")
++      assert String.contains?(response, "fileDownloads:!0")
++      assert String.contains?(response, "outboundLinks:!0")
++
++      # changing settings back and forth keeps serving the latest ones
++      Tracker.update_script_configuration!(
++        site,
++        Map.merge(@example_config, %{file_downloads: false, outbound_links: false}),
++        :installation
++      )
++
++      wait_until_cached(config.id, fn value ->
++        is_binary(value) and
++          not String.contains?(value, "fileDownloads:!0") and
++          not String.contains?(value, "outboundLinks:!0")
++      end)
++
++      response = get(conn, "/js/#{config.id}.js") |> response(200)
++
++      assert String.contains?(response, "domain:\"#{site.domain}\"")
++      refute String.contains?(response, "fileDownloads:!0")
++      refute String.contains?(response, "outboundLinks:!0")
++
++      # updating one site's configuration leaves other sites' scripts unchanged
++      response = get(conn, "/js/#{other_config.id}.js") |> response(200)
++
++      assert String.contains?(response, "domain:\"#{other_site.domain}\"")
++      refute String.contains?(response, "domain:\"#{site.domain}\"")
++      refute String.contains?(response, "fileDownloads:!0")
++      refute String.contains?(response, "outboundLinks:!0")
++    end
++
++    test "cache refresh picks up configurations changed directly in the database", %{conn: conn} do
++      site = new_site()
++
++      config = Tracker.update_script_configuration!(site, @example_config, :installation)
++
++      wait_until_cached(config.id, fn value -> is_binary(value) end)
++
++      # simulate a configuration change made directly in the database (for
++      # example by another node); no broadcast to the cache happens here
++      config
++      |> Ecto.Changeset.change(file_downloads: true)
++      |> Plausible.Repo.update!()
++
++      # the periodic cache refresh brings the dedicated script up to date
++      :ok = TrackerScriptCache.refresh_updated_recently()
++
++      response = get(conn, "/js/#{config.id}.js") |> response(200)
++
++      assert String.contains?(response, "domain:\"#{site.domain}\"")
++      assert String.contains?(response, "fileDownloads:!0")
++
++      # repeated refreshes in both modes do not make script requests fail
++      for _ <- 1..2 do
++        :ok = TrackerScriptCache.refresh_updated_recently()
++        :ok = TrackerScriptCache.refresh_all()
++
++        response = get(conn, "/js/#{config.id}.js") |> response(200)
++
++        assert String.contains?(response, "domain:\"#{site.domain}\"")
++        assert String.contains?(response, "fileDownloads:!0")
++      end
++    end
++
++    test "returns 404 for an unknown tracker id", %{conn: conn} do
++      conn
++      |> get("/js/pa-00000000-0000-0000-0000-000000000000.js")
++      |> response(404)
++    end
++
++    defp wait_until_cached(id, predicate) do
++      eventually(fn ->
++        value = TrackerScriptCache.get(id, force?: true)
++        {predicate.(value), :ok}
++      end)
++    end
++  end
++
+   describe "legacy variants" do
+     test "returns legacy script p.js" do
+       assert String.contains?(get_script("p.js"), "; samesite=strict; path=/")
