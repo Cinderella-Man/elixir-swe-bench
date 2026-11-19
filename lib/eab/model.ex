@@ -110,6 +110,15 @@ defmodule Eab.Model do
             "config, and connect again."
         )
 
+    # The gateway may leave a reply's limit for Maya to size (server_sizes_reply?/3); a shared
+    # limit would fill it in and cut the reply short.
+    if Map.has_key?(shared, "max_tokens"),
+      do:
+        raise(
+          "Project Maya's shared Chat settings set a reply limit, which would cap the " <>
+            "benchmark's replies. Clear Maya's shared Chat settings and connect again."
+        )
+
     defaults = health["defaults"] || %{}
 
     profile
@@ -264,7 +273,20 @@ defmodule Eab.Model do
         else: {usage["prompt_tokens"], usage["completion_tokens"]}
 
     unless complete, do: raise("Model stream ended without a completion marker")
-    unless input == expected_input, do: raise("Prompt count differs from generation accounting")
+
+    # Project Maya's loop guard may add a note to a conversation that repeats itself, or leave
+    # repeated rounds out, after the prompt was counted. Maya's own count of the prompt it read
+    # is then the record, with the gateway's count beside it.
+    edited =
+      endpoint["backend"] == "maya" and is_integer(input) and input > 0 and
+        input != expected_input
+
+    unless input == expected_input or edited,
+      do: raise("Prompt count differs from generation accounting")
+
+    # No reply limit was sent: the server filled the room the prompt it read left in its
+    # context, less the same 8-token margin the gateway keeps.
+    allowance = allowance || endpoint["context"] - input - 8
 
     unless is_integer(output) and output >= 0 and output <= allowance,
       do: raise("Missing or out-of-budget output accounting")
@@ -274,8 +296,20 @@ defmodule Eab.Model do
     unless is_integer(reasoning) and reasoning >= 0 and reasoning <= output,
       do: raise("Invalid reasoning-token accounting")
 
-    %{"input_tokens" => input, "output_tokens" => output}
+    usage = %{"input_tokens" => input, "output_tokens" => output}
+    if edited, do: Map.put(usage, "counted_input_tokens", expected_input), else: usage
   end
+
+  @doc """
+  Whether a call's request leaves out its reply limit for the server to size. Project Maya's
+  loop guard may lengthen a prompt after it was counted, so a limit that fills the context
+  exactly would be refused. Where the whole server context bounds a reply, and nothing else
+  does, Maya fills the room after the prompt it reads.
+  """
+  def server_sizes_reply?(endpoint, settings, bound),
+    do:
+      endpoint["backend"] == "maya" and bound == "context" and
+        settings["window_tokens"] == endpoint["context"]
 
   def unchanged!(%{"backend" => "openai_subscription"} = endpoint, _key),
     do: Eab.OpenAI.unchanged!(endpoint)

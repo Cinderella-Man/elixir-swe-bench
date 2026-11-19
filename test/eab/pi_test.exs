@@ -158,7 +158,11 @@ defmodule Eab.PiTest do
         refute Map.has_key?(first, "reasoning_budget_tokens")
       end
 
-      if backend == "maya", do: assert(first["loop_guard"] == false)
+      if backend == "maya" do
+        # Maya's loop guard stays on, and with only the context bounding the reply Maya sizes it.
+        refute Map.has_key?(first, "loop_guard")
+        refute Map.has_key?(first, "max_tokens")
+      end
 
       assert Jason.encode!(first["messages"]) =~ "Write repaired.txt"
       refute Jason.encode!(first["messages"]) =~ "echo with value ready"
@@ -607,6 +611,69 @@ defmodule Eab.PiTest do
       assert stopped.calls == 40
       assert stopped.stop_reason == "token_budget"
     end
+  end
+
+  test "Maya's own prompt count is the record when its loop guard edits a counted prompt", %{
+    prefix: prefix
+  } do
+    parent = self()
+    model = endpoint("maya")
+
+    frame = %{
+      "type" => "request",
+      "id" => "1",
+      "method" => "POST",
+      "path" => "/v1/chat/completions",
+      "body" => %{"messages" => [%{"role" => "user", "content" => "ticket"}], "tools" => []}
+    }
+
+    # The guard added a note after the count: Maya reads 57 tokens where 42 were counted.
+    Application.put_env(:eab, :http_request, fn opts ->
+      if String.ends_with?(opts[:url], "/api/tokens") do
+        {:ok, %{status: 200, body: count_reply("maya", 42)}}
+      else
+        send(parent, {:generation, opts[:json]})
+
+        {:ok,
+         %{
+           status: 200,
+           body:
+             sse([
+               %{
+                 "id" => "synthetic",
+                 "choices" => [
+                   %{"index" => 0, "delta" => %{"content" => "Done."}, "finish_reason" => nil}
+                 ]
+               },
+               %{
+                 "id" => "synthetic",
+                 "choices" => [%{"index" => 0, "delta" => %{}, "finish_reason" => "stop"}],
+                 "usage" => %{"prompt_tokens" => 57, "completion_tokens" => 3}
+               }
+             ]) <> "data: [DONE]\n\n"
+         }}
+      end
+    end)
+
+    state = Pi.state(model, "", Model.settings(model), "#{prefix}/maya", fn _ -> :ok end)
+    {reply, state} = PiGateway.request(frame, state)
+    assert reply["status"] == 200
+    assert_receive {:generation, payload}
+    refute Map.has_key?(payload, "loop_guard")
+    refute Map.has_key?(payload, "max_tokens")
+    refute Map.has_key?(Store.read("#{prefix}/maya/request-0000.json"), "max_tokens")
+    usage = Store.read("#{prefix}/maya/usage-0000.json")
+    assert usage["input_tokens"] == 57
+    assert usage["counted_input_tokens"] == 42
+    assert state.peak_context == 60
+
+    # A window smaller than Maya's context keeps the reply limit: Maya's room is larger.
+    settings = Model.settings(model, %{"window_tokens" => 16384})
+    state = Pi.state(model, "", settings, "#{prefix}/maya-window", fn _ -> :ok end)
+    {reply, _} = PiGateway.request(frame, state)
+    assert reply["status"] == 200
+    assert_receive {:generation, payload}
+    assert payload["max_tokens"] == 16384 - 42 - settings["safety_tokens"]
   end
 
   test "budgets stop forwarding, count exact Pi requests and retain endpoint errors", %{

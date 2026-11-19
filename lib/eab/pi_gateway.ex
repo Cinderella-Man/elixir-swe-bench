@@ -141,36 +141,34 @@ defmodule Eab.PiGateway do
       |> Eab.Thinking.payload(state.settings)
 
     payload =
-      case state.endpoint["backend"] do
-        "strata" ->
-          Map.delete(payload, "tool_choice")
-
-        # Project Maya's loop guard edits a conversation that repeats itself, after the prompt
-        # was counted, and answers some repeated tool calls itself. Every request turns it off,
-        # so the model sees Pi's conversation as sent.
-        "maya" ->
-          Map.merge(payload, %{
-            "stream_options" => %{"include_usage" => true},
-            "loop_guard" => false
-          })
-
-        _ ->
-          Map.put(payload, "stream_options", %{"include_usage" => true})
-      end
+      if state.endpoint["backend"] == "strata",
+        do: Map.delete(payload, "tool_choice"),
+        else: Map.put(payload, "stream_options", %{"include_usage" => true})
 
     step = state.calls |> Integer.to_string() |> String.pad_leading(4, "0")
     Store.write("#{state.prefix}/request-#{step}.json", payload, state.key)
     Activity.note("Counting prompt tokens for model call #{state.calls + 1}")
     count = Model.count(state.endpoint, state.key, payload)
     {allowance, bound} = reply_limit(state.settings, remaining, count)
+    # nil: the request names no reply limit and the server fills the context's room itself.
+    limit =
+      if Model.server_sizes_reply?(state.endpoint, state.settings, bound),
+        do: nil,
+        else: allowance
 
     payload =
-      if allowance > 0 and allowance != payload["max_tokens"] do
-        payload = %{payload | "max_tokens" => allowance}
-        Store.write("#{state.prefix}/request-#{step}.json", payload, state.key)
-        payload
-      else
-        payload
+      cond do
+        allowance < 1 or payload["max_tokens"] == limit ->
+          payload
+
+        true ->
+          payload =
+            if limit,
+              do: %{payload | "max_tokens" => limit},
+              else: Map.delete(payload, "max_tokens")
+
+          Store.write("#{state.prefix}/request-#{step}.json", payload, state.key)
+          payload
       end
 
     if allowance < 1 do
@@ -190,7 +188,15 @@ defmodule Eab.PiGateway do
 
         {body, timing} = Model.stream(state.endpoint, state.key, payload)
         Store.write_text("#{state.prefix}/response-#{step}.sse", body, state.key)
-        usage = Model.stream_usage(state.endpoint, body, count, allowance)
+        usage = Model.stream_usage(state.endpoint, body, count, limit)
+
+        if usage["counted_input_tokens"],
+          do:
+            Activity.note(
+              "Project Maya's loop guard changed the prompt after it was counted: " <>
+                "counted #{count} tokens, Maya read #{usage["input_tokens"]}"
+            )
+
         # Speed is recorded only while elapsed time is (ADR 0014).
         speed = if is_map(state.measurement), do: ModelSpeed.call(state.endpoint, body, timing)
         usage = if speed, do: Map.put(usage, "speed", speed), else: usage

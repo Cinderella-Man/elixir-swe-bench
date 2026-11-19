@@ -116,6 +116,35 @@ defmodule Eab.ModelTest do
         }) <> "\n\ndata: [DONE]\n\n"
 
     assert Model.stream_usage(endpoint(), llama, 20, 8)["output_tokens"] == 5
+
+    # Project Maya's loop guard may change a prompt after it was counted: Maya's own count is
+    # the record, beside the gateway's. Other servers must match the count exactly.
+    edited =
+      "data: " <>
+        Jason.encode!(%{
+          "choices" => [%{"finish_reason" => "stop"}],
+          "usage" => %{"prompt_tokens" => 25, "completion_tokens" => 5}
+        }) <> "\n\ndata: [DONE]\n\n"
+
+    assert Model.stream_usage(endpoint("maya"), edited, 20, 8) ==
+             %{"input_tokens" => 25, "output_tokens" => 5, "counted_input_tokens" => 20}
+
+    assert Model.stream_usage(endpoint("maya"), edited, 25, 8) ==
+             %{"input_tokens" => 25, "output_tokens" => 5}
+
+    assert_raise RuntimeError, fn -> Model.stream_usage(endpoint(), edited, 20, 8) end
+
+    # With no reply limit sent, the room Maya's prompt left in its context bounds the reply.
+    assert Model.stream_usage(endpoint("maya"), edited, 25, nil)["output_tokens"] == 5
+
+    overlong =
+      "data: " <>
+        Jason.encode!(%{
+          "choices" => [%{"finish_reason" => "length"}],
+          "usage" => %{"prompt_tokens" => 25, "completion_tokens" => 32768 - 25 - 7}
+        }) <> "\n\ndata: [DONE]\n\n"
+
+    assert_raise RuntimeError, fn -> Model.stream_usage(endpoint("maya"), overlong, 25, nil) end
     assert_raise RuntimeError, fn -> Model.stream_usage(endpoint(), "data: [DONE]\n\n", 20, 8) end
 
     assert_raise RuntimeError, fn ->
@@ -245,6 +274,14 @@ defmodule Eab.ModelTest do
     })
 
     assert_raise RuntimeError, ~r/shared Chat settings set a thinking level/, fn ->
+      Model.discover("http://fixture", "")
+    end
+
+    maya_server(self(), %{
+      "/settings" => %{"shared" => true, "defaults" => %{"max_tokens" => 8192}}
+    })
+
+    assert_raise RuntimeError, ~r/set a reply limit/, fn ->
       Model.discover("http://fixture", "")
     end
 
