@@ -13,7 +13,7 @@
 #   MIX_ENV=test mix run --no-start verification/local-series-2026-11-18/add-deepseek-peak-context.exs
 alias Eab.{ContextSize, Results}
 
-calls = Results.read!("verification/runs/run-20261113-193538-5205670a/calls.json")
+calls = Results.read!("verification/v6-archive-2026-11-19/runs/run-20261113-193538-5205670a/calls.json")
 ["prompt_tokens", "output_tokens"] = calls["fields"]
 
 path =

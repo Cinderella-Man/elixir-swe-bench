@@ -6,8 +6,8 @@ On 2026-11-18 a full v6 run of Qwen3.8 Flash Next, Unsloth's UD-IQ2_XS v3.1 quan
 
 | Run | What it is | Cases | Outcome | Logs |
 | --- | --- | ---: | --- | --- |
-| `20261118-115818-69764904` | Full run, seed 101 | 20 | 18 passed, ash-pr-3031 and vutuv-pr-1759 failed, beacon-pr-687 an evaluation error | [run-20261118-115818-69764904](../runs/run-20261118-115818-69764904/) |
-| `20261118-184224-6d451a46` | One-case rerun of beacon-pr-687 from that run | 1 | **Passed** all required checks | [run-20261118-184224-6d451a46](../runs/run-20261118-184224-6d451a46/) |
+| `20261118-115818-69764904` | Full run, seed 101 | 20 | 18 passed, ash-pr-3031 and vutuv-pr-1759 failed, beacon-pr-687 an evaluation error | [run-20261118-115818-69764904](../v6-archive-2026-11-19/runs/run-20261118-115818-69764904/) |
+| `20261118-184224-6d451a46` | One-case rerun of beacon-pr-687 from that run | 1 | **Passed** all required checks | [run-20261118-184224-6d451a46](../v6-archive-2026-11-19/runs/run-20261118-184224-6d451a46/) |
 
 beacon-pr-687 produced no outcome in the full run. After 102 model calls the agent ran `rm -rf lib && cp -r /tmp/lib-current/lib lib`. Its earlier copy had put the folder's contents straight into `/tmp/lib-current`, so the copy back failed and `lib/` was gone. The harness saves the patch after every tool call. The diff deleting every file in `lib/`, about 1.6 MB of source, was over the 1 MiB patch limit, and the failed save ended the attempt. The agent's code was lost with the workspace. Since commit `4ba807da` a snapshot that cannot be saved keeps the previous one and the attempt goes on. The rerun ran on a controller with that fix.
 

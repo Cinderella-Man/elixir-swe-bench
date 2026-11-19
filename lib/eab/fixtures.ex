@@ -26,6 +26,14 @@ defmodule Eab.Fixtures do
        "a096b3c82cea512cba884f5f86d0b623389b13cac3dcbd5afe571fa73a7850fe40353c5e1f0deff0123dcced25b31e6c6c5390d2a8695cbcb77a467c56d17a7c"}
   }
 
+  # Programs agents reach for that the base images lack, from the saved attempts
+  # (docs/research/agent-environment-gaps-2026-11-19): Python in two thirds of them, then
+  # socket checks, `file`, `xxd`, `curl` and `sqlite3`. `jq`, `column`, `bc`, `tree` and `nc`
+  # are what Claude uses most on a desktop besides. Debian's build-essential already brings
+  # Perl; Alpine's build-base does not. BusyBox supplies bc, tree, xxd, nc and netstat on Alpine.
+  @apt_tools ~w(python3 python-is-python3 perl jq file bc tree xxd curl sqlite3 iproute2 net-tools netcat-openbsd)
+  @apk_tools ~w(python3 perl jq file curl sqlite iproute2 util-linux-misc)
+
   def ensure(id, emit, opts \\ []) do
     Eab.Retention.with_use(fn -> do_ensure(id, emit, opts) end)
   end
@@ -356,6 +364,7 @@ defmodule Eab.Fixtures do
           "FROM #{base} AS toolchain",
           "USER root",
           "RUN if command -v apk; then apk add --no-cache git bash ca-certificates build-base brotli libstdc++ cmake grep ripgrep coreutils findutils diffutils; else apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git bash ca-certificates build-essential brotli cmake grep ripgrep coreutils findutils diffutils && rm -rf /var/lib/apt/lists/*; fi",
+          agent_tools(spec),
           "RUN if command -v useradd; then existing=$(getent passwd 1000 | cut -d: -f1); groupadd -f agent; if [ -n \"$existing\" ]; then usermod -l agent -d /home/agent -m -g agent \"$existing\"; else useradd -m -u 1000 -g agent agent; fi; else adduser -D -u 1000 agent; fi"
         ]
 
@@ -441,6 +450,19 @@ defmodule Eab.Fixtures do
         ],
       "\n"
     ) <> "\n"
+  end
+
+  # A case whose database is PostgreSQL also gets its client, for `pg_isready` and `psql`.
+  # `column` moved from bsdmainutils to bsdextrautils after Ubuntu 20.04. Alpine's python3
+  # has had no `python` name in some releases.
+  defp agent_tools(spec) do
+    client = if get_in(spec, ["services", "postgres"]), do: ["postgresql-client"], else: []
+    apt = "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends"
+
+    "RUN if command -v apk; then apk add --no-cache #{Enum.join(@apk_tools ++ client, " ")} && " <>
+      "(command -v python || ln -s python3 /usr/bin/python); " <>
+      "else apt-get update && #{apt} #{Enum.join(@apt_tools ++ client, " ")} && " <>
+      "(#{apt} bsdextrautils || #{apt} bsdmainutils) && rm -rf /var/lib/apt/lists/*; fi"
   end
 
   defp setup_commands(runtime) do

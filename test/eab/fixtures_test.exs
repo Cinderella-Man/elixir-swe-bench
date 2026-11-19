@@ -195,6 +195,30 @@ defmodule Eab.FixturesTest do
              "git add . && GIT_LITERAL_PATHSPECS=1 git add -f --pathspec-from-file=/opt/eab-force-add.txt --pathspec-file-nul && git commit"
   end
 
+  test "case images get the programs agents reach for, and a PostgreSQL client with that database" do
+    spec = %{"runtime" => %{"image" => "hexpm/elixir:1.18.4-erlang-27.3.4@sha256:abc"}}
+    plain = Fixtures.dockerfile(spec, "base")
+    services = %{"postgres" => %{"image" => "postgres:16@sha256:abc"}}
+    database = Fixtures.dockerfile(Map.put(spec, "services", services), "base")
+
+    for tool <- ~w(python3 python-is-python3 perl jq file sqlite3 iproute2 curl),
+        do: assert(plain =~ " #{tool} ")
+
+    assert plain =~
+             "apk add --no-cache python3 perl jq file curl sqlite iproute2 util-linux-misc &&"
+
+    assert plain =~ "bsdextrautils || "
+    refute plain =~ "postgresql-client"
+    assert database =~ "netcat-openbsd postgresql-client &&"
+    assert database =~ "util-linux-misc postgresql-client &&"
+
+    # Installed as root with the rest of the toolchain, so a reused toolchain image has them.
+    {tools, _} = :binary.match(plain, "python3")
+    {user, _} = :binary.match(plain, "useradd")
+    assert tools < user
+    refute Fixtures.dockerfile(spec, "base", nil, toolchain: "installed-tools") =~ "python3"
+  end
+
   test "recipes reconcile seeds before compilation and export an independent fixture" do
     for id <- Inventory.all() do
       spec = Inventory.spec(id)

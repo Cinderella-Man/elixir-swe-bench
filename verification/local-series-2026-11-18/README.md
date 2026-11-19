@@ -8,10 +8,10 @@ Two of the runs were made by the controller on this repository's machine. The ot
 
 | Run | Model | Thinking | Passed | Cut off, context full | Model calls | Output tokens | Made by |
 | --- | --- | --- | ---: | ---: | ---: | ---: | --- |
-| [`20261113-193538-5205670a`](../runs/run-20261113-193538-5205670a/) | DeepSeek-V4.1-Flash-1017, Unsloth UD-IQ1_M | high | 17 of 20 | 1 | 1,248 | 773,439 | The second controller |
-| [`20261114-085614-515bd299`](../runs/run-20261114-085614-515bd299/) | DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder, ISTA DASLab IQ2_XXS | high | 15 of 20 | 4 | 1,791 | 1,076,236 | The second controller |
-| [`20261116-113511-21de1916`](../runs/run-20261116-113511-21de1916/) | Qwen3.8-27B, Unsloth UD-Q6_K_L v3.1 | xhigh | 16 of 20 | 4 | 2,397 | 1,599,358 | This machine's controller |
-| [`20261117-072245-3bd94d5c`](../runs/run-20261117-072245-3bd94d5c/) | Qwen3.8-27B, Unsloth UD-Q4_K_XL v3.1 | xhigh | 18 of 20 | 3 | 2,300 | 1,423,381 | This machine's controller |
+| [`20261113-193538-5205670a`](../v6-archive-2026-11-19/runs/run-20261113-193538-5205670a/) | DeepSeek-V4.1-Flash-1017, Unsloth UD-IQ1_M | high | 17 of 20 | 1 | 1,248 | 773,439 | The second controller |
+| [`20261114-085614-515bd299`](../v6-archive-2026-11-19/runs/run-20261114-085614-515bd299/) | DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder, ISTA DASLab IQ2_XXS | high | 15 of 20 | 4 | 1,791 | 1,076,236 | The second controller |
+| [`20261116-113511-21de1916`](../v6-archive-2026-11-19/runs/run-20261116-113511-21de1916/) | Qwen3.8-27B, Unsloth UD-Q6_K_L v3.1 | xhigh | 16 of 20 | 4 | 2,397 | 1,599,358 | This machine's controller |
+| [`20261117-072245-3bd94d5c`](../v6-archive-2026-11-19/runs/run-20261117-072245-3bd94d5c/) | Qwen3.8-27B, Unsloth UD-Q4_K_XL v3.1 | xhigh | 18 of 20 | 3 | 2,300 | 1,423,381 | This machine's controller |
 
 All four used the case files v6 has today: each run's recorded hashes of every case's files equal the current ones. Each is the first run of its series, with seed 101.
 
@@ -37,7 +37,7 @@ Cases solved, of 20, with the whole attempt inside each size ([how these scores 
 
 ## DeepSeek's peak context
 
-The DeepSeek UD-IQ1_M run was published on 2026-11-14, three days before attempts began recording their peak context ([ADR 0022](../../docs/adr/0022-score-runs-at-context-sizes.md)), so the results page could not show it at a context size. Its 1,248 model calls each left a usage record with the tokens of the prompt and of the reply. [`calls.json`](../runs/run-20261113-193538-5205670a/calls.json) in the run's folder lists them, and [`add-deepseek-peak-context.exs`](add-deepseek-peak-context.exs) adds each case's peak to the published series, `75a9990dffea…`, and brings it to public schema 12.
+The DeepSeek UD-IQ1_M run was published on 2026-11-14, three days before attempts began recording their peak context ([ADR 0022](../../docs/adr/0022-score-runs-at-context-sizes.md)), so the results page could not show it at a context size. Its 1,248 model calls each left a usage record with the tokens of the prompt and of the reply. [`calls.json`](../v6-archive-2026-11-19/runs/run-20261113-193538-5205670a/calls.json) in the run's folder lists them, and [`add-deepseek-peak-context.exs`](add-deepseek-peak-context.exs) adds each case's peak to the published series, `75a9990dffea…`, and brings it to public schema 12.
 
 The script refuses to write unless every case has exactly as many calls as its published `model_calls` and their reply tokens add up exactly to its published `generated_tokens`. All twenty cases do. No outcome, token count or other published number changed.
 
