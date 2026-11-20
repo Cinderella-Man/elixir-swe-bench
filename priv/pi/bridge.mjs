@@ -22,23 +22,39 @@ process.on('uncaughtException', fail);
 process.on('unhandledRejection', fail);
 if (!(config.bash_timeout_seconds > 0)) fail(new Error('Missing bash timeout'));
 
-function lines(stream, callback) {
-  let buffer = '';
+// Pi's events are per-token deltas and messages, kept within the controller's 16 MiB line
+// limit. A controller record carries a whole model reply as streamed: one reply may fill
+// the context window (ADR 0016), and its stream runs to 200-odd bytes per token, so a
+// 262,144-token window needs about 64 MiB. Replies are capped only below V8's string limit.
+const EVENT_LIMIT = 16 * 1024 * 1024;
+const REPLY_LIMIT = 500 * 1024 * 1024;
+
+function lines(stream, limit, callback) {
+  let parts = [];
+  let size = 0;
   stream.setEncoding('utf8');
   stream.on('data', (data) => {
-    buffer += data;
+    // Search only the new data, so a long record is read in linear time.
+    let start = 0;
     let end;
-    while ((end = buffer.indexOf('\n')) !== -1) {
-      const line = buffer.slice(0, end);
-      buffer = buffer.slice(end + 1);
+    while ((end = data.indexOf('\n', start)) !== -1) {
+      parts.push(data.slice(start, end));
+      const line = parts.join('');
+      parts = [];
+      size = 0;
+      start = end + 1;
       if (line.trim()) callback(JSON.parse(line));
     }
-    if (buffer.length > 16 * 1024 * 1024) throw new Error('Oversized protocol record');
+    if (start < data.length) {
+      parts.push(data.slice(start));
+      size += data.length - start;
+    }
+    if (size > limit) throw new Error('Oversized protocol record');
   });
-  stream.on('end', () => { if (buffer.trim()) fail(new Error('Incomplete protocol record')); });
+  stream.on('end', () => { if (parts.join('').trim()) fail(new Error('Incomplete protocol record')); });
 }
 
-lines(process.stdin, (reply) => {
+lines(process.stdin, REPLY_LIMIT, (reply) => {
   const response = pending.get(reply.id);
   if (!response) throw new Error('Unknown model request');
   pending.delete(reply.id);
@@ -88,7 +104,7 @@ server.listen(0, '127.0.0.1', () => {
       EAB_BASH_TIMEOUT_SECONDS: String(config.bash_timeout_seconds)}
   });
   child.on('error', fail);
-  lines(child.stdout, (event) => emit({type: 'event', event}));
+  lines(child.stdout, EVENT_LIMIT, (event) => emit({type: 'event', event}));
   child.stderr.setEncoding('utf8');
   child.stderr.on('data', (text) => emit({type: 'diagnostic', text}));
   child.on('close', (code, signal) => {

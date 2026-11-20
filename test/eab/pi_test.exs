@@ -265,6 +265,65 @@ defmodule Eab.PiTest do
     assert File.read!(Path.join(workspace, "repaired.txt")) == "fixed"
   end
 
+  # A reply may fill the context window, and its stream is far larger than its text: one
+  # reply of 155,225 tokens streamed 35 MB and once ended an attempt as an evaluation error.
+  test "real Pi receives a reply whose stream is larger than 16 MiB", %{prefix: prefix} do
+    parent = self()
+    model = endpoint("llama_cpp")
+    settings = Model.settings(model)
+    workspace = Store.path("#{prefix}/workspace")
+    File.mkdir_p!(workspace)
+    Store.write("#{prefix}/config.json", Pi.config(model, settings, "Repair the file.", ""))
+    # Servers repeat these fields in every chunk; together they make the stream's size.
+    padding = String.duplicate("0", 2048)
+
+    Application.put_env(:eab, :http_request, fn opts ->
+      if String.ends_with?(opts[:url], "tokens") do
+        {:ok, %{status: 200, body: %{"input_tokens" => 42}}}
+      else
+        allowance = opts[:json]["max_tokens"]
+
+        chunk = fn delta, finish ->
+          %{
+            "id" => "synthetic",
+            "system_fingerprint" => padding,
+            "choices" => [%{"index" => 0, "delta" => delta, "finish_reason" => finish}]
+          }
+        end
+
+        thinking = for _ <- 1..9000, do: chunk.(%{"reasoning_content" => "Still thinking. "}, nil)
+
+        last =
+          chunk.(%{"reasoning_content" => "End of the long reply."}, "length")
+          |> Map.put("usage", %{"prompt_tokens" => 42, "completion_tokens" => allowance})
+
+        body =
+          sse([chunk.(%{"role" => "assistant"}, nil) | thinking] ++ [last]) <> "data: [DONE]\n\n"
+
+        send(parent, {:reply_bytes, byte_size(body)})
+        {:ok, %{status: 200, body: body}}
+      end
+    end)
+
+    result =
+      Command.exchange(
+        "/opt/pi/node",
+        ["/opt/pi/bridge.mjs", Store.path("#{prefix}/config.json")],
+        Pi.state(model, "", settings, prefix, fn _ -> :ok end, false),
+        &Pi.handle/2,
+        cd: workspace,
+        timeout: 120
+      )
+
+    assert_receive {:reply_bytes, bytes}
+    assert bytes > 16 * 1024 * 1024
+    refute_receive {:reply_bytes, _}
+    # The reply fills the window, so the attempt ends as a context cutoff and is graded.
+    assert Pi.finish(result)["stop_reason"] == "context_budget"
+    assert Pi.finish(result)["calls"] == 1
+    assert File.read!(Store.path("#{prefix}/pi-events.jsonl")) =~ "End of the long reply."
+  end
+
   test "a final reply cut at its allowance records which budget ended the attempt", %{
     prefix: prefix
   } do
