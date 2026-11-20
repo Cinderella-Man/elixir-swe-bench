@@ -1,0 +1,1217 @@
+diff --git a/docs/features/cache-warming/proactive-warming.md b/docs/features/cache-warming/proactive-warming.md
+index 3e10aa7..d9eb6ab 100644
+--- a/docs/features/cache-warming/proactive-warming.md
++++ b/docs/features/cache-warming/proactive-warming.md
+@@ -22,7 +22,7 @@ Cachex.start_link(:my_cache, [
+ ])
+ ```
+ 
+-These are the only two fields in a `warmer()` record; a `:module` tag to define the module, and a `:state` field to define the state to be provided to the warmer (used later). The state in this case is a connection handle to our database, since we'll need that for queries we're trying to warm. All that remains is to implement our `DatabaseWarmer` module which implements the warmer behaviour:
++These are the fields in a `warmer()` record which matter here; a `:module` tag to define the module, and a `:state` field to define the state to be provided to the warmer (used later). The state in this case is a connection handle to our database, since we'll need that for queries we're trying to warm. All that remains is to implement our `DatabaseWarmer` module which implements the warmer behaviour:
+ 
+ ```elixir
+ defmodule MyProject.DatabaseWarmer do
+@@ -115,3 +115,51 @@ end
+ Using the same amount of database calls, on the same frequency, we have not only populated `"/api/v1/packages"` to return the list of packages, but we have also populated the entire API `"/api/v1/packages/{id}"` to return the single package referenced in the path. This is a much more optimized solution for this type of caching, as you can explode out your key writes with a single cache action, and no extra database requests.
+ 
+ Obviously, these warmers can only be used if you know what types of data you're expecting to be cached. If you're dealing with seeded data (i.e. from a user), you probably can't use warmers, and should be looking at fallbacks instead. You must also consider how relevant the data is that you're caching; if you only care about it for a short period of time, you likely don't want a warmer as they run for the lifetime of the cache.
++
++## Warmer Names
++
++Warmers are unnamed by default, and unnamed warmers are not registered under any name at all. This allows a single warmer module to be used by several caches at the same time, and it also allows one module to back several warmers within a single cache - so long as each of those warmers has a distinct name:
++
++```elixir
++# for warmer()
++import Cachex.Spec
++
++Cachex.start_link(:my_cache, [
++  warmers: [
++    warmer(module: MyProject.DatabaseWarmer, name: :primary_db, state: primary_conn),
++    warmer(module: MyProject.DatabaseWarmer, name: :replica_db, state: replica_conn)
++  ]
++])
++```
++
++Each named warmer is a separate process, running on its own interval with its own state, and it's registered under its name (`Process.whereis(:primary_db)`, and so on). Names have to be atoms, and every warmer inside a cache has to have a unique identity; a warmer is identified by its name when it has one, and by its module when it doesn't. Any clash of these identities causes the cache to fail to start with `{ :error, :invalid_warmer }`.
++
++## Manual Warming
++
++Warmers run on their interval, and once when the cache starts, but a run can also be triggered by hand using `Cachex.warm/2`. This is mostly useful when you know the backing state of a warmer has changed, and you want the warmed values refreshed immediately rather than waiting for the next interval.
++
++```elixir
++# triggers every warmer inside the cache
++Cachex.warm(:my_cache)
++#=> { :ok, [ :primary_db, :replica_db ] }
++```
++
++Only some of the warmers can be triggered using the `:only` option. Entries are either warmer names or warmer modules, where a name selects that warmer, and a module selects every warmer built from it. Entries which match nothing are ignored, and the result contains one entry per warmer which was triggered, in the order the warmers were configured against the cache:
++
++```elixir
++Cachex.warm(:my_cache, only: [:replica_db])
++#=> { :ok, [ :replica_db ] }
++
++Cachex.warm(:my_cache, only: [MyProject.DatabaseWarmer])
++#=> { :ok, [ :primary_db, :replica_db ] }
++```
++
++By default the call returns as soon as the warmers have been triggered, without waiting for them to run. Providing `wait: true` blocks the call until every selected warmer has finished executing and has written its values into the cache, however long that takes, so a read straight after the call will see the warmed values:
++
++```elixir
++Cachex.warm(:my_cache, only: [:replica_db], wait: true)
++#=> { :ok, [ :replica_db ] }
++
++# the warmed values are already set at this point
++Cachex.get!(:my_cache, "some key")
++```
+diff --git a/lib/cachex.ex b/lib/cachex.ex
+index cfa7700..850420c 100644
+--- a/lib/cachex.ex
++++ b/lib/cachex.ex
+@@ -1366,25 +1366,39 @@ defmodule Cachex do
+ 
+   This allows for manual warming of a cache in situations where
+   you already know the backing state has been updated. The return
+-  value of this function will contain the list of modules which
+-  were warmed as a result of this call.
++  value of this function will contain the list of warmers which
++  were warmed as a result of this call. Warmers are identified by
++  their name when they have one, or by their module otherwise.
+ 
+   ## Options
+ 
++    * `:only`
++
++      An optional list of warmer names and modules to warm, acting as a
++      whitelist. An entry matching a warmer name selects that warmer, and an
++      entry matching a module selects every warmer built from that module.
++      Entries which match no warmer inside the cache are ignored. The default
++      behaviour of this function is to trigger warming in all warmers.
++
+     * `:modules`
+ 
+-      An optional list of modules to warm, acting as a whitelist. The default
+-      behaviour of this function is to trigger warming in all modules.
++      A legacy alias of the `:only` option. If both are given, `:only` wins.
++
++    * `:wait`
++
++      Whether to wait for each selected warmer to finish executing before
++      returning from this call. Waiting will block until the warmer has run
++      and written its values into the cache; there is no timeout applied.
+ 
+   ## Examples
+ 
+       iex> Cachex.warm(:my_cache)
+       { :ok, [MyWarmer] }
+ 
+-      iex> Cachex.warm(:my_cache, modules: [MyWarmer])
++      iex> Cachex.warm(:my_cache, only: [MyWarmer])
+       { :ok, [MyWarmer] }
+ 
+-      iex> Cachex.warm(:my_cache, modules: [])
++      iex> Cachex.warm(:my_cache, only: [])
+       { :ok, [] }
+ 
+   """
+@@ -1446,23 +1460,26 @@ defmodule Cachex do
+   # Run warmers on cache startup
+   #
+   # This will find the cache's warmer pids by getting the children from the
+-  # Incubator server, matching those pids to the warmer by module, and then
+-  # executing the warmer based on the warmer's `async` attribute
++  # Incubator server, matching those pids to the warmer by identity (their
++  # name, or their module when they're unnamed), and then executing the
++  # warmer based on the warmer's `async` attribute
+   defp run_warmers(cache(warmers: warmers) = cache) do
+-    parent = Services.locate(cache, Services.Incubator)
+-    children = if parent, do: Supervisor.which_children(parent), else: []
+-    warmer_map = Map.new(children, fn {mod, pid, _, _} -> {mod, pid} end)
+-
+-    for warmer(module: module, async: async) <- warmers,
+-        pid = warmer_map[module] do
+-      if async do
+-        send(pid, :cachex_warmer)
+-      else
+-        GenServer.call(pid, :cachex_warmer, :infinity)
+-      end
++    processes = Services.Incubator.processes(cache)
++
++    for warmer() = warmer <- warmers,
++        pid = processes[warmer_identity(warmer)],
++        is_pid(pid) do
++      run_warmer(warmer, pid)
+     end
+   end
+ 
++  # Executes a warmer, blocking on the result when the warmer is not async.
++  defp run_warmer(warmer(async: true), pid),
++    do: send(pid, :cachex_warmer)
++
++  defp run_warmer(warmer(async: false), pid),
++    do: GenServer.call(pid, :cachex_warmer, :infinity)
++
+   # Unwraps a command result into an unsafe form.
+   #
+   # This is used alongside the Unsafe library to generate shorthand
+diff --git a/lib/cachex/actions/warm.ex b/lib/cachex/actions/warm.ex
+index b1f6471..033cb49 100644
+--- a/lib/cachex/actions/warm.ex
++++ b/lib/cachex/actions/warm.ex
+@@ -7,6 +7,9 @@ defmodule Cachex.Actions.Warm do
+   # immediately refresh your warmed entries.
+   import Cachex.Spec
+ 
++  # add some aliases
++  alias Cachex.Services.Incubator
++
+   ##############
+   # Public API #
+   ##############
+@@ -18,18 +21,64 @@ defmodule Cachex.Actions.Warm do
+   to our services module. This allows us to avoid having to track any special
+   state in order to support manual warming.
+ 
+-  You can provide a `:modules` option to restrict the warming to a specific
+-  set of warmer modules. The list of modules which had a warming triggered will
+-  be returned in the result of this call.
++  You can provide an `:only` option to restrict the warming to a specific set
++  of warmers. This accepts a list of warmer names and modules; a name selects
++  the warmer with that name, and a module selects every warmer built from it.
++  Entries which do not match any warmer inside the cache are ignored. The
++  `:modules` option is an alias of `:only`, and is only used when `:only` has
++  not been given.
++
++  You can also provide a `:wait` option to block this call until each selected
++  warmer has finished running and written its values into the cache. There is
++  no timeout applied to this wait.
++
++  The identities of the warmers which had a warming triggered are returned in
++  the result of this call, in the order the warmers were configured against the
++  cache. A warmer is identified by its name when it has one, and by its module
++  when it does not.
+   """
+-  def execute(cache(warmers: warmers), options) do
+-    mods = Keyword.get(options, :modules, nil)
++  def execute(cache(warmers: warmers) = cache, options) do
++    only = Keyword.get(options, :only, Keyword.get(options, :modules, nil))
++    wait = Keyword.get(options, :wait, false)
++
++    processes = Incubator.processes(cache)
+ 
+     handlers =
+-      for warmer(module: mod) <- warmers, mods == nil or mod in mods do
+-        send(mod, :cachex_warmer) && mod
++      for warmer() = warmer <- warmers,
++          selected?(warmer, only),
++          pid = processes[warmer_identity(warmer)],
++          is_pid(pid) do
++        trigger(pid, wait)
++        warmer_identity(warmer)
+       end
+ 
+     {:ok, handlers}
+   end
++
++  ###############
++  # Private API #
++  ###############
++
++  # Determines whether a warmer is selected by the given list of entries.
++  #
++  # A `nil` selection matches every warmer in the cache. Otherwise, a warmer
++  # matches when its name appears inside the entries, or when its module does.
++  defp selected?(_warmer, nil),
++    do: true
++
++  defp selected?(warmer(name: nil, module: module), only),
++    do: module in only
++
++  defp selected?(warmer(name: name, module: module), only),
++    do: name in only or module in only
++
++  # Triggers a warming run inside the warmer process.
++  #
++  # When waiting, the warmer is called rather than cast; the call only returns
++  # once the warmer has executed and placed all of its values into the cache.
++  defp trigger(pid, true),
++    do: GenServer.call(pid, :cachex_warmer, :infinity)
++
++  defp trigger(pid, _wait),
++    do: send(pid, :cachex_warmer)
+ end
+diff --git a/lib/cachex/options.ex b/lib/cachex/options.ex
+index c145a43..29f7802 100644
+--- a/lib/cachex/options.ex
++++ b/lib/cachex/options.ex
+@@ -338,6 +338,11 @@ defmodule Cachex.Options do
+   # This will return a list of warmer records to be associated to the
+   # cache at startup in the incubator service. All warmer records are
+   # passed through validation beforehand in order to ensure correctness.
++  #
++  # Warmers are also checked for unique identities; a warmer is identified
++  # by its name when it has one, and by its module when it's unnamed. This
++  # is required in order to be able to start (and address) each warmer as a
++  # distinct process within the cache.
+   defp parse_type(:warmers, cache, options) do
+     # pull warmers
+     warmers =
+@@ -346,7 +351,7 @@ defmodule Cachex.Options do
+       |> List.wrap()
+ 
+     # validation of all warmer records
+-    case validated?(warmers, :warmer) do
++    case validated?(warmers, :warmer) and unique?(warmers) do
+       false -> error(:invalid_warmer)
+       true -> cache(cache, warmers: warmers)
+     end
+@@ -358,4 +363,16 @@ defmodule Cachex.Options do
+   # are validated using the specification validation for the given type.
+   defp validated?(enum, type),
+     do: Enum.all?(enum, &Validator.valid?(type, &1))
++
++  # Determines if every warmer inside the given enum has a unique
++  # identity within the collection. Duplicated identities would cause
++  # warmer processes to clash on startup, so they're rejected instead.
++  defp unique?(warmers) do
++    identities =
++      warmers
++      |> Enum.map(&warmer_identity/1)
++      |> Enum.uniq()
++
++    length(identities) == length(warmers)
++  end
+ end
+diff --git a/lib/cachex/services/incubator.ex b/lib/cachex/services/incubator.ex
+index 3454c82..5490fb6 100644
+--- a/lib/cachex/services/incubator.ex
++++ b/lib/cachex/services/incubator.ex
+@@ -8,6 +8,9 @@ defmodule Cachex.Services.Incubator do
+   """
+   import Cachex.Spec
+ 
++  # add some aliases
++  alias Cachex.Services
++
+   ##############
+   # Public API #
+   ##############
+@@ -29,14 +32,66 @@ defmodule Cachex.Services.Incubator do
+     |> Supervisor.start_link(strategy: :one_for_one)
+   end
+ 
++  @doc """
++  Returns the running warmer processes associated with a cache.
++
++  Processes are returned inside a Map keyed by the identity of the warmer
++  they were started from; that is, the name of the warmer when it has one,
++  or the module of the warmer when it's unnamed. An empty Map is returned
++  when the cache has no running warmers.
++
++  Looking processes up this way (rather than by registration) allows for
++  unnamed warmers to be built from the same module several times, and also
++  ensures that restarted warmers can still be reached by callers.
++  """
++  @spec processes(Cachex.Spec.cache()) :: %{atom() => pid()}
++  def processes(cache() = cache) do
++    case Services.locate(cache, __MODULE__) do
++      nil ->
++        %{}
++
++      parent ->
++        parent
++        |> Supervisor.which_children()
++        |> Enum.flat_map(&child_pair/1)
++        |> Map.new()
++    end
++  end
++
+   ###############
+   # Private API #
+   ###############
+ 
+-  # Generates a Supervisor specification for a hook.
+-  defp spec(warmer(module: module) = warmer, cache),
+-    do: %{
+-      id: module,
+-      start: {GenServer, :start_link, [module, {cache, warmer}, [name: module]]}
++  # Extracts an {id, pid} pair from a supervisor child specification,
++  # ignoring any children which do not currently have a process.
++  defp child_pair({id, pid, _type, _modules}) when is_pid(pid),
++    do: [{id, pid}]
++
++  defp child_pair(_child),
++    do: []
++
++  # Generates a Supervisor specification for a warmer.
++  #
++  # Warmers are identified inside the supervision tree by their identity,
++  # which is their name when they have one and their module when they do
++  # not. Only named warmers are registered, and only under their name;
++  # unnamed warmers are left unregistered so that one module can back any
++  # amount of warmers, both within a cache and across several caches.
++  defp spec(warmer() = warmer, cache) do
++    warmer(module: module, name: name) = warmer
++
++    %{
++      id: warmer_identity(warmer),
++      start: {
++        GenServer,
++        :start_link,
++        [module, {cache, warmer}, name_options(name)]
++      }
+     }
++  end
++
++  # Options to provide to the warmer process on startup. Named warmers
++  # are registered under their name, unnamed warmers are not registered.
++  defp name_options(nil), do: []
++  defp name_options(name), do: [name: name]
+ end
+diff --git a/lib/cachex/services/steward.ex b/lib/cachex/services/steward.ex
+index 439314e..9fc2992 100644
+--- a/lib/cachex/services/steward.ex
++++ b/lib/cachex/services/steward.ex
+@@ -12,6 +12,9 @@ defmodule Cachex.Services.Steward do
+   """
+   import Cachex.Spec
+ 
++  # add some aliases
++  alias Cachex.Services.Incubator
++
+   # recognised
+   @provisions [
+     :cache
+@@ -33,13 +36,17 @@ defmodule Cachex.Services.Steward do
+     cache(hooks: hooks(pre: pre_hooks, post: post_hooks)) = cache
+     cache(warmers: warmers) = cache
+ 
++    # unnamed warmers are not registered under any name, so they have to
++    # be located through the warmer supervision tree instead.
++    processes = Incubator.processes(cache)
++
+     provisioned =
+       warmers
+-      |> Enum.concat(pre_hooks)
+-      |> Enum.concat(post_hooks)
+-      |> Enum.map(&map_names/1)
++      |> Enum.map(&warmer_names(&1, processes))
++      |> Enum.concat(Enum.map(pre_hooks, &hook_names/1))
++      |> Enum.concat(Enum.map(post_hooks, &hook_names/1))
+ 
+-    for {name, mod} <- provisioned, key in mod.provisions() do
++    for {name, mod} <- provisioned, not is_nil(name), key in mod.provisions() do
+       send(name, {:cachex_provision, provision})
+     end
+   end
+@@ -49,10 +56,14 @@ defmodule Cachex.Services.Steward do
+   ##############
+ 
+   # Map a hook into the name and module tuple
+-  defp map_names(hook(name: name, module: module)),
++  defp hook_names(hook(name: name, module: module)),
+     do: {name, module}
+ 
+-  # Map a warmer into the name and module tuple
+-  defp map_names(warmer(module: module)),
+-    do: {module, module}
++  # Map a warmer into the name and module tuple.
++  #
++  # The name used here is the process which is currently running the
++  # warmer; this is `nil` when the warmer is not running, in which case
++  # no provision is sent to it at all.
++  defp warmer_names(warmer(module: module) = warmer, processes),
++    do: {processes[warmer_identity(warmer)], module}
+ end
+diff --git a/lib/cachex/spec.ex b/lib/cachex/spec.ex
+index 003a2b0..52ed19f 100644
+--- a/lib/cachex/spec.ex
++++ b/lib/cachex/spec.ex
+@@ -102,7 +102,8 @@ defmodule Cachex.Spec do
+           record(:warmer,
+             module: atom,
+             state: any,
+-            async: boolean
++            async: boolean,
++            name: atom | nil
+           )
+ 
+   ###########
+@@ -255,11 +256,18 @@ defmodule Cachex.Spec do
+   associated with `Cachex.Warmer`. A state can also be provided, which will be passed
+   to the execution callback of the provided module (which defaults to `nil`). An async
+   flag determines if initial warmup will run asynchronously cache startup.
++
++  A warmer can also be given a name, which must be an atom when provided (and defaults
++  to `nil` for an unnamed warmer). Named warmer processes are registered under their
++  name, which allows several warmers to be built from the same module by giving each
++  of them a distinct name. Unnamed warmers are not registered under any name at all,
++  so the same module can be used by several caches at the same time.
+   """
+   defrecord :warmer,
+     module: nil,
+     state: nil,
+-    async: false
++    async: false,
++    name: nil
+ 
+   ###############
+   # Record Docs #
+@@ -447,6 +455,18 @@ defmodule Cachex.Spec do
+   # Utilities #
+   #############
+ 
++  @doc """
++  Returns the identity of a warmer inside a cache.
++
++  A warmer is identified by its name when it has one, and by its module
++  when it's unnamed. This identity must be unique across all warmers of
++  a cache, and is what's used to key the warmer processes started for a
++  cache (and what's returned by `Cachex.warm/2` for each warmer).
++  """
++  @spec warmer_identity(warmer) :: atom
++  def warmer_identity(warmer(name: name, module: module)),
++    do: name || module
++
+   @doc """
+   Determines if a value is a negative integer.
+   """
+diff --git a/lib/cachex/spec/validator.ex b/lib/cachex/spec/validator.ex
+index 6f76c86..2214451 100644
+--- a/lib/cachex/spec/validator.ex
++++ b/lib/cachex/spec/validator.ex
+@@ -134,12 +134,15 @@ defmodule Cachex.Spec.Validator do
+   # Validates a warmer specification record.
+   #
+   # This will validate that the provided module correctly implements
+-  # the behaviour of `Cachex.Warmer` via function checking.
+-  def valid?(:warmer, warmer(module: module)) do
++  # the behaviour of `Cachex.Warmer` via function checking. The name
++  # of the warmer (if any) is also checked to be a valid atom; a nil
++  # name simply dictates an unnamed warmer.
++  def valid?(:warmer, warmer(module: module, name: name)) do
+     check1 = behaviour?(module, Cachex.Warmer)
+     check2 = check1 and {:interval, 0} in module.__info__(:functions)
+     check3 = check2 and {:execute, 1} in module.__info__(:functions)
+-    check3
++    check4 = check3 and nillable?(name, &is_atom/1)
++    check4
+   end
+ 
+   # Catch-all for invalid records.
+diff --git a/lib/cachex/warmer.ex b/lib/cachex/warmer.ex
+index 7436c7c..ea030c1 100644
+--- a/lib/cachex/warmer.ex
++++ b/lib/cachex/warmer.ex
+@@ -15,6 +15,13 @@ defmodule Cachex.Warmer do
+   Warmers are fired on a schedule, and are exposed via a very simple behaviour of
+   just an interval and a block to execute on the interval. It should be noted that
+   this is a moving interval, and it resets after execution has completed.
++
++  Warmers are unnamed by default, and unnamed warmers are not registered under any
++  name; this means a single warmer module may back any amount of warmers, whether
++  inside one cache or across several of them. Providing a `:name` inside a warmer
++  record registers that warmer process under the given name, which is what makes it
++  possible to tell two warmers built from the same module apart. Please see the
++  `Cachex.Spec.warmer/1` documentation for further information.
+   """
+ 
+   #############
+diff --git a/test/cachex/actions/warm_test.exs b/test/cachex/actions/warm_test.exs
+index 517cff6..7ed1c50 100644
+--- a/test/cachex/actions/warm_test.exs
++++ b/test/cachex/actions/warm_test.exs
+@@ -67,4 +67,287 @@ defmodule Cachex.Actions.WarmTest do
+     # check that our key has been put back
+     assert Cachex.get!(cache, 1) == 1
+   end
++
++  # Warmers can be named, in which case they're reported by their name rather
++  # than by their module. Selection can be made by either name or module, and
++  # entries which match nothing are simply ignored.
++  test "manually warming named warmers" do
++    # create a test warmer to pass to the cache
++    Helper.create_warmer(:manual_named_warmer, :timer.hours(1), fn state ->
++      {:ok, [{state, state}]}
++    end)
++
++    # create a cache with two named warmers, and one unnamed warmer, all of
++    # them built from the same module
++    cache =
++      Helper.create_cache(
++        warmers: [
++          named_warmer(:manual_named_warmer, :manual_named_warmer1, :first),
++          named_warmer(:manual_named_warmer, :manual_named_warmer2, :second),
++          warmer(module: :manual_named_warmer, state: :third)
++        ]
++      )
++
++    # all warmers should have warmed on startup
++    assert Cachex.get!(cache, :first) == :first
++    assert Cachex.get!(cache, :second) == :second
++    assert Cachex.get!(cache, :third) == :third
++
++    # warming every warmer reports them in the order they were configured
++    assert Cachex.warm(cache) ==
++             {:ok,
++              [
++                :manual_named_warmer1,
++                :manual_named_warmer2,
++                :manual_named_warmer
++              ]}
++
++    # warming by name only triggers the warmer of that name
++    assert Cachex.warm(cache, only: [:manual_named_warmer2]) ==
++             {:ok, [:manual_named_warmer2]}
++
++    # warming by module triggers every warmer built from that module
++    assert Cachex.warm(cache, only: [:manual_named_warmer]) ==
++             {:ok,
++              [
++                :manual_named_warmer1,
++                :manual_named_warmer2,
++                :manual_named_warmer
++              ]}
++
++    # warmers matched by several entries are only triggered once, and the
++    # result always follows the configuration order of the cache
++    assert Cachex.warm(cache,
++             only: [
++               :manual_named_warmer2,
++               :manual_named_warmer,
++               :manual_named_warmer1
++             ]
++           ) ==
++             {:ok,
++              [
++                :manual_named_warmer1,
++                :manual_named_warmer2,
++                :manual_named_warmer
++              ]}
++
++    # entries which match no warmer are ignored
++    assert Cachex.warm(cache, only: [:missing_warmer]) == {:ok, []}
++    assert Cachex.warm(cache, only: []) == {:ok, []}
++
++    # the only option takes precedence over the modules alias
++    assert Cachex.warm(cache,
++             only: [],
++             modules: [:manual_named_warmer]
++           ) == {:ok, []}
++
++    # only the selected warmers should have written their values
++    assert Cachex.clear!(cache) == 3
++
++    assert Cachex.warm(cache, only: [:manual_named_warmer2]) ==
++             {:ok, [:manual_named_warmer2]}
++
++    # wait for the warming
++    :timer.sleep(50)
++
++    assert Cachex.get!(cache, :first) == nil
++    assert Cachex.get!(cache, :second) == :second
++    assert Cachex.get!(cache, :third) == nil
++  end
++
++  # Providing the wait option should block the call until all selected warmers
++  # have finished executing, and written their values into the cache.
++  test "manually warming a cache while waiting" do
++    # create a test warmer to pass to the cache
++    Helper.create_warmer(:waiting_warmer, :timer.hours(1), fn _ ->
++      :timer.sleep(300)
++      {:ok, [{1, 1}]}
++    end)
++
++    # create a cache instance with a warmer, blocking on the startup run
++    cache = Helper.create_cache(warmers: [warmer(module: :waiting_warmer)])
++
++    # clean out our cache entries
++    assert Cachex.clear!(cache) == 1
++    assert Cachex.get!(cache, 1) == nil
++
++    # mark the time before the manual warming begins
++    start = System.monotonic_time(:millisecond)
++
++    # waiting should only return once the warmer has written its values
++    assert Cachex.warm(cache, wait: true) == {:ok, [:waiting_warmer]}
++
++    # the call should have waited for the warmer to execute
++    assert System.monotonic_time(:millisecond) - start >= 250
++
++    # the value should be set as soon as the call returns
++    assert Cachex.get!(cache, 1) == 1
++  end
++
++  # Warming should not wait for the warmers unless asked to; the call has to
++  # return as soon as the warmers have been triggered, even while they're still
++  # running. This warmer can only finish when the test lets it through.
++  test "manually warming a cache without waiting" do
++    # create a warmer which blocks until it's told to continue
++    Helper.create_warmer(:blocking_warmer, :timer.hours(1), fn _ ->
++      receive do
++        :continue -> {:ok, [{1, 1}]}
++      after
++        5000 -> {:ok, [{1, 1}]}
++      end
++    end)
++
++    # create a cache with a named async warmer, so the startup run is blocked
++    warmer = named_warmer(:blocking_warmer, :blocking_warmer_process, nil, true)
++    cache = Helper.create_cache(warmers: [warmer])
++
++    # the warmer cannot have finished, so the value should not be set
++    assert Cachex.get!(cache, 1) == nil
++
++    # the call should return without waiting for the warmer to execute
++    assert Cachex.warm(cache) == {:ok, [:blocking_warmer_process]}
++
++    # the warmer is still blocked, so the cache should still be empty
++    assert Cachex.get!(cache, 1) == nil
++
++    # letting the warmer through writes the warmed values
++    send(:blocking_warmer_process, :continue)
++    Helper.poll(5000, 1, fn -> Cachex.get!(cache, 1) end)
++  end
++
++  # Waiting for warmers inside a cache without any should not block, and
++  # should just return an empty result set as nothing is triggered.
++  test "manually warming a cache without warmers" do
++    # create a cache instance without any warmers
++    cache = Helper.create_cache()
++
++    # there's nothing to warm, waiting or not
++    assert Cachex.warm(cache) == {:ok, []}
++    assert Cachex.warm(cache, wait: true) == {:ok, []}
++    assert Cachex.warm(cache, only: [:missing_warmer], wait: true) == {:ok, []}
++  end
++
++  # Unnamed warmers are no longer registered under their module, so they have
++  # to be reached through the cache supervision tree. This has to keep working
++  # for warmers which have been restarted by the cache supervisor.
++  test "manually warming a restarted warmer" do
++    # create a test warmer to pass to the cache
++    Helper.create_warmer(:restarted_warmer, :timer.hours(1), fn _ ->
++      {:ok, [{1, 1}]}
++    end)
++
++    # create a cache instance with a warmer
++    cache = Helper.create_cache(warmers: [warmer(module: :restarted_warmer)])
++
++    # pull the warmer process out of the incubator
++    incubator =
++      cache
++      |> Services.Overseer.retrieve()
++      |> Services.locate(Services.Incubator)
++
++    [{_, pid, _, _}] = Supervisor.which_children(incubator)
++
++    # kill the warmer and wait for a new process to take its place
++    Process.exit(pid, :kill)
++
++    Helper.poll(1000, true, fn ->
++      case Supervisor.which_children(incubator) do
++        [{_, new_pid, _, _}] -> new_pid != pid && Process.alive?(new_pid)
++        _ -> false
++      end
++    end)
++
++    # clean out our cache entries
++    assert Cachex.clear!(cache) == 1
++    assert Cachex.get!(cache, 1) == nil
++
++    # the restarted warmer should still be reached
++    assert Cachex.warm(cache) == {:ok, [:restarted_warmer]}
++
++    # wait for the warming
++    :timer.sleep(50)
++
++    assert Cachex.get!(cache, 1) == 1
++  end
++
++  # When a warmer crashes while a call is waiting for it, the failure should
++  # be passed back through to the caller rather than being swallowed.
++  test "waiting for a crashing warmer" do
++    # create a warmer which crashes when asked to by the cache itself
++    Helper.create_warmer(:crashing_warmer, :timer.hours(1), fn cache ->
++      if Cachex.get!(cache, :crash) do
++        raise "warmer crash"
++      else
++        {:ok, [{1, 1}]}
++      end
++    end)
++
++    # grab a cache name to use as the warmer state
++    name = Helper.create_name()
++    Helper.delete_on_exit(name)
++
++    # create a cache instance with a warmer using the cache as its state
++    {:ok, _pid} =
++      Cachex.start_link(name,
++        warmers: [warmer(module: :crashing_warmer, state: name)]
++      )
++
++    # the startup warming should have succeeded
++    assert Cachex.get!(name, 1) == 1
++
++    # ask the warmer to crash on its next run
++    assert Cachex.put!(name, :crash, true)
++
++    # the crash should be raised through the waiting call
++    result =
++      try do
++        {:returned, Cachex.warm(name, wait: true)}
++      catch
++        :exit, reason -> {:exited, reason}
++      end
++
++    assert {:exited, _reason} = result
++  end
++
++  # Manual warming should be reported to hooks as any other action is, but the
++  # warming triggered at cache startup should not be reported at all.
++  test "manually warming a cache with hooks" do
++    # create a test warmer to pass to the cache
++    Helper.create_warmer(:notified_warmer, :timer.hours(1), fn _ ->
++      {:ok, [{1, 1}]}
++    end)
++
++    # create a hook to forward messages
++    hook = ForwardHook.create()
++
++    # create a cache instance with a warmer and hook
++    cache =
++      Helper.create_cache(
++        hooks: [hook],
++        warmers: [warmer(module: :notified_warmer)]
++      )
++
++    # the values written by the startup warmer should be notified
++    assert_receive({{:put_many, [[{1, 1}], []]}, {:ok, true}}, 5000)
++
++    # ... but the startup warming itself should not be
++    refute_receive({:warm, _}, 100)
++
++    # manually warming should notify hooks of the action and the result
++    assert Cachex.warm(cache, only: [:notified_warmer]) ==
++             {:ok, [:notified_warmer]}
++
++    assert_receive(
++      {{:warm, [[only: [:notified_warmer]]]}, {:ok, [:notified_warmer]}},
++      5000
++    )
++  end
++
++  # Builds a warmer record with the given module, name, state and async flag.
++  #
++  # Warmer records are built by hand here as tuples so that this test file
++  # also compiles against spec definitions which do not provide a `:name`
++  # key inside warmer records.
++  defp named_warmer(module, name, state \\ nil, async \\ false),
++    do: {:warmer, module, state, async, name}
+ end
+diff --git a/test/cachex/options_test.exs b/test/cachex/options_test.exs
+index 5c36f6a..ec604d7 100644
+--- a/test/cachex/options_test.exs
++++ b/test/cachex/options_test.exs
+@@ -425,6 +425,82 @@ defmodule Cachex.OptionsTest do
+     assert results4 == {:error, :invalid_warmer}
+   end
+ 
++  # Warmer records also carry a name, which has to be an atom when provided.
++  # Names are what allow several warmers to be built from the same module,
++  # so long as each of them has a distinct name.
++  test "parsing :warmers flags with names" do
++    # grab a cache name
++    name = Helper.create_name()
++
++    # define our warmers to pass through to the cache
++    Helper.create_warmer(:options_named_warmer1, 50, fn _ ->
++      :ignore
++    end)
++
++    Helper.create_warmer(:options_named_warmer2, 50, fn _ ->
++      :ignore
++    end)
++
++    # unnamed warmers are parsed as they always were
++    {:ok, cache(warmers: unnamed)} =
++      Cachex.Options.parse(name,
++        warmers: warmer(module: :options_named_warmer1)
++      )
++
++    assert unnamed == [warmer(module: :options_named_warmer1)]
++
++    # named warmers keep their names
++    {:ok, cache(warmers: named)} =
++      Cachex.Options.parse(name,
++        warmers: named_warmer(:options_named_warmer1, :warmer_name)
++      )
++
++    assert named == [named_warmer(:options_named_warmer1, :warmer_name)]
++
++    # a name which isn't an atom is invalid
++    assert Cachex.Options.parse(name,
++             warmers: named_warmer(:options_named_warmer1, "warmer_name")
++           ) == {:error, :invalid_warmer}
++
++    # several warmers can share a module when they have distinct names
++    {:ok, cache(warmers: shared)} =
++      Cachex.Options.parse(name,
++        warmers: [
++          named_warmer(:options_named_warmer1, :warmer_name1),
++          named_warmer(:options_named_warmer1, :warmer_name2)
++        ]
++      )
++
++    assert shared == [
++             named_warmer(:options_named_warmer1, :warmer_name1),
++             named_warmer(:options_named_warmer1, :warmer_name2)
++           ]
++
++    # warmers may not share a name, even when they use different modules
++    assert Cachex.Options.parse(name,
++             warmers: [
++               named_warmer(:options_named_warmer1, :warmer_name),
++               named_warmer(:options_named_warmer2, :warmer_name)
++             ]
++           ) == {:error, :invalid_warmer}
++
++    # unnamed warmers may not share a module either
++    assert Cachex.Options.parse(name,
++             warmers: [
++               warmer(module: :options_named_warmer1),
++               warmer(module: :options_named_warmer1)
++             ]
++           ) == {:error, :invalid_warmer}
++
++    # an unnamed warmer module may not clash with another warmer name
++    assert Cachex.Options.parse(name,
++             warmers: [
++               named_warmer(:options_named_warmer1, :options_named_warmer2),
++               warmer(module: :options_named_warmer2)
++             ]
++           ) == {:error, :invalid_warmer}
++  end
++
+   # This test simply validates the ability to retrieve and transform an option
+   # from inside a Keyword List. We validate both existing and missing options in
+   # order to make sure there are no issues when retrieving. We also verify the
+@@ -444,4 +520,12 @@ defmodule Cachex.OptionsTest do
+     assert(result1 == {"value"})
+     assert(result2 == {nil})
+   end
++
++  # Builds a warmer record with the given module and name.
++  #
++  # Warmer records are built by hand here as tuples so that this test file
++  # also compiles against spec definitions which do not provide a `:name`
++  # key inside warmer records.
++  defp named_warmer(module, name),
++    do: {:warmer, module, nil, false, name}
+ end
+diff --git a/test/cachex/spec/validator_test.exs b/test/cachex/spec/validator_test.exs
+index fe7908c..1c9aec5 100644
+--- a/test/cachex/spec/validator_test.exs
++++ b/test/cachex/spec/validator_test.exs
+@@ -224,4 +224,51 @@ defmodule Cachex.Spec.ValidatorTest do
+     refute Validator.valid?(:warmer, warmer2)
+     refute Validator.valid?(:warmer, warmer3)
+   end
++
++  # Warmer names are validated as part of the warmer record itself; they must
++  # always be atoms, with `nil` being used to dictate an unnamed warmer.
++  test "validation of warmer names" do
++    # create a warmer for validation
++    Helper.create_warmer(:validator_name_warmer, 1000, fn _ ->
++      :ignore
++    end)
++
++    # a missing name is just an unnamed warmer, atoms are valid names
++    assert Validator.valid?(:warmer, named_warmer(:validator_name_warmer, nil))
++
++    assert Validator.valid?(
++             :warmer,
++             named_warmer(:validator_name_warmer, :name)
++           )
++
++    # anything which isn't an atom is an invalid name
++    refute Validator.valid?(
++             :warmer,
++             named_warmer(:validator_name_warmer, "name")
++           )
++
++    refute Validator.valid?(:warmer, named_warmer(:validator_name_warmer, 1))
++    refute Validator.valid?(:warmer, named_warmer(:validator_name_warmer, [1]))
++
++    refute Validator.valid?(
++             :warmer,
++             named_warmer(:validator_name_warmer, {:global, :name})
++           )
++
++    refute Validator.valid?(
++             :warmer,
++             named_warmer(:validator_name_warmer, {:via, Registry, {R, :name}})
++           )
++
++    # a valid name does not excuse an invalid module
++    refute Validator.valid?(:warmer, named_warmer(__MODULE__, :name))
++  end
++
++  # Builds a warmer record with the given module and name.
++  #
++  # Warmer records are built by hand here as tuples so that this test file
++  # also compiles against spec definitions which do not provide a `:name`
++  # key inside warmer records.
++  defp named_warmer(module, name),
++    do: {:warmer, module, nil, false, name}
+ end
+diff --git a/test/cachex/warmer_test.exs b/test/cachex/warmer_test.exs
+index 3dfbd8c..8ea0bad 100644
+--- a/test/cachex/warmer_test.exs
++++ b/test/cachex/warmer_test.exs
+@@ -104,4 +104,104 @@ defmodule Cachex.WarmerTest do
+     assert_receive({{:put_many, [[{1, 1}], []]}, {:ok, true}})
+     assert_receive({{:put_many, [[{2, 2}], []]}, {:ok, true}})
+   end
++
++  # Warmers can be given a name; doing so registers the warmer process under
++  # that name instead of leaving it unregistered. This is what allows several
++  # warmers to be built from a single module, each with their own state.
++  test "warmers with names" do
++    # create a test warmer to pass to the cache
++    Helper.create_warmer(:named_warmer, 15000, fn state ->
++      {:ok, [{state, state}]}
++    end)
++
++    # create a cache with two warmers using the same module
++    cache =
++      Helper.create_cache(
++        warmers: [
++          named_warmer(:named_warmer, :named_warmer1, :first),
++          named_warmer(:named_warmer, :named_warmer2, :second)
++        ]
++      )
++
++    # both warmers should have warmed at startup
++    assert Cachex.get!(cache, :first) == :first
++    assert Cachex.get!(cache, :second) == :second
++
++    # each warmer should be registered under its own name
++    pid1 = Process.whereis(:named_warmer1)
++    pid2 = Process.whereis(:named_warmer2)
++    assert is_pid(pid1)
++    assert is_pid(pid2)
++    assert pid1 != pid2
++
++    # the module should not be registered at all
++    assert Process.whereis(:named_warmer) == nil
++  end
++
++  # Named warmers should obey the async flag exactly as unnamed warmers do;
++  # they only block startup until they've finished their first run.
++  test "named warmers which aren't blocking" do
++    # create a test warmer to pass to the cache
++    Helper.create_warmer(:named_async_warmer, 50, fn _ ->
++      :timer.sleep(3000)
++      {:ok, [{1, 1}]}
++    end)
++
++    # create a cache instance with a warmer
++    warmer = named_warmer(:named_async_warmer, :named_async_warmer, nil, true)
++    cache = Helper.create_cache(warmers: [warmer])
++
++    # check that the key was not warmed
++    assert Cachex.get!(cache, 1) == nil
++  end
++
++  # Unnamed warmers are not registered under their module, so the same warmer
++  # module should be usable by several caches at the same time.
++  test "the same warmer module across caches" do
++    # create a test warmer to pass to the cache
++    Helper.create_warmer(:shared_warmer, 15000, fn _ ->
++      {:ok, [{1, 1}]}
++    end)
++
++    # create two caches using the same warmer
++    warmer = warmer(module: :shared_warmer)
++    cache1 = Helper.create_cache(warmers: [warmer])
++    cache2 = Helper.create_cache(warmers: [warmer])
++
++    # both caches should have been warmed
++    assert Cachex.get!(cache1, 1) == 1
++    assert Cachex.get!(cache2, 1) == 1
++
++    # the warmer module should not be registered by either cache
++    assert Process.whereis(:shared_warmer) == nil
++  end
++
++  # Named warmers still have to be provisioned with the cache state in order
++  # to be able to trigger hooks while they're executing.
++  test "triggering cache hooks from within named warmers" do
++    # create a test warmer to pass to the cache
++    Helper.create_warmer(:named_hook_warmer, 15000, fn _ ->
++      {:ok, [{1, 1}]}
++    end)
++
++    # create a hook to forward messages
++    hook = ForwardHook.create()
++
++    # create a cache instance with a warmer and hook
++    Helper.create_cache(
++      hooks: [hook],
++      warmers: [named_warmer(:named_hook_warmer, :named_hook_warmer_process)]
++    )
++
++    # ensure that we receive the creation of the warmer entry
++    assert_receive({{:put_many, [[{1, 1}], []]}, {:ok, true}}, 5000)
++  end
++
++  # Builds a warmer record with the given module, name, state and async flag.
++  #
++  # Warmer records are built by hand here as tuples so that this test file
++  # also compiles against spec definitions which do not provide a `:name`
++  # key inside warmer records.
++  defp named_warmer(module, name, state \\ nil, async \\ false),
++    do: {:warmer, module, state, async, name}
+ end
+diff --git a/test/cachex_test.exs b/test/cachex_test.exs
+index 79d5d0d..e8b8664 100644
+--- a/test/cachex_test.exs
++++ b/test/cachex_test.exs
+@@ -120,6 +120,124 @@ defmodule CachexTest do
+     assert(reason == :invalid_hook)
+   end
+ 
++  # Warmers must have a valid name when they provide one, and every warmer
++  # inside a cache must have a unique identity. An identity is the name of a
++  # warmer when it has one, and the module of the warmer otherwise.
++  test "cache start with invalid warmer names" do
++    # create the warmers to pass through to the cache
++    Helper.create_warmer(:invalid_warmer1, 50, fn _ ->
++      :ignore
++    end)
++
++    Helper.create_warmer(:invalid_warmer2, 50, fn _ ->
++      :ignore
++    end)
++
++    # grab a name
++    name = Helper.create_name()
++
++    # cleanup on exit (just in case)
++    Helper.delete_on_exit(name)
++
++    # names which are not atoms should be rejected
++    for invalid <- [
++          "warmer",
++          1,
++          [1],
++          {:global, :warmer},
++          {:via, Registry, {R, :warmer}}
++        ] do
++      {:error, reason} =
++        Cachex.start_link(name,
++          warmers: [named_warmer(:invalid_warmer1, invalid)]
++        )
++
++      assert reason == :invalid_warmer
++    end
++
++    # warmers should not be able to share a name
++    {:error, reason1} =
++      Cachex.start_link(name,
++        warmers: [
++          named_warmer(:invalid_warmer1, :shared_warmer_name),
++          named_warmer(:invalid_warmer2, :shared_warmer_name)
++        ]
++      )
++
++    # ... or a module when they're unnamed
++    {:error, reason2} =
++      Cachex.start_link(name,
++        warmers: [
++          warmer(module: :invalid_warmer1),
++          warmer(module: :invalid_warmer1)
++        ]
++      )
++
++    # ... or have an unnamed module clash with another warmer name
++    {:error, reason3} =
++      Cachex.start_link(name,
++        warmers: [
++          named_warmer(:invalid_warmer1, :invalid_warmer2),
++          warmer(module: :invalid_warmer2)
++        ]
++      )
++
++    # all should've been rejected as invalid warmers
++    assert reason1 == :invalid_warmer
++    assert reason2 == :invalid_warmer
++    assert reason3 == :invalid_warmer
++
++    # no cache should have started, nor should any warmer have been started
++    assert Process.whereis(name) == nil
++    assert Process.whereis(:shared_warmer_name) == nil
++    assert Process.whereis(:invalid_warmer1) == nil
++    assert Process.whereis(:invalid_warmer2) == nil
++  end
++
++  # Warmers with a name are registered under it, so a name which is already in
++  # use by another process should stop the cache from starting entirely.
++  test "cache start with a warmer name already in use" do
++    # create the warmer to pass through to the cache
++    Helper.create_warmer(:taken_warmer, 50, fn _ ->
++      :ignore
++    end)
++
++    # grab a name
++    name = Helper.create_name()
++
++    # cleanup on exit (just in case)
++    Helper.delete_on_exit(name)
++
++    # start a process to take the warmer name
++    {:ok, pid} =
++      Agent.start_link(fn -> nil end, name: :taken_warmer_name)
++
++    # the name should be held by our process
++    assert Process.whereis(:taken_warmer_name) == pid
++
++    # the cache should not be able to start with the name in use; trapping
++    # exits here allows the failure to be caught rather than propagated
++    Process.flag(:trap_exit, true)
++
++    try do
++      Cachex.start_link(name,
++        warmers: [named_warmer(:taken_warmer, :taken_warmer_name)]
++      )
++    catch
++      _kind, _reason -> :ok
++    end
++
++    # neither the cache should have started, nor the name been released
++    assert Process.whereis(name) == nil
++    assert Process.whereis(:taken_warmer_name) == pid
++
++    # stop trapping exits for the rest of the test
++    Process.flag(:trap_exit, false)
++
++    # cleanup the process holding the name
++    assert Agent.stop(pid) == :ok
++  end
++
+   # Naturally starting a cache when a cache already exists with the same name will
+   # cause an issue, so this test is just ensuring that we handle it gracefully
+   # by returning a small atom error saying that the cache name already exists.
+@@ -218,4 +336,12 @@ defmodule CachexTest do
+       end)
+     end)
+   end
++
++  # Builds a warmer record with the given module, name, state and async flag.
++  #
++  # Warmer records are built by hand here as tuples so that this test file
++  # also compiles against spec definitions which do not provide a `:name`
++  # key inside warmer records.
++  defp named_warmer(module, name, state \\ nil, async \\ false),
++    do: {:warmer, module, state, async, name}
+ end

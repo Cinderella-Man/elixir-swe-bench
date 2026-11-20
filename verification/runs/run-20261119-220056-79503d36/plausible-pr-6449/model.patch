@@ -1,0 +1,328 @@
+diff --git a/lib/plausible_web/live/shared_link_settings/form.ex b/lib/plausible_web/live/shared_link_settings/form.ex
+index 0adf0c1..58d1620 100644
+--- a/lib/plausible_web/live/shared_link_settings/form.ex
++++ b/lib/plausible_web/live/shared_link_settings/form.ex
+@@ -5,9 +5,13 @@ defmodule PlausibleWeb.Live.SharedLinkSettings.Form do
+   use PlausibleWeb, :live_component
+   use Plausible
+ 
++  alias Plausible.Segments
+   alias Plausible.Sites
+   alias PlausibleWeb.Live.Components.ComboBox
+ 
++  # Segment IDs are bigserials in Postgres - anything larger cannot be a valid ID
++  @max_segment_id 9_223_372_036_854_775_807
++
+   def update(assigns, socket) do
+     form =
+       (assigns.shared_link || %Plausible.Site.SharedLink{})
+@@ -183,7 +187,7 @@ defmodule PlausibleWeb.Live.SharedLinkSettings.Form do
+       ) do
+     case Sites.create_shared_link(socket.assigns.site, shared_link_params["name"],
+            password: shared_link_params["password"],
+-           segment_id: shared_link_params["segment_id"]
++           segment_id: resolve_segment_id(socket.assigns.site, shared_link_params["segment_id"])
+          ) do
+       {:ok, shared_link} ->
+         socket = socket.assigns.on_save_shared_link.(shared_link, socket)
+@@ -206,10 +210,21 @@ defmodule PlausibleWeb.Live.SharedLinkSettings.Form do
+         %{"shared_link" => shared_link_params},
+         %{assigns: %{shared_link: %Plausible.Site.SharedLink{} = shared_link}} = socket
+       ) do
++    # The slug is the secret part of the shared link URL and is never updatable
++    # via the form. The segment selection is untrusted and has to be validated
++    # against the segments of the link's own site.
++    params =
++      shared_link_params
++      |> Map.take(["name", "password"])
++      |> Map.put(
++        "segment_id",
++        resolve_segment_id(socket.assigns.site, shared_link_params["segment_id"])
++      )
++
+     changeset =
+       Plausible.Site.SharedLink.changeset(
+         shared_link,
+-        shared_link_params
++        params
+       )
+ 
+     case Plausible.Repo.update(changeset) do
+@@ -221,4 +236,36 @@ defmodule PlausibleWeb.Live.SharedLinkSettings.Form do
+         {:noreply, assign(socket, form: to_form(changeset))}
+     end
+   end
++
++  # Only segments belonging to the site of the shared link may be attached to it.
++  # Empty, malformed, non-existent or foreign segment selections are saved as
++  # "no segment" rather than failing the whole submission.
++  defp resolve_segment_id(site, segment_selection) do
++    case parse_segment_id(segment_selection) do
++      nil -> nil
++      segment_id -> if site_segment?(site, segment_id), do: segment_id, else: nil
++    end
++  end
++
++  defp parse_segment_id(segment_id) when is_integer(segment_id) and segment_id > 0,
++    do: maybe_segment_id(segment_id)
++
++  defp parse_segment_id(segment_id) when is_binary(segment_id) do
++    case Integer.parse(segment_id) do
++      {parsed, ""} when parsed > 0 -> maybe_segment_id(parsed)
++      _ -> nil
++    end
++  end
++
++  defp parse_segment_id(_segment_selection), do: nil
++
++  defp maybe_segment_id(segment_id) when segment_id <= @max_segment_id, do: segment_id
++  defp maybe_segment_id(_segment_id), do: nil
++
++  defp site_segment?(%Plausible.Site{} = site, segment_id) do
++    case Segments.get_many(site, [segment_id], []) do
++      {:ok, [_ | _]} -> true
++      {:ok, []} -> false
++    end
++  end
+ end
+diff --git a/test/plausible_web/live/shared_link_settings/form_test.exs b/test/plausible_web/live/shared_link_settings/form_test.exs
+index 04b5a80..63b142e 100644
+--- a/test/plausible_web/live/shared_link_settings/form_test.exs
++++ b/test/plausible_web/live/shared_link_settings/form_test.exs
+@@ -281,6 +281,236 @@ defmodule PlausibleWeb.Live.SharedLinkSettings.FormTest do
+       assert html =~ "New shared link" or
+                html =~ "Your current subscription plan does not include Shared Links"
+     end
++
++    test "does not change the secret url slug when editing a shared link", %{
++      conn: conn,
++      site: site,
++      session: session
++    } do
++      shared_link = insert(:shared_link, site: site, name: "Original Name")
++
++      lv = get_liveview(conn, session)
++
++      lv
++      |> element(~s/button[phx-click="edit-shared-link"][phx-value-slug="#{shared_link.slug}"]/)
++      |> render_click()
++
++      lv
++      |> find_form()
++      |> render_submit(%{shared_link: %{name: "Updated Name", slug: "overwritten-slug"}})
++
++      html = render(lv)
++      assert html =~ "Updated Name"
++      assert html =~ "Shared link saved"
++      refute html =~ "auth=overwritten-slug"
++
++      updated = Plausible.Repo.get!(Plausible.Site.SharedLink, shared_link.id)
++      assert updated.name == "Updated Name"
++      assert updated.slug == shared_link.slug
++    end
++
++    test "creates a shared link with no segment when the segment belongs to another site", %{
++      conn: conn,
++      site: site,
++      session: session
++    } do
++      other_site = insert(:site)
++      other_segment = insert(:segment, type: :site, site: other_site, name: "Other segment")
++
++      lv = get_liveview(conn, session)
++
++      lv |> element("button#add-shared-link-button") |> render_click()
++
++      lv
++      |> find_form()
++      |> render_submit(%{
++        shared_link: %{name: "Cross-site segment link", segment_id: other_segment.id}
++      })
++
++      html = render(lv)
++      assert html =~ "Shared link saved"
++
++      shared_link =
++        Plausible.Repo.get_by!(Plausible.Site.SharedLink,
++          name: "Cross-site segment link",
++          site_id: site.id
++        )
++
++      assert shared_link.segment_id == nil
++    end
++
++    test "creates a shared link with no segment when the segment does not exist", %{
++      conn: conn,
++      site: site,
++      session: session
++    } do
++      lv = get_liveview(conn, session)
++
++      lv |> element("button#add-shared-link-button") |> render_click()
++
++      lv
++      |> find_form()
++      |> render_submit(%{shared_link: %{name: "Nonexistent segment link", segment_id: 999_999}})
++
++      html = render(lv)
++      assert html =~ "Shared link saved"
++
++      shared_link =
++        Plausible.Repo.get_by!(Plausible.Site.SharedLink,
++          name: "Nonexistent segment link",
++          site_id: site.id
++        )
++
++      assert shared_link.segment_id == nil
++    end
++
++    @invalid_segment_selections [
++      {"an empty selection", ""},
++      {"a non-numeric selection", "not-a-segment-id"},
++      {"a partly numeric selection", "123abc"},
++      {"a negative selection", "-123"},
++      {"a number too large to be a segment id", "99999999999999999999"},
++      {"a list rather than a single id", ["1"]},
++      {"a map rather than a single id", %{"id" => 1}}
++    ]
++
++    test "creates a shared link with no segment for a malformed segment selection", %{
++      conn: conn,
++      site: site,
++      session: session
++    } do
++      segment = insert(:segment, type: :site, site: site, name: "Scandinavia")
++
++      for {label, segment_id} <- @invalid_segment_selections do
++        lv = get_liveview(conn, session)
++
++        lv |> element("button#add-shared-link-button") |> render_click()
++
++        lv
++        |> find_form()
++        |> render_submit(%{
++          shared_link: %{name: "Link with #{label}", segment_id: segment_id}
++        })
++
++        html = render(lv)
++
++        assert html =~ "Shared link saved",
++               "expected link to be saved without a segment for #{label}"
++
++        shared_link =
++          Plausible.Repo.get_by!(Plausible.Site.SharedLink,
++            name: "Link with #{label}",
++            site_id: site.id
++          )
++
++        assert shared_link.segment_id == nil,
++               "expected #{label} of segment #{segment.id} to be ignored"
++      end
++    end
++
++    test "edits a shared link and clears its segment for an invalid segment selection",
++         %{
++           conn: conn,
++           site: site,
++           session: session
++         } do
++      segment = insert(:segment, type: :site, site: site, name: "Scandinavia")
++      other_site = insert(:site)
++      other_segment = insert(:segment, type: :site, site: other_site, name: "Other segment")
++
++      invalid_selections =
++        @invalid_segment_selections ++
++          [{"a nonexistent segment", 999_999}, {"a foreign site segment", other_segment.id}]
++
++      for {label, segment_id} <- invalid_selections do
++        shared_link =
++          insert(:shared_link, site: site, name: "Original name #{label}", segment: segment)
++
++        lv = get_liveview(conn, session)
++
++        lv
++        |> element(~s/button[phx-click="edit-shared-link"][phx-value-slug="#{shared_link.slug}"]/)
++        |> render_click()
++
++        lv
++        |> find_form()
++        |> render_submit(%{shared_link: %{name: "New name #{label}", segment_id: segment_id}})
++
++        html = render(lv)
++
++        assert html =~ "Shared link saved", "expected save for #{label}"
++        refute html =~ "Original name #{label}", "expected rename for #{label}"
++
++        updated = Plausible.Repo.get!(Plausible.Site.SharedLink, shared_link.id)
++
++        assert updated.name == "New name #{label}", "expected rename for #{label}"
++        assert updated.slug == shared_link.slug, "expected slug to stay put for #{label}"
++
++        assert updated.segment_id == nil,
++               "expected #{label} of segment #{segment.id} to clear the segment"
++      end
++    end
++
++    test "editing a shared link keeps a valid segment of the same site", %{
++      conn: conn,
++      site: site,
++      session: session
++    } do
++      segment = insert(:segment, type: :site, site: site, name: "Scandinavia")
++      shared_link = insert(:shared_link, site: site, name: "Existing Link", segment: segment)
++
++      lv = get_liveview(conn, session)
++
++      lv
++      |> element(~s/button[phx-click="edit-shared-link"][phx-value-slug="#{shared_link.slug}"]/)
++      |> render_click()
++
++      lv
++      |> find_form()
++      |> render_submit(%{shared_link: %{name: "Renamed Link", segment_id: segment.id}})
++
++      html = render(lv)
++      assert html =~ "Renamed Link"
++      assert html =~ "Shared link saved"
++
++      updated = Plausible.Repo.get!(Plausible.Site.SharedLink, shared_link.id)
++      assert updated.name == "Renamed Link"
++      assert updated.segment_id == segment.id
++      assert updated.slug == shared_link.slug
++    end
++
++    test "editing a shared link keeps a segment that was made personal after being linked", %{
++      conn: conn,
++      site: site,
++      user: user,
++      session: session
++    } do
++      segment = insert(:segment, type: :site, site: site, name: "Scandinavia", owner_id: user.id)
++      shared_link = insert(:shared_link, site: site, name: "Existing Link", segment: segment)
++
++      # the site segment is later turned into a personal one
++      segment
++      |> Ecto.Changeset.change(type: :personal)
++      |> Plausible.Repo.update!()
++
++      lv = get_liveview(conn, session)
++
++      lv
++      |> element(~s/button[phx-click="edit-shared-link"][phx-value-slug="#{shared_link.slug}"]/)
++      |> render_click()
++
++      lv
++      |> find_form()
++      |> render_submit(%{shared_link: %{name: "Renamed Link"}})
++
++      html = render(lv)
++      assert html =~ "Renamed Link"
++      assert html =~ "Shared link saved"
++
++      updated = Plausible.Repo.get!(Plausible.Site.SharedLink, shared_link.id)
++      assert updated.name == "Renamed Link"
++      assert updated.segment_id == segment.id
++    end
+   end
+ 
+   defp get_liveview(conn, session) do
