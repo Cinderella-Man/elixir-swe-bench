@@ -1,0 +1,197 @@
+diff --git a/lib/plausible/application.ex b/lib/plausible/application.ex
+index 2bae31a..0fc99be 100644
+--- a/lib/plausible/application.ex
++++ b/lib/plausible/application.ex
+@@ -164,7 +164,7 @@ defmodule Plausible.Application do
+           adapter_opts: [
+             n_lock_partitions: 1,
+             ttl_check_interval: false,
+-            ets_options: [:bag, read_concurrency: true]
++            ets_options: [read_concurrency: true]
+           ],
+           warmers: [
+             refresh_all:
+diff --git a/test/plausible_web/plugs/tracker_plug_test.exs b/test/plausible_web/plugs/tracker_plug_test.exs
+index 488b5b2..67d052a 100644
+--- a/test/plausible_web/plugs/tracker_plug_test.exs
++++ b/test/plausible_web/plugs/tracker_plug_test.exs
+@@ -15,8 +15,10 @@ defmodule PlausibleWeb.TrackerPlugTest do
+   """
+   use PlausibleWeb.ConnCase, async: true
+   import Plug.Test
++  import Ecto.Query
+ 
+   alias PlausibleWeb.Tracker
++  alias PlausibleWeb.TrackerScriptCache
+ 
+   describe "plausible-web.js" do
+     @example_config %{
+@@ -127,6 +129,168 @@ defmodule PlausibleWeb.TrackerPlugTest do
+     end
+   end
+ 
++  describe "dedicated tracker script with the application cache enabled" do
++    # Regression tests for the self-hosted (Community Edition) tracker script cache.
++    #
++    # On a running CE instance `Plausible.Cache` is enabled, so the dedicated script at
++    # `/js/<tracker script configuration id>.js` is served from the `:tracker_script_cache`
++    # ConCache (see `PlausibleWeb.TrackerScriptCache`) instead of the database.
++    #
++    # The cache must always hold exactly one, up-to-date script per configuration id:
++    #
++    #   * right after the configuration is created,
++    #   * after every subsequent update (including back-and-forth changes), and
++    #   * after a periodic cache refresh, including when the configuration was changed
++    #     directly in the database or by another node (no broadcast happened).
++    #
++    # Reading the cache is forced with `force?: true`, which runs the exact same code
++    # path as when the cache is enabled (`Plausible.Cache.Adapter.get/2`), without having
++    # to flip the process-wide `Plausible.Cache` enabled flag that other (async) tests
++    # rely on being disabled.
++
++    @base_config %{
++      installation_type: "manual",
++      track_404_pages: false,
++      hash_based_routing: false,
++      file_downloads: false,
++      outbound_links: false,
++      pageview_props: false,
++      tagged_events: false,
++      revenue_tracking: false,
++      form_submissions: false
++    }
++
++    test "stays current across creation, updates, and cache refreshes", %{conn: conn} do
++      # The cache process must be running with the production configuration
++      # (as it is on a running Community Edition instance).
++      assert is_pid(Process.whereis(TrackerScriptCache.name())),
++             "expected the application tracker script cache process to be running"
++
++      site = new_site()
++      other_site = new_site()
++
++      config = update_configuration(site, @base_config)
++      other_config = update_configuration(other_site, @base_config)
++
++      # 1. Right after creation the cached script exists and belongs to the site.
++      script = wait_for_script(config.id, ["domain:\"#{site.domain}\""])
++
++      assert is_binary(script),
++             "expected a single cached script after creation, got: #{truncate(script)}"
++
++      other_script = wait_for_script(other_config.id, ["domain:\"#{other_site.domain}\""])
++      assert is_binary(other_script)
++
++      # 2. After an update the cached script reflects the new settings.
++      update_configuration(site, Map.put(@base_config, :outbound_links, true))
++
++      script =
++        wait_for_script(config.id, ["outboundLinks:!0"], ["fileDownloads:!0"])
++
++      assert is_binary(script),
++             "expected a single cached script after an update, got: #{truncate(script)}"
++
++      assert String.contains?(script, "outboundLinks:!0")
++      refute String.contains?(script, "fileDownloads:!0")
++
++      # 3. Repeated back-and-forth changes keep following the latest settings.
++      update_configuration(
++        site,
++        @base_config
++        |> Map.put(:file_downloads, true)
++        |> Map.put(:outbound_links, false)
++      )
++
++      script =
++        wait_for_script(config.id, ["fileDownloads:!0"], ["outboundLinks:!0"])
++
++      assert is_binary(script),
++             "expected a single cached script after repeated updates, got: #{truncate(script)}"
++
++      assert String.contains?(script, "fileDownloads:!0")
++      refute String.contains?(script, "outboundLinks:!0")
++
++      # Updating one site must not affect another site's script.
++      assert cached_script(other_config.id) == other_script
++
++      # 4. A configuration changed directly in the database (no broadcast, e.g. by
++      #    another node or a DBA) must be picked up by the periodic cache refresh.
++      Plausible.Repo.update_all(
++        from(t in Plausible.Site.TrackerScriptConfiguration, where: t.id == ^config.id),
++        set: [
++          outbound_links: true,
++          file_downloads: true,
++          updated_at: NaiveDateTime.utc_now()
++        ]
++      )
++
++      :ok = TrackerScriptCache.refresh_all()
++
++      script =
++        wait_for_script(config.id, ["outboundLinks:!0", "fileDownloads:!0"])
++
++      assert is_binary(script),
++             "expected a single cached script after refresh_all, got: #{truncate(script)}"
++
++      assert String.contains?(script, "outboundLinks:!0")
++      assert String.contains?(script, "fileDownloads:!0")
++
++      # 5. Repeated refreshes must not make the cache return stale or broken values.
++      :ok = TrackerScriptCache.refresh_all()
++      :ok = TrackerScriptCache.refresh_updated_recently()
++
++      script = cached_script(config.id)
++
++      assert is_binary(script),
++             "expected a single cached script after repeated refreshes, got: #{truncate(script)}"
++
++      assert String.contains?(script, "outboundLinks:!0")
++      assert String.contains?(script, "fileDownloads:!0")
++
++      # 6. A tracker id without a configuration is still not found.
++      assert cached_script("pa-a14125a2-000-000-0000-000000000000") == nil
++
++      # 7. The plug serves the latest settings over HTTP.
++      response = get(conn, "/js/#{config.id}.js") |> response(200)
++
++      assert String.contains?(response, "domain:\"#{site.domain}\"")
++      assert String.contains?(response, "outboundLinks:!0")
++      assert String.contains?(response, "fileDownloads:!0")
++    end
++
++    defp update_configuration(site, config) do
++      Tracker.update_script_configuration!(
++        site,
++        Map.put(config, :site_id, site.id),
++        :installation
++      )
++    end
++
++    # The same read the plug performs when the cache is enabled.
++    defp cached_script(id) do
++      Tracker.get_plausible_main_script(id, force?: true)
++    end
++
++    # Waits for the asynchronous cache broadcast to land, expecting a single
++    # binary script containing `required` (and not `forbidden`) substrings.
++    defp wait_for_script(id, required, forbidden \\ []) do
++      Plausible.TestUtils.eventually(fn ->
++        script = cached_script(id)
++
++        ok =
++          is_binary(script) and
++            Enum.all?(required, &String.contains?(script, &1)) and
++            Enum.all?(forbidden, &(!String.contains?(script, &1)))
++
++        {ok, script}
++      end)
++    end
++
++    defp truncate(value) do
++      value |> inspect() |> String.slice(0, 80)
++    end
++  end
++
+   def get_script(filename) do
+     opts = PlausibleWeb.TrackerPlug.init([])
+ 

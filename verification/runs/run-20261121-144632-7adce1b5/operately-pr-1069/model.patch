@@ -1,0 +1,224 @@
+diff --git a/lib/operately/operations/project_check_in.ex b/lib/operately/operations/project_check_in.ex
+index 0e5259d..7bb4a52 100644
+--- a/lib/operately/operations/project_check_in.ex
++++ b/lib/operately/operations/project_check_in.ex
+@@ -12,13 +12,25 @@ defmodule Operately.Operations.ProjectCheckIn do
+       DateTime.utc_now()
+     )
+ 
+-    Multi.new()
+-    |> Multi.insert(:subscription_list, SubscriptionList.changeset(%{
+-      send_to_everyone: attrs.send_notifications_to_everyone,
+-    }))
+-    |> insert_author_subscription(author.id)
+-    |> insert_subscriptions(attrs.subscriber_ids)
+-    |> insert_mentioned_subscriptions(attrs.description)
++    recipients = compute_recipients(author.id, attrs.subscriber_ids, attrs.description)
++
++    multi =
++      Multi.new()
++      |> Multi.insert(:subscription_list, SubscriptionList.changeset(%{
++        send_to_everyone: attrs.send_notifications_to_everyone,
++      }))
++
++    multi = Enum.reduce(recipients, multi, fn {index, {person_id, type}}, multi ->
++      Multi.insert(multi, :"subscription_#{index}", fn changes ->
++        Subscription.changeset(%{
++          subscription_list_id: changes.subscription_list.id,
++          person_id: person_id,
++          type: type,
++        })
++      end)
++    end)
++
++    multi
+     |> Multi.insert(:check_in, fn changes ->
+       CheckIn.changeset(%{
+         author_id: author.id,
+@@ -59,48 +71,32 @@ defmodule Operately.Operations.ProjectCheckIn do
+     end
+   end
+ 
+-  defp insert_author_subscription(multi, author_id) do
+-    Multi.insert(multi, :author_subscription, fn changes ->
+-      Subscription.changeset(%{
+-        subscription_list_id: changes.subscription_list.id,
+-        person_id: author_id,
+-        type: :invited,
+-      })
+-    end)
+-  end
+-
+-  defp insert_subscriptions(multi, nil), do: multi
+-  defp insert_subscriptions(multi, subscriber_ids) do
+-    Enum.reduce(subscriber_ids, multi, fn id, multi ->
+-      name = "subscription_" <> id
++  #
++  # Subscription recipients
++  #
+ 
+-      Multi.insert(multi, name, fn changes ->
+-        Subscription.changeset(%{
+-          subscription_list_id: changes.subscription_list.id,
+-          person_id: id,
+-          type: :invited,
+-        })
+-      end)
+-    end)
+-  end
++  # Computes one subscription per distinct person among the author, the
++  # explicitly selected recipients, and the people mentioned in the description.
++  #
++  # The author and explicitly selected recipients always get an `:invited`
++  # subscription, even when they are also mentioned. Mentioned people get a
++  # `:mentioned` subscription unless they are already invited. Recipients are
++  # de-duplicated by their decoded id, so a person is kept exactly once no
++  # matter how many times they appear, or which id form a mention uses.
++  defp compute_recipients(author_id, subscriber_ids, description) do
++    invited_ids =
++      [author_id] ++ Enum.uniq(subscriber_ids || [])
+ 
+-  defp insert_mentioned_subscriptions(multi, description) do
+-    {:ok, ids} =
++    {:ok, mentioned_ids} =
+       description
+       |> Operately.RichContent.find_mentioned_ids()
+-      |> Enum.uniq()
+       |> OperatelyWeb.Api.Helpers.decode_id()
+ 
+-    Enum.reduce(ids, multi, fn id, multi ->
+-      name = "mentioned_subscription_" <> id
+-
+-      Multi.insert(multi, name, fn changes ->
+-        Subscription.changeset(%{
+-          subscription_list_id: changes.subscription_list.id,
+-          person_id: id,
+-          type: :mentioned,
+-        })
+-      end)
++    Enum.uniq(invited_ids ++ mentioned_ids)
++    |> Enum.with_index()
++    |> Enum.map(fn {person_id, index} ->
++      type = if person_id in invited_ids, do: :invited, else: :mentioned
++      {index, {person_id, type}}
+     end)
+   end
+ end
+diff --git a/test/operately_web/api/mutations/post_project_check_in_test.exs b/test/operately_web/api/mutations/post_project_check_in_test.exs
+index 70db716..371575e 100644
+--- a/test/operately_web/api/mutations/post_project_check_in_test.exs
++++ b/test/operately_web/api/mutations/post_project_check_in_test.exs
+@@ -138,6 +138,92 @@ defmodule OperatelyWeb.Api.Mutations.PostProjectCheckInTest do
+         assert Enum.filter(subscriptions, &(&1.person_id == p.id))
+       end)
+     end
++
++    test "keeps one subscription per distinct person across recipients and mentions", ctx do
++      project = project_fixture(%{company_id: ctx.company.id, creator_id: ctx.person.id, group_id: ctx.company.company_space_id})
++      alice = person_fixture(%{company_id: ctx.company.id, full_name: "Alice"})
++      bob = person_fixture(%{company_id: ctx.company.id, full_name: "Bob"})
++      carol = person_fixture(%{company_id: ctx.company.id, full_name: "Carol"})
++
++      # The author is explicitly selected and mentions themselves.
++      # Alice is explicitly selected and also mentioned.
++      # Bob is not selected, but is mentioned twice, in two different id
++      # forms (short and canonical).
++      # Carol is mentioned once.
++      description = mention_doc([
++        Paths.person_id(ctx.person),
++        Paths.person_id(alice),
++        Paths.person_id(bob),
++        bob.id,
++        Paths.person_id(carol),
++      ])
++
++      assert {200, res} = mutation(ctx.conn, :post_project_check_in, %{
++        project_id: Paths.project_id(project),
++        status: "on_track",
++        description: Jason.encode!(description),
++        send_notifications_to_everyone: false,
++        subscriber_ids: [
++          Paths.person_id(ctx.person),
++          Paths.person_id(alice),
++        ],
++      })
++
++      {:ok, id} = OperatelyWeb.Api.Helpers.decode_id(res.check_in.id)
++
++      list = Notifications.get_subscription_list!(parent_id: id)
++      subscriptions = Notifications.list_subscriptions(list)
++
++      assert length(subscriptions) == 4
++
++      types = Map.new(subscriptions, fn s -> {s.person_id, s.type} end)
++      assert MapSet.new(Map.keys(types)) == MapSet.new([ctx.person.id, alice.id, bob.id, carol.id])
++
++      # The author and explicitly invited people keep :invited status
++      # even when they are also mentioned.
++      assert types[ctx.person.id] == :invited
++      assert types[alice.id] == :invited
++
++      # Everyone else is subscribed exactly once as :mentioned.
++      assert types[bob.id] == :mentioned
++      assert types[carol.id] == :mentioned
++    end
++
++    test "creates check-ins and subscriptions when the explicit recipient list is omitted or empty", ctx do
++      project = project_fixture(%{company_id: ctx.company.id, creator_id: ctx.person.id, group_id: ctx.company.company_space_id})
++      alice = person_fixture(%{company_id: ctx.company.id, full_name: "Alice"})
++
++      # Omitted explicit recipient list.
++      assert {200, res} = mutation(ctx.conn, :post_project_check_in, %{
++        project_id: Paths.project_id(project),
++        status: "on_track",
++        description: Jason.encode!(mention_doc([Paths.person_id(alice)])),
++      })
++
++      {:ok, id} = OperatelyWeb.Api.Helpers.decode_id(res.check_in.id)
++      subscriptions = Notifications.list_subscriptions(Notifications.get_subscription_list!(parent_id: id))
++
++      assert length(subscriptions) == 2
++      assert MapSet.new(Enum.map(subscriptions, & &1.person_id)) == MapSet.new([ctx.person.id, alice.id])
++      assert Map.new(subscriptions, fn s -> {s.person_id, s.type} end) == %{
++        ctx.person.id => :invited,
++        alice.id => :mentioned,
++      }
++
++      # Empty explicit recipient list and no mentions.
++      assert {200, res} = mutation(ctx.conn, :post_project_check_in, %{
++        project_id: Paths.project_id(project),
++        status: "on_track",
++        description: RichText.rich_text("No mentions", :as_string),
++        subscriber_ids: [],
++      })
++
++      {:ok, id} = OperatelyWeb.Api.Helpers.decode_id(res.check_in.id)
++      subscriptions = Notifications.list_subscriptions(Notifications.get_subscription_list!(parent_id: id))
++
++      assert length(subscriptions) == 1
++      assert Enum.map(subscriptions, &{&1.person_id, &1.type}) == [{ctx.person.id, :invited}]
++    end
+   end
+ 
+   #
+@@ -177,13 +263,17 @@ defmodule OperatelyWeb.Api.Mutations.PostProjectCheckInTest do
+   end
+ 
+   defp mentioned_people(people) do
+-    mentions = Enum.map(people, fn p ->
++    Enum.map(people, &Paths.person_id/1) |> mention_doc()
++  end
++
++  defp mention_doc(mention_ids) do
++    mentions = Enum.map(mention_ids, fn id ->
+       %{
+         "content" => [
+           %{
+             "attrs" => %{
+-              "id" => Paths.person_id(p),
+-              "label" => p.full_name
++              "id" => id,
++              "label" => "Someone"
+             },
+             "type" => "mention"
+           },
