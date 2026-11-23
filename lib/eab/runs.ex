@@ -779,18 +779,29 @@ defmodule Eab.Runs do
         end
       end
 
-    # A seed the series already has would only be refused hours later, at its run's start.
-    if opts[:series] do
+    # A seed a series already has would only be refused hours later, at its run's start or
+    # when the run is added to the results page.
+    if later != [] do
       release = Release.freeze()
+      collector = collector?(endpoint)
+      records = if is_nil(opts[:series]), do: Eab.Results.load!()
 
       for settings <- later do
         settings = Model.settings(endpoint, without_caps(endpoint, settings))
-        Eab.Series.contribution!(new_run(release, endpoint, settings), opts[:series])
+        run = new_run(release, endpoint, settings)
+
+        if opts[:series],
+          do: Eab.Series.contribution!(run, opts[:series], collector: collector),
+          else: Eab.Series.fresh!(run, collector: collector, records: records)
       end
     end
 
     {opts, later, pause}
   end
+
+  # Whether a memory collector will sample the endpoint's model host, and so read its files'
+  # hashes and maker (ADR 0018).
+  defp collector?(endpoint), do: not is_nil(MemoryMonitor.configuration(endpoint))
 
   defp begin_run(endpoint, key, settings, opts, state) do
     release = Release.freeze()
@@ -817,10 +828,11 @@ defmodule Eab.Runs do
           speed(run, endpoint, settings, release)
 
         opts[:series] ->
-          Eab.Series.contribution!(run, opts[:series])
+          Eab.Series.contribution!(run, opts[:series], collector: collector?(endpoint))
           Map.put(run, "series", opts[:series])
 
         true ->
+          Eab.Series.fresh!(run, collector: collector?(endpoint))
           run
       end
 

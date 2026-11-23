@@ -733,6 +733,92 @@ defmodule Eab.RunsTest do
              Runs.snapshot().queue
   end
 
+  test "a run that could not join the published series of its setup is refused before it starts" do
+    stub_runner()
+    Runs.subscribe()
+    page = Path.join(System.tmp_dir!(), "eab-fresh-page-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(page)
+
+    for file <- ~w(index.html styles.css theme.js app.js),
+        do: File.cp!(Path.join(Eab.Results.root(), file), Path.join(page, file))
+
+    previous = Application.get_env(:eab, :results_page_root)
+    Application.put_env(:eab, :results_page_root, page)
+    # This controller collects no memory from the model host.
+    Application.delete_env(:eab, :memory_monitor)
+
+    on_exit(fn ->
+      if previous,
+        do: Application.put_env(:eab, :results_page_root, previous),
+        else: Application.delete_env(:eab, :results_page_root)
+
+      File.rm_rf!(page)
+    end)
+
+    model = %{
+      "model" => "alias",
+      "backend" => "llama_cpp",
+      "url" => "http://model-host:8080",
+      "context" => 262_144,
+      "profile" => %{
+        "model_path" => "/srv/Swift-27B-Q4_K_M.gguf",
+        "build_info" => "b1",
+        "total_slots" => 1,
+        "chat_template" => "{{ messages }}",
+        "default_generation_settings" => %{
+          "n_ctx" => 262_144,
+          "params" => %{"temperature" => 0.6, "seed" => 4_294_967_295}
+        }
+      }
+    }
+
+    # A seed-102 run of this setup, made elsewhere with a collector that read its files.
+    assert {:ok, id} = Runs.start(model, "", %{"seed" => "102"})
+    assert_receive {:started, worker, run}, 3000
+    send(worker, {:finish, :ok, [finished(run)]})
+    await_terminal(id)
+    await_cleanup()
+
+    files = [%{"name" => "Swift-27B-Q4_K_M.gguf", "size_bytes" => 15}]
+
+    session = %{
+      "sample_count" => 1,
+      "identity" => %{
+        "model_artifact" => "Swift-27B-Q4_K_M.gguf",
+        "backend" => "llama_cpp",
+        "weight_files" => %{"size_bytes" => 15, "quantized_by" => "Unsloth", "files" => files}
+      },
+      "weight_hashes" => %{
+        "status" => "hashed",
+        "files" => [Map.put(hd(files), "sha256", String.duplicate("d", 64))]
+      }
+    }
+
+    published =
+      Store.run(id)
+      |> Map.put("memory", %{"sessions" => [session]})
+      |> Map.put(
+        "attempts",
+        Map.new(run["cases"], &{&1, %{"status" => "completed", "grade" => %{"passed" => true}}})
+      )
+
+    assert Eab.Results.publish!(published, page_root: page, resources: nil) == :added
+    series = Eab.Series.id(published)
+
+    for {settings, opts, message} <- [
+          {%{"seed" => "102"}, [], "already has a run with seed 102 on the results page"},
+          {%{"seed" => "101"}, [runs: 2], "already has a run with seed 102 on the results page"},
+          {%{"seed" => "101"}, [], "does not collect memory from this model's host"},
+          {%{"seed" => "101"}, [series: series], "does not collect memory from this model's host"}
+        ] do
+      assert {:error, error} = Runs.start(model, "", settings, opts)
+      assert error =~ message
+    end
+
+    refute_receive {:started, _, _}, 100
+    assert Runs.snapshot().active == nil and Runs.snapshot().queue == nil
+  end
+
   test "restart marks persisted active work interrupted without resuming" do
     Store.write("runs/old/run.json", %{
       "id" => "old",

@@ -17,7 +17,7 @@ Public schema 8 adds `model.source`, `model.weight_files` and `model.gguf`; each
 
 - Runs of a re-uploaded file no longer share a series with the file they replaced, and a published series names the exact upload it was made with, even after the link moves on.
 - **Run** on the dashboard needs a declared source for a local model. Resumes keep the source their run recorded. A case run again, which is never published, records whatever the connected model declares.
-- Hashes need a configured collector. A deployment without one records the declared source unchecked, and its series identity is unchanged.
+- Hashes need a configured collector. A deployment without one records the declared source unchecked, and its series identity is unchanged. Such a run cannot join a series that records hashes or a maker. On 2026-11-22 one controller that did not collect from the model host made a run of a model whose series another controller had started. Adding it to the results page created a second series of the same model. Since then, starting such a run is refused, and so is adding it to the results page (see the runbook's "Run series and contributions").
 - The collector must be rebuilt and reinstalled on the model host to hash files. The first run of a new file reads all of it there once; that read is file access, not a measurement.
 - Series published before this change are migrated to schema 8 with null sources and hashes. They are not re-keyed.
 - `mix eab.results add` takes `--source-url` and `--release-label` for a run that declared none, marked as given by the publisher.

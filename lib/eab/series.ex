@@ -284,37 +284,17 @@ defmodule Eab.Series do
 
   def closed_reason(_), do: nil
 
-  @doc "Checks a run about to start as a contribution to a published series."
-  def contribution!(run, series_id) do
+  @doc """
+  Checks a run about to start as a contribution to a published series. `collector: false`
+  says the run's memory collector cannot reach the model host.
+  """
+  def contribution!(run, series_id, opts \\ []) do
     record = Eab.Results.series!(series_id)
 
     if reason = closed_reason(record),
       do: raise("Run series #{String.slice(series_id, 0, 12)} takes no more runs. " <> reason)
 
-    expected =
-      Map.merge(record["setup"], %{
-        "benchmark" => record["benchmark"],
-        "cases" => Enum.map(record["runs"] |> hd() |> Map.fetch!("cases"), & &1["id"]),
-        "case_fixtures" => record["case_fixtures"]
-      })
-
-    # A run about to start has no memory yet, so its files' maker and hashes are still
-    # unread; export compares the whole setup again once the collector has read them.
-    actual =
-      Enum.reduce(~w(quantized_by sha256), setup(run), fn key, actual ->
-        case {expected["model"], actual["model"]} do
-          {%{^key => value}, model} when not is_map_key(model, key) ->
-            put_in(actual, ["model", key], value)
-
-          _ ->
-            actual
-        end
-      end)
-
-    differences =
-      for field <- Enum.sort(Map.keys(expected)),
-          expected[field] != actual[field],
-          do: field
+    differences = differences(record, run)
 
     if differences != [],
       do:
@@ -334,7 +314,103 @@ defmodule Eab.Series do
         raise "Choose one of the series' missing seeds: #{Enum.join(record["seeds"] -- filled, ", ")}"
 
       true ->
-        :ok
+        measurable!(record, Keyword.get(opts, :collector, true))
+    end
+  end
+
+  @doc """
+  Checks a full run about to start for no series. A run joins the published series its setup
+  matches once it is added to the results page, so where such a series still takes runs, the
+  run's seed must be free there, and a series that records its files' hashes or maker needs
+  a run whose memory collector reads them. Otherwise the run is refused at publication, or
+  shown beside the series as another model. `collector: false` says the run's memory
+  collector cannot reach the model host; `records` are the published series.
+  """
+  def fresh!(run, opts \\ []) do
+    seed = get_in(run, ["settings", "seed"])
+    records = Keyword.get_lazy(opts, :records, &Eab.Results.load!/0)
+
+    for record <- records,
+        is_nil(closed_reason(record)),
+        length(record["runs"]) < @required,
+        differences(record, run) == [],
+        not other_upload?(record, run) do
+      filled = Enum.map(record["runs"], & &1["seed"])
+
+      if is_integer(seed) and seed in filled do
+        free = (record["seeds"] || @seeds) -- filled
+
+        raise "#{record["model"]["name"]} already has a run with seed #{seed} on the results " <>
+                "page (run series #{String.slice(record["series_id"], 0, 12)}, " <>
+                "#{length(filled)} of #{@required} runs), so this run could never be added. " <>
+                "Contribute to that series with seed #{Enum.join(free, " or ")} instead."
+      end
+
+      measurable!(record, Keyword.get(opts, :collector, true))
+    end
+
+    :ok
+  end
+
+  # The setup fields in which a run about to start differs from a published series. The run
+  # has no memory yet, so its files' maker and hashes are still unread and are taken as the
+  # series'; export compares the whole setup again once the collector has read them.
+  defp differences(record, run) do
+    expected =
+      Map.merge(record["setup"], %{
+        "benchmark" => record["benchmark"],
+        "cases" => Enum.map(record["runs"] |> hd() |> Map.fetch!("cases"), & &1["id"]),
+        "case_fixtures" => record["case_fixtures"]
+      })
+
+    actual =
+      Enum.reduce(~w(quantized_by sha256), setup(run), fn key, actual ->
+        case {expected["model"], actual["model"]} do
+          {%{^key => value}, model} when not is_map_key(model, key) ->
+            put_in(actual, ["model", key], value)
+
+          _ ->
+            actual
+        end
+      end)
+
+    for field <- Enum.sort(Map.keys(expected)),
+        expected[field] != actual[field],
+        do: field
+  end
+
+  # A declared source whose Hub lookup names other bytes than the series recorded is most
+  # likely a re-upload under the same name, which is another series (ADR 0018).
+  defp other_upload?(record, run) do
+    declared = get_in(run, ["model", "source", "lookup", "files"])
+    recorded = get_in(record, ["setup", "model", "sha256"])
+    is_list(declared) and is_list(recorded) and Enum.map(declared, & &1["sha256"]) != recorded
+  end
+
+  # Only the memory collector reads the served files' hashes and maker on the model host. A
+  # run without it lacks them, so its setup no longer matches a series that records them.
+  defp measurable!(record, collector?) do
+    measured = Map.take(record["setup"]["model"], ~w(sha256 quantized_by))
+
+    if measured != %{} and not collector?,
+      do:
+        raise(
+          "Run series #{String.slice(record["series_id"], 0, 12)} (#{record["model"]["name"]}) " <>
+            "records its model files' #{measured_words(measured)}, which only the memory " <>
+            "collector reads on the model host, and this controller does not collect memory " <>
+            "from this model's host. Start the run from a controller whose memory collector " <>
+            "reaches the model host."
+        )
+
+    :ok
+  end
+
+  @doc false
+  def measured_words(fields) do
+    case {Map.has_key?(fields, "sha256"), Map.has_key?(fields, "quantized_by")} do
+      {true, true} -> "hashes and maker"
+      {true, false} -> "hashes"
+      {false, true} -> "maker"
     end
   end
 

@@ -367,6 +367,81 @@ defmodule Eab.SeriesTest do
     end
   end
 
+  test "a run whose files were not read on the model host cannot start a second series of a model",
+       %{page: page} do
+    v3 = String.duplicate("d", 64)
+    first = hashed(run("first", 101, [false]), v3)
+    Results.publish!(first, page_root: page, resources: nil)
+    id = Series.id(first)
+
+    # Made by a controller whose memory collector did not reach the model host.
+    for {unread, words} <- [
+          {run("unread", 102, [], "2026-10-27T12:00:00Z"), "hashes and maker"},
+          {served(run("unhashed", 102, [], "2026-10-27T12:00:00Z"), "Unsloth"), "hashes"}
+        ] do
+      error =
+        assert_raise ArgumentError, fn ->
+          Results.publish!(unread, page_root: page, resources: nil)
+        end
+
+      assert error.message =~ "model files' #{words} were not read on the model host"
+      assert error.message =~ "cannot join run series #{String.slice(id, 0, 12)} (Swift-27B)"
+    end
+
+    assert [%{"series_id" => ^id}] = Results.load!(Path.join(page, "results"))
+
+    # Another upload's hashes say it is another model, which starts its own series.
+    other = hashed(run("other", 101, [], "2026-10-27T13:00:00Z"), String.duplicate("e", 64))
+    assert Results.publish!(other, page_root: page, resources: nil) == :added
+
+    # So does any other setup, measured or not.
+    template = put_in(run("template", 101, []), ["model", "profile", "chat_template"], "{{ x }}")
+    assert Results.publish!(template, page_root: page, resources: nil) == :added
+  end
+
+  test "a fresh run that would join a published series needs a free seed and its collector",
+       %{page: page} do
+    first = hashed(run("first", 101, [false]), String.duplicate("d", 64))
+    Results.publish!(first, page_root: page, resources: nil)
+    id = Series.id(first)
+
+    error = assert_raise RuntimeError, fn -> Series.fresh!(run("again", 101, [])) end
+    assert error.message =~ "Swift-27B already has a run with seed 101 on the results page"
+    assert error.message =~ "(run series #{String.slice(id, 0, 12)}, 1 of 3 runs)"
+    assert error.message =~ "Contribute to that series with seed 102 or 103 instead"
+
+    # A free seed joins the series, which records hashes only the collector reads.
+    assert :ok = Series.fresh!(run("next", 102, []))
+
+    for check <- [
+          fn -> Series.fresh!(run("next", 102, []), collector: false) end,
+          fn -> Series.contribution!(run("next", 102, []), id, collector: false) end
+        ] do
+      error = assert_raise RuntimeError, check
+      assert error.message =~ "records its model files' hashes and maker"
+      assert error.message =~ "does not collect memory from this model's host"
+    end
+
+    # A declared source that names other bytes is a re-upload: another series, any seed.
+    reupload =
+      put_in(run("reupload", 101, []), ["model", "source"], %{
+        "lookup" => %{"files" => [%{"sha256" => String.duplicate("e", 64)}]}
+      })
+
+    assert :ok = Series.fresh!(reupload, collector: false)
+
+    # Any other setup, or a series that takes no more runs, leaves a fresh run alone.
+    template = put_in(run("template", 101, []), ["model", "profile", "chat_template"], "{{ x }}")
+    assert :ok = Series.fresh!(template, collector: false)
+
+    for {run_id, seed} <- [{"second", 102}, {"third", 103}] do
+      next = run(run_id, seed, [], "2026-10-28T00:00:0#{seed - 100}Z") |> Map.put("series", id)
+      Results.publish!(hashed(next, String.duplicate("d", 64)), page_root: page, resources: nil)
+    end
+
+    assert :ok = Series.fresh!(run("fourth", 101, []), collector: false)
+  end
+
   test "a local series made with a per-reply cap takes no more runs", %{page: page} do
     capped = put_in(run("first", 101, [false]), ["settings", "response_tokens"], 8192)
     Results.publish!(capped, page_root: page)

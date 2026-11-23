@@ -602,6 +602,7 @@ defmodule Eab.Results do
         else
           addition = export!(run, opts)
           existing = Enum.find(records, &(&1["series_id"] == addition["series_id"]))
+          if is_nil(existing), do: unmeasured!(addition, records)
           record = if existing, do: merge!(existing, addition), else: addition
           status = if existing == record, do: :already_added, else: :added
           records = Enum.reject(records, &(&1["series_id"] == record["series_id"])) ++ [record]
@@ -639,6 +640,35 @@ defmodule Eab.Results do
         File.rm_rf!(stage)
       end
     end)
+  end
+
+  # Only the memory collector reads the served files' hashes and maker on the model host
+  # (ADR 0018). A run made without them whose setup otherwise matches a published series
+  # that records them would start a second series of the same model.
+  defp unmeasured!(addition, records) do
+    model = addition["setup"]["model"]
+    missing = Enum.reject(~w(sha256 quantized_by), &Map.has_key?(model, &1))
+    alike = &(comparable(&1, missing) == comparable(addition, []))
+    record = if missing != [], do: Enum.find(records, alike)
+
+    if record do
+      lacking = Map.take(record["setup"]["model"], missing)
+
+      raise ArgumentError,
+            "The model files' #{Series.measured_words(lacking)} were not read on the model " <>
+              "host during this run, so it cannot join run series " <>
+              "#{String.slice(record["series_id"], 0, 12)} (#{record["model"]["name"]}), " <>
+              "whose setup it otherwise matches. Added on its own it would show that model " <>
+              "twice. Make this model's runs from a controller whose memory collector " <>
+              "reaches its model host."
+    end
+  end
+
+  defp comparable(record, drop) do
+    record
+    |> Map.take(~w(benchmark setup case_fixtures))
+    |> update_in(["setup", "model"], &Map.drop(&1, drop))
+    |> Map.put("cases", Enum.map(hd(record["runs"])["cases"], & &1["id"]))
   end
 
   @doc """
