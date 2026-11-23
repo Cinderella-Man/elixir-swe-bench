@@ -737,7 +737,7 @@ defmodule Eab.RunsTest do
              Runs.snapshot().queue
   end
 
-  test "a local run needs its memory collected and a seed its published series does not have" do
+  test "a local run needs its memory collected, and a contributed row must fit its series" do
     stub_runner()
     Runs.subscribe()
     page = Path.join(System.tmp_dir!(), "eab-fresh-page-#{System.unique_integer([:positive])}")
@@ -823,23 +823,15 @@ defmodule Eab.RunsTest do
     assert Eab.Results.publish!(published, page_root: page, resources: nil) == :added
     series = Eab.Series.id(published)
 
-    for {settings, opts, message} <- [
-          {%{"seed" => "102"}, [], "already has a run with seed 102 on the results page"},
-          {%{"seed" => "102"}, [runs: 2], "already has a run with seed 102 on the results page"},
-          {%{"seed" => "102"}, [series: series], "already has a run with seed 102; leave the"},
-          {%{}, [series: series, runs: 3], "needs 2 more runs, not 3"}
-        ] do
-      assert {:error, error} = Runs.start(model, "", settings, opts)
-      assert error =~ message
-    end
-
+    assert {:error, error} = Runs.start(model, "", %{}, series: series, runs: 3)
+    assert error =~ "needs 2 more runs, not 3"
     refute_receive {:started, _, _}, 100
     assert Runs.snapshot().active == nil and Runs.snapshot().queue == nil
 
-    # A blank seed draws a new one, which the series takes.
-    assert {:ok, id} = Runs.start(model, "", %{"seed" => ""}, series: series)
+    # A seed the series already has is no obstacle: a seed does not make a run repeat.
+    assert {:ok, id} = Runs.start(model, "", %{"seed" => "102"}, series: series)
     assert_receive {:started, worker, run}, 3000
-    assert run["series"] == series and run["settings"]["seed"] not in [102, nil]
+    assert run["series"] == series and run["settings"]["seed"] == 102
     send(worker, {:finish, :ok, [finished(run)]})
     await_terminal(id)
     await_cleanup()

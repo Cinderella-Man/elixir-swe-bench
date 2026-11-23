@@ -17,8 +17,8 @@ defmodule Eab.Results.Schema do
 
   # Fields each schema version adds to a run and to its cases: timing in 9 (ADR 0019), the
   # machine in 10 (ADR 0020), the patch's own verdict in 11 (ADR 0021), the attempt's peak
-  # context in 12 (ADR 0022). In 13 a seeded series takes any seed it does not have yet
-  # (ADR 0025). Series published earlier keep their files unchanged and are upgraded when
+  # context in 12 (ADR 0022). In 13 a seeded series takes runs with any seeds, repeated ones
+  # too (ADR 0025). Series published earlier keep their files unchanged and are upgraded when
   # they take another run.
   @versions %{
     8 => {[], []},
@@ -45,8 +45,8 @@ defmodule Eab.Results.Schema do
     if r["schema_version"] >= 13,
       do:
         require!(
-          r["seeds"] in [nil, "distinct"],
-          "A seeded series takes runs with distinct seeds"
+          r["seeds"] in [nil, "any"],
+          "A seeded series takes runs with any seeds"
         ),
       else:
         require!(
@@ -63,7 +63,7 @@ defmodule Eab.Results.Schema do
     run_ids = Enum.map(runs, & &1["run_id"])
     require!(Enum.uniq(run_ids) == run_ids, "Duplicate run IDs")
     seeds = Enum.map(runs, & &1["seed"])
-    require!(is_nil(r["seeds"]) or Enum.uniq(seeds) == seeds, "Each seed counts once")
+    require!(not is_list(r["seeds"]) or Enum.uniq(seeds) == seeds, "Each seed counts once")
     require!(Enum.sort_by(runs, & &1["created_at"]) == runs, "Runs are listed oldest first")
     case_fixtures!(r["case_fixtures"], ids)
     allowance!(r["setup"]["allowance"], ids)
@@ -191,7 +191,7 @@ defmodule Eab.Results.Schema do
 
     cond do
       opts[:any_seed] -> require!(is_nil(run["seed"]) or is_integer(run["seed"]), "Invalid seed")
-      r["seeds"] == "distinct" -> require!(is_integer(run["seed"]), "Each run needs a seed")
+      r["seeds"] == "any" -> require!(is_integer(run["seed"]), "Each run needs a seed")
       r["seeds"] -> require!(run["seed"] in r["seeds"], "Each run needs one of the series seeds")
       true -> require!(is_nil(run["seed"]), "This series records no seed")
     end

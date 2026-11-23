@@ -1,0 +1,197 @@
+diff --git a/lib/livebook/runtime/evaluator.ex b/lib/livebook/runtime/evaluator.ex
+index 2343b84..d9190ef 100644
+--- a/lib/livebook/runtime/evaluator.ex
++++ b/lib/livebook/runtime/evaluator.ex
+@@ -468,8 +468,26 @@ defmodule Livebook.Runtime.Evaluator do
+           identifiers_used = :unknown
+           identifiers_defined = %{}
+           identifier_definitions = []
+-          # Empty context
+-          new_context = initial_context()
++
++          # A failed evaluation does not contribute to the state of
++          # later evaluations, so its context has no bindings, aliases,
++          # requires, variables or modules. However, it also must not
++          # discard the state of the earlier evaluations, so we keep
++          # the imports (functions and macros) and the process
++          # dictionary that were in effect before the evaluation
++          # started. That way a later evaluation using this one as a
++          # parent sees the same context as the earlier successful
++          # evaluations, with all of the failed evaluation's changes
++          # rolled back.
++          new_context =
++            initial_context()
++            |> Map.update!(:env, fn env ->
++              env
++              |> Map.put(:functions, context.env.functions)
++              |> Map.put(:macros, context.env.macros)
++            end)
++            |> Map.put(:pdict, context.pdict)
++
+           {new_context, result, identifiers_used, identifiers_defined, identifier_definitions}
+       end
+ 
+diff --git a/test/livebook/runtime/evaluator_test.exs b/test/livebook/runtime/evaluator_test.exs
+index 6d2fe89..1823b82 100644
+--- a/test/livebook/runtime/evaluator_test.exs
++++ b/test/livebook/runtime/evaluator_test.exs
+@@ -362,6 +362,159 @@ defmodule Livebook.Runtime.EvaluatorTest do
+                       metadata()}
+     end
+ 
++    test "in case of an error keeps the state of the earlier evaluations intact",
++         %{evaluator: evaluator} do
++      code1 = """
++      import ExUnit.Assertions
++
++      require Integer
++
++      alias Map, as: M
++
++      Process.put(:x, 1)
++      Process.put(:y, 1)
++
++      x = 1
++      """
++
++      code2 = """
++      Process.put(:z, 1)
++
++      y = 2
++      """
++
++      code3 = """
++      import Integer
++
++      require BitString
++
++      alias MapSet, as: S
++
++      defmodule Livebook.Runtime.EvaluatorTest.FailedEvaluation do
++      end
++
++      x = 100
++      y = 100
++
++      Process.put(:failed_key, 1)
++      Process.delete(:z)
++
++      assert false
++      """
++
++      Evaluator.evaluate_code(evaluator, :elixir, code1, :code_1, [])
++
++      assert_receive {:runtime_evaluation_response, :code_1, terminal_text(ansi_number(1)),
++                      metadata()}
++
++      Evaluator.evaluate_code(evaluator, :elixir, code2, :code_2, [:code_1])
++
++      assert_receive {:runtime_evaluation_response, :code_2, terminal_text(ansi_number(2)),
++                      metadata()}
++
++      # The failed evaluation still returns its error, but it does not
++      # leave behind the modules it defined
++      Evaluator.evaluate_code(evaluator, :elixir, code3, :code_3, [:code_2, :code_1])
++
++      assert_receive {:runtime_evaluation_response, :code_3, error(_),
++                      metadata() = failed_metadata}
++
++      assert failed_metadata.errored
++      refute Code.ensure_loaded?(Livebook.Runtime.EvaluatorTest.FailedEvaluation)
++
++      # A later evaluation whose parents are the failed evaluation and
++      # the earlier successful ones sees exactly the context of the
++      # successful evaluations
++      ok_context = Evaluator.get_evaluation_context(evaluator, [:code_2, :code_1])
++      merged_context =
++        Evaluator.get_evaluation_context(evaluator, [:code_3, :code_2, :code_1])
++
++      assert merged_context.binding == ok_context.binding
++      assert merged_context.pdict == ok_context.pdict
++      assert merged_context.env.functions == ok_context.env.functions
++      assert merged_context.env.macros == ok_context.env.macros
++      assert merged_context.env.aliases == ok_context.env.aliases
++      assert merged_context.env.requires == ok_context.env.requires
++      assert merged_context.env.versioned_vars == ok_context.env.versioned_vars
++      assert merged_context.env.context_modules == ok_context.env.context_modules
++
++      # That is, all of the failed evaluation's changes are rolled
++      # back: its bindings, aliases, requires and imports do not
++      # apply, its process dictionary writes and deletions are undone
++      # and the keys it added are absent
++      assert merged_context.binding == [y: 2, x: 1]
++      assert merged_context.pdict == %{x: 1, y: 1, z: 1}
++      assert merged_context.env.aliases == [{M, Map}]
++      assert merged_context.env.requires == [Application, ExUnit.Assertions, Integer, Kernel]
++      assert merged_context.env.versioned_vars == %{{:x, nil} => 0, {:y, nil} => 1}
++      assert merged_context.env.context_modules == []
++      assert Enum.any?(ok_context.env.macros, fn
++        {ExUnit.Assertions, [{:assert, 1} | _]} -> true
++        _ -> false
++      end)
++      refute Enum.any?(merged_context.env.functions, fn
++        {Integer, _} -> true
++        _ -> false
++      end)
++
++      # And it can use the earlier imports, bindings and process
++      # dictionary values
++      Evaluator.evaluate_code(
++        evaluator,
++        :elixir,
++        """
++        assert true
++
++        x + y == 3 and
++          Process.get(:x) == 1 and
++          Process.get(:y) == 1 and
++          Process.get(:z) == 1 and
++          Process.get(:failed_key) == nil and
++          M.new() == %{} and
++          Integer.is_even(2)
++        """,
++        :code_4,
++        [:code_3, :code_2, :code_1]
++      )
++
++      assert_receive {:runtime_evaluation_response, :code_4, terminal_text("\e[35mtrue\e[0m"),
++                      metadata()}
++
++      # The context of the failed evaluation alone is empty: it has no
++      # bindings, aliases, requires, variables or modules, but it keeps
++      # the imports and the process dictionary that were in effect
++      # before it ran
++      failed_context = Evaluator.get_evaluation_context(evaluator, [:code_3])
++
++      assert failed_context.binding == []
++      assert failed_context.pdict == %{x: 1, y: 1, z: 1}
++      assert failed_context.env.aliases == []
++      assert failed_context.env.requires == [Application, Kernel]
++      assert failed_context.env.versioned_vars == %{}
++      assert failed_context.env.context_modules == []
++      assert failed_context.env.functions == ok_context.env.functions
++      assert failed_context.env.macros == ok_context.env.macros
++
++      # A later evaluation whose only parent is the failed evaluation
++      # can still use the earlier imports and process dictionary values
++      Evaluator.evaluate_code(
++        evaluator,
++        :elixir,
++        """
++        assert true
++
++        Process.get(:x) == 1 and
++          Process.get(:z) == 1 and
++          Process.get(:failed_key) == nil
++        """,
++        :code_5,
++        [:code_3]
++      )
++
++      assert_receive {:runtime_evaluation_response, :code_5, terminal_text("\e[35mtrue\e[0m"),
++                      metadata()}
++    end
++
+     test "given file option sets it in evaluation environment", %{evaluator: evaluator} do
+       code = """
+       __DIR__

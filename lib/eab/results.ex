@@ -102,7 +102,7 @@ defmodule Eab.Results do
       "settings" => parts.settings,
       "setup" => parts.setup,
       "case_fixtures" => parts.case_fixtures,
-      "seeds" => if(is_integer(parts.run["seed"]), do: "distinct"),
+      "seeds" => if(is_integer(parts.run["seed"]), do: "any"),
       "required_runs" => Series.required(),
       "runs" => [parts.run],
       "evidence_url" => opts[:evidence_url],
@@ -399,7 +399,7 @@ defmodule Eab.Results do
     %{"name" => "pi", "version" => agent["version"] || "unknown"}
   end
 
-  @doc "Adds one run to a series record, keeping each seed's first published run."
+  @doc "Adds one run to a series record, up to its required runs, whatever their seeds."
   def merge!(record, addition) do
     [run] = addition["runs"]
 
@@ -424,9 +424,6 @@ defmodule Eab.Results do
       length(record["runs"]) >= record["required_runs"] ->
         raise ArgumentError, "Run series already has #{record["required_runs"]} runs"
 
-      record["seeds"] && Enum.any?(record["runs"], &(&1["seed"] == run["seed"])) ->
-        raise ArgumentError, "Seed #{run["seed"]} already has a run in this series"
-
       true ->
         record = upgrade(record)
         runs = Enum.sort_by(record["runs"] ++ [run], & &1["created_at"])
@@ -437,8 +434,8 @@ defmodule Eab.Results do
   # An older series takes the current schema when it takes another run. Its runs recorded
   # what they recorded: timing before schema 9, the machine before 10 and peak context before
   # 12 are null. Before schema 11 a case's outcome was its patch's verdict. Before schema 13
-  # a seeded series took seeds 101, 102 and 103; its runs keep theirs, and it now takes any
-  # seed it does not have yet (ADR 0025).
+  # a seeded series took seeds 101, 102 and 103, once each; its runs keep theirs, and it now
+  # takes a run with any seed, a repeated one too (ADR 0025).
   @doc false
   def upgrade(record) do
     runs =
@@ -457,7 +454,7 @@ defmodule Eab.Results do
         |> Map.put_new("machine", nil)
       end)
 
-    seeds = if record["seeds"], do: "distinct"
+    seeds = if record["seeds"], do: "any"
     %{record | "schema_version" => Schema.current_version(), "runs" => runs, "seeds" => seeds}
   end
 

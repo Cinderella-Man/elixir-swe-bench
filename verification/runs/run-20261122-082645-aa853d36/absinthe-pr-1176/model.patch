@@ -1,0 +1,1403 @@
+diff --git a/lib/absinthe/blueprint/schema.ex b/lib/absinthe/blueprint/schema.ex
+index cbaedb4..99819f1 100644
+--- a/lib/absinthe/blueprint/schema.ex
++++ b/lib/absinthe/blueprint/schema.ex
+@@ -117,7 +117,8 @@ defmodule Absinthe.Blueprint.Schema do
+     Schema.InterfaceTypeDefinition,
+     Schema.UnionTypeDefinition,
+     Schema.EnumValueDefinition,
+-    Schema.TypeExtensionDefinition
++    Schema.TypeExtensionDefinition,
++    Schema.SchemaDeclaration
+   ]
+ 
+   defp build_types([%module{} = type | rest], stack, buff) when module in @simple_open do
+@@ -210,6 +211,20 @@ defmodule Absinthe.Blueprint.Schema do
+     build_types(rest, [%{extend | definition: def} | stack], buff)
+   end
+ 
++  defp build_types(
++         [:close | rest],
++         [%Schema.FieldDefinition{} = field, %Schema.SchemaDeclaration{} = declaration | stack],
++         buff
++       ) do
++    field =
++      field
++      |> Map.update!(:middleware, &Enum.reverse/1)
++      |> Map.update!(:arguments, &Enum.reverse/1)
++      |> Map.update!(:triggers, &{:%{}, [], &1})
++
++    build_types(rest, [push(declaration, :field_definitions, field) | stack], buff)
++  end
++
+   defp build_types([:close | rest], [%Schema.FieldDefinition{} = field, obj | stack], buff) do
+     field =
+       field
+@@ -229,6 +244,25 @@ defmodule Absinthe.Blueprint.Schema do
+     build_types(rest, [push(schema, :type_extensions, extension) | stack], buff)
+   end
+ 
++  defp build_types(
++         [:close | rest],
++         [
++           %Schema.SchemaDeclaration{} = declaration,
++           %Schema.TypeExtensionDefinition{} = extend | stack
++         ],
++         buff
++       ) do
++    build_types(rest, [%{extend | definition: declaration} | stack], buff)
++  end
++
++  defp build_types(
++         [:close | rest],
++         [%Schema.SchemaDeclaration{} = declaration, %Schema.SchemaDefinition{} = schema | stack],
++         buff
++       ) do
++    build_types(rest, [push(schema, :type_definitions, declaration) | stack], buff)
++  end
++
+   defp build_types([:close | rest], [%Schema.ObjectTypeDefinition{} = obj, schema | stack], buff) do
+     obj = Map.update!(obj, :fields, &Enum.reverse/1)
+     build_types(rest, [push(schema, :type_definitions, obj) | stack], buff)
+diff --git a/lib/absinthe/blueprint/transform.ex b/lib/absinthe/blueprint/transform.ex
+index 3b4bbe2..9fa9546 100644
+--- a/lib/absinthe/blueprint/transform.ex
++++ b/lib/absinthe/blueprint/transform.ex
+@@ -86,11 +86,13 @@ defmodule Absinthe.Blueprint.Transform do
+     Blueprint.Schema.InterfaceTypeDefinition => [:interfaces, :fields, :directives],
+     Blueprint.Schema.ObjectTypeDefinition => [:interfaces, :fields, :directives],
+     Blueprint.Schema.ScalarTypeDefinition => [:directives],
++    Blueprint.Schema.SchemaDeclaration => [:field_definitions, :directives],
+     Blueprint.Schema.SchemaDefinition => [
+       :directive_definitions,
+       :type_definitions,
+       :type_extensions,
+-      :directives
++      :directives,
++      :schema_declaration
+     ],
+     Blueprint.Schema.TypeExtensionDefinition => [:definition],
+     Blueprint.Schema.UnionTypeDefinition => [:directives, :types]
+diff --git a/lib/absinthe/phase/schema/apply_declaration.ex b/lib/absinthe/phase/schema/apply_declaration.ex
+index f0b4e58..758b7d7 100644
+--- a/lib/absinthe/phase/schema/apply_declaration.ex
++++ b/lib/absinthe/phase/schema/apply_declaration.ex
+@@ -3,11 +3,14 @@ defmodule Absinthe.Phase.Schema.ApplyDeclaration do
+ 
+   use Absinthe.Phase
+   alias Absinthe.Blueprint
++  alias Absinthe.Blueprint.Schema
+ 
+   @type operation :: :query | :mutation | :subscription
+ 
+   @type root_mappings :: %{operation() => Blueprint.TypeReference.Name.t()}
+ 
++  @roots ~w(query mutation subscription)a
++
+   def run(blueprint, _opts) do
+     blueprint = process(blueprint)
+     {:ok, blueprint}
+@@ -29,17 +32,27 @@ defmodule Absinthe.Phase.Schema.ApplyDeclaration do
+     {declarations, type_defs} =
+       Enum.split_with(
+         schema_definition.type_definitions,
+-        &match?(%Blueprint.Schema.SchemaDeclaration{}, &1)
++        &match?(%Schema.SchemaDeclaration{}, &1)
++      )
++
++    {schema_extensions, type_extensions} =
++      Enum.split_with(
++        schema_definition.type_extensions,
++        &match?(%Schema.TypeExtensionDefinition{definition: %Schema.SchemaDeclaration{}}, &1)
+       )
+ 
+     # Remove declaration
+-    schema_definition = %{schema_definition | type_definitions: type_defs}
++    schema_definition =
++      %{
++        schema_definition
++        | type_definitions: type_defs,
++          type_extensions: type_extensions
++      }
+ 
+     case declarations do
+       [declaration] ->
+-        root_mappings =
+-          declaration
+-          |> extract_root_mappings
++        declaration = merge_schema_extensions(declaration, schema_extensions)
++        root_mappings = extract_root_mappings(declaration)
+ 
+         %{
+           schema_definition
+@@ -49,7 +62,30 @@ defmodule Absinthe.Phase.Schema.ApplyDeclaration do
+         }
+ 
+       [] ->
+-        schema_definition
++        inferred = infer_declaration(schema_definition, schema_definition.type_definitions)
++        declaration = declaration_from_extensions(schema_definition, schema_extensions)
++
++        root_mappings =
++          extract_root_mappings(
++            declaration || %Schema.SchemaDeclaration{field_definitions: []}
++          )
++
++        type_defs = Enum.map(schema_definition.type_definitions, &maybe_mark_root(&1, root_mappings))
++
++        declaration =
++          case declaration do
++            nil ->
++              inferred
++
++            %Schema.SchemaDeclaration{} = declaration ->
++              merge_inferred_entries(declaration, inferred)
++          end
++
++        %{
++          schema_definition
++          | type_definitions: type_defs,
++            schema_declaration: declaration
++        }
+ 
+       [_first | extra_declarations] ->
+         extra_declarations
+@@ -60,12 +96,100 @@ defmodule Absinthe.Phase.Schema.ApplyDeclaration do
+     end
+   end
+ 
++  # Merge the directives and operation entries of `extend schema` extensions
++  # into the declaration. Extensions never add or change the description.
++  @spec merge_schema_extensions(
++          declaration :: Blueprint.Schema.SchemaDeclaration.t(),
++          extensions :: [Blueprint.Schema.TypeExtensionDefinition.t()]
++        ) :: Blueprint.Schema.SchemaDeclaration.t()
++  defp merge_schema_extensions(declaration, []) do
++    declaration
++  end
++
++  defp merge_schema_extensions(declaration, extensions) do
++    {directives, field_definitions} =
++      Enum.reduce(extensions, {[], []}, fn
++        %Schema.TypeExtensionDefinition{
++          definition: %Schema.SchemaDeclaration{directives: directives, field_definitions: fields}
++        },
++        {acc_directives, acc_fields} ->
++        {directives ++ acc_directives, fields ++ acc_fields}
++      end)
++
++    %{
++      declaration
++      | directives: declaration.directives ++ directives,
++        field_definitions: declaration.field_definitions ++ field_definitions
++    }
++  end
++
++  # Build a declaration out of `extend schema` extensions when no declaration
++  # is written. It has no description.
++  @spec declaration_from_extensions(
++          schema_definition :: Blueprint.Schema.SchemaDefinition.t(),
++          extensions :: [Blueprint.Schema.TypeExtensionDefinition.t()]
++        ) :: nil | Blueprint.Schema.SchemaDeclaration.t()
++  defp declaration_from_extensions(_schema_definition, []), do: nil
++
++  defp declaration_from_extensions(schema_definition, [first | _rest] = extensions) do
++    declaration = %Schema.SchemaDeclaration{
++      module: schema_definition.module,
++      __reference__: first.__reference__,
++      source_location: first.source_location
++    }
++
++    merge_schema_extensions(declaration, extensions)
++  end
++
++  # Add the inferred root entries that the extension-built declaration does not
++  # already list.
++  @spec merge_inferred_entries(
++          declaration :: Blueprint.Schema.SchemaDeclaration.t(),
++          inferred :: Blueprint.Schema.SchemaDeclaration.t()
++        ) :: Blueprint.Schema.SchemaDeclaration.t()
++  defp merge_inferred_entries(declaration, inferred) do
++    existing = MapSet.new(declaration.field_definitions, & &1.identifier)
++
++    missing =
++      for field_def <- inferred.field_definitions, field_def.identifier not in existing,
++          do: field_def
++
++    %{declaration | field_definitions: missing ++ declaration.field_definitions}
++  end
++
++  # Infer a declaration from the schema's roots: the objects defined with
++  # `query`, `mutation` and `subscription` (or, in SDL schemas, the types named
++  # `Query`, `Mutation` and `Subscription`).
++  @spec infer_declaration(
++          schema_definition :: Blueprint.Schema.SchemaDefinition.t(),
++          type_defs :: [Blueprint.Schema.t()]
++        ) :: Blueprint.Schema.SchemaDeclaration.t()
++  defp infer_declaration(schema_definition, type_defs) do
++    field_definitions =
++      for operation <- @roots,
++          type_def = Enum.find(type_defs, &(&1.identifier == operation)) do
++        %Schema.FieldDefinition{
++          identifier: operation,
++          name: to_string(operation),
++          type: %Blueprint.TypeReference.Name{name: type_def.name},
++          module: schema_definition.module,
++          __reference__: type_def.__reference__
++        }
++      end
++
++    %Schema.SchemaDeclaration{
++      module: schema_definition.module,
++      field_definitions: field_definitions,
++      __reference__: schema_definition.__reference__
++    }
++  end
++
+   # Generate an error for extraneous schema declarations
+   @spec error(declaration :: Blueprint.Schema.SchemaDeclaration.t()) :: Absinthe.Phase.Error.t()
+   defp error(declaration) do
+     %Absinthe.Phase.Error{
+       message:
+-        "More than one schema declaration found. Only one instance of `schema' should be present in SDL.",
++        "More than one schema declaration found. Only one instance of `schema` should be present in your schema.",
+       locations: [declaration.__reference__.location],
+       phase: __MODULE__
+     }
+diff --git a/lib/absinthe/phase/schema/compile.ex b/lib/absinthe/phase/schema/compile.ex
+index ece2db7..d4f4e4f 100644
+--- a/lib/absinthe/phase/schema/compile.ex
++++ b/lib/absinthe/phase/schema/compile.ex
+@@ -33,6 +33,8 @@ defmodule Absinthe.Phase.Schema.Compile do
+ 
+     implementors = build_implementors(schema)
+ 
++    declaration = schema.schema_declaration
++
+     body =
+       quote do
+         @moduledoc false
+@@ -40,6 +42,10 @@ defmodule Absinthe.Phase.Schema.Compile do
+         unquote_splicing(type_ast)
+         unquote_splicing(directive_ast)
+ 
++        def __absinthe_schema_declaration__ do
++          unquote(Macro.escape(declaration, unquote: true))
++        end
++
+         def __absinthe_types__() do
+           __absinthe_types__(:referenced)
+         end
+diff --git a/lib/absinthe/phase/schema/populate_persistent_term.ex b/lib/absinthe/phase/schema/populate_persistent_term.ex
+index 4def971..b821644 100644
+--- a/lib/absinthe/phase/schema/populate_persistent_term.ex
++++ b/lib/absinthe/phase/schema/populate_persistent_term.ex
+@@ -49,7 +49,8 @@ if Code.ensure_loaded?(:persistent_term) do
+         __absinthe_prototype_schema__: prototype_schema,
+         __absinthe_type__: types_map,
+         __absinthe_directive__: directives_map,
+-        __absinthe_reference__: metadata
++        __absinthe_reference__: metadata,
++        __absinthe_schema_declaration__: schema.schema_declaration
+       }
+ 
+       schema_name = opts[:schema] || raise "no schema name provided"
+diff --git a/lib/absinthe/phase/schema/type_extension_imports.ex b/lib/absinthe/phase/schema/type_extension_imports.ex
+index b09fb2d..203f5fd 100644
+--- a/lib/absinthe/phase/schema/type_extension_imports.ex
++++ b/lib/absinthe/phase/schema/type_extension_imports.ex
+@@ -40,12 +40,16 @@ defmodule Absinthe.Phase.Schema.TypeExtensionImports do
+         rejections = Keyword.get(opts, :except, []) |> MapSet.new()
+ 
+         type_extensions =
+-          Enum.reject(other_def.type_extensions, &(&1.definition.identifier in rejections))
++          Enum.reject(other_def.type_extensions, fn extension ->
++            Map.get(extension.definition, :identifier) in rejections
++          end)
+ 
+         type_extensions =
+           case Keyword.fetch(opts, :only) do
+             {:ok, selections} ->
+-              Enum.filter(type_extensions, &(&1.definition.identifier in selections))
++              Enum.filter(type_extensions, fn extension ->
++                Map.get(extension.definition, :identifier) in selections
++              end)
+ 
+             _ ->
+               type_extensions
+diff --git a/lib/absinthe/phase/schema/type_imports.ex b/lib/absinthe/phase/schema/type_imports.ex
+index 78b0c78..c5c1c3f 100644
+--- a/lib/absinthe/phase/schema/type_imports.ex
++++ b/lib/absinthe/phase/schema/type_imports.ex
+@@ -40,12 +40,17 @@ defmodule Absinthe.Phase.Schema.TypeImports do
+         rejections =
+           MapSet.new([:query, :mutation, :subscription] ++ Keyword.get(opts, :except, []))
+ 
+-        types = Enum.reject(other_def.type_definitions, &(&1.identifier in rejections))
++        types =
++          Enum.reject(other_def.type_definitions, fn type_def ->
++            Map.get(type_def, :identifier) in rejections
++          end)
+ 
+         types =
+           case Keyword.fetch(opts, :only) do
+             {:ok, selections} ->
+-              Enum.filter(types, &(&1.identifier in selections))
++              Enum.filter(types, fn type_def ->
++                Map.get(type_def, :identifier) in selections
++              end)
+ 
+             _ ->
+               types
+diff --git a/lib/absinthe/schema.ex b/lib/absinthe/schema.ex
+index b13c321..3b6e727 100644
+--- a/lib/absinthe/schema.ex
++++ b/lib/absinthe/schema.ex
+@@ -150,6 +150,38 @@ defmodule Absinthe.Schema do
+ 
+   @object_type Absinthe.Blueprint.Schema.ObjectTypeDefinition
+ 
++  @doc """
++  Defines the schema declaration.
++
++  The declaration is the `schema { query: … mutation: … subscription: … }`
++  block of a GraphQL schema. It may carry a description, type system
++  directives, and operation entries naming the schema's root objects.
++
++  The roots themselves are still the objects defined with `query`, `mutation`
++  and `subscription`; the operation entries only describe those roots.
++
++  ## Placement
++
++  Toplevel, at most once. Use `extend schema do ... end` to add directives
++  and operation entries to a written or inferred declaration.
++
++  ## Examples
++
++  ```
++  schema do
++    description "Catalog API"
++    directive :feature, name: "catalog"
++    field :query, :query
++    field :mutation, :mutation
++  end
++  ```
++  """
++  defmacro schema(do: block) do
++    __CALLER__
++    |> Absinthe.Schema.Notation.recordable!(:schema, [toplevel: true])
++    |> Absinthe.Schema.Notation.record_schema_declaration!(block)
++  end
++
+   @default_query_name "RootQueryType"
+   @doc """
+   Defines a root Query object
+@@ -329,6 +361,10 @@ defmodule Absinthe.Schema do
+         @schema_provider.__absinthe_interface_implementors__(__MODULE__)
+       end
+ 
++      def __absinthe_schema_declaration__ do
++        @schema_provider.__absinthe_schema_declaration__(__MODULE__)
++      end
++
+       def __absinthe_prototype_schema__() do
+         @prototype_schema
+       end
+diff --git a/lib/absinthe/schema/compiled.ex b/lib/absinthe/schema/compiled.ex
+index a6d7a8b..c800dd8 100644
+--- a/lib/absinthe/schema/compiled.ex
++++ b/lib/absinthe/schema/compiled.ex
+@@ -30,4 +30,8 @@ defmodule Absinthe.Schema.Compiled do
+   def __absinthe_interface_implementors__(schema_mod) do
+     Module.concat([schema_mod, Compiled]).__absinthe_interface_implementors__
+   end
++
++  def __absinthe_schema_declaration__(schema_mod) do
++    Module.concat([schema_mod, Compiled]).__absinthe_schema_declaration__
++  end
+ end
+diff --git a/lib/absinthe/schema/notation.ex b/lib/absinthe/schema/notation.ex
+index 5c8c488..416e95a 100644
+--- a/lib/absinthe/schema/notation.ex
++++ b/lib/absinthe/schema/notation.ex
+@@ -188,13 +188,27 @@ defmodule Absinthe.Schema.Notation do
+   @reserved_identifiers ~w(query mutation subscription)a
+   defmacro object(identifier, attrs \\ [], block)
+ 
+-  defmacro object(identifier, _attrs, _block) when identifier in @reserved_identifiers do
+-    raise Absinthe.Schema.Notation.Error,
+-          "Invalid schema notation: cannot create an `object` " <>
+-            "with reserved identifier `#{identifier}`"
++  defmacro object(identifier, attrs, block) when identifier in @reserved_identifiers do
++    if extending?(__CALLER__) do
++      # Root objects can be extended like any other object
++      object_macro_body(identifier, attrs, block, __CALLER__)
++    else
++      raise Absinthe.Schema.Notation.Error,
++            "Invalid schema notation: cannot create an `object` " <>
++              "with reserved identifier `#{identifier}`"
++    end
+   end
+ 
+   defmacro object(identifier, attrs, do: block) do
++    object_macro_body(identifier, attrs, block, __CALLER__)
++  end
++
++  defp extending?(caller) do
++    [scope | _] = Module.get_attribute(caller.module, :absinthe_scope_stack)
++    scope == :extend
++  end
++
++  defp object_macro_body(identifier, attrs, block, env) do
+     block = block_from_directive_attrs(attrs, block)
+ 
+     {attrs, block} =
+@@ -212,7 +226,7 @@ defmodule Absinthe.Schema.Notation do
+           {attrs, block}
+       end
+ 
+-    __CALLER__
++    env
+     |> recordable!(:object, @placement[:object])
+     |> record!(
+       Schema.ObjectTypeDefinition,
+@@ -300,6 +314,37 @@ defmodule Absinthe.Schema.Notation do
+     |> record_extend!([], block, [])
+   end
+ 
++  @doc """
++  Extend the schema declaration.
++
++  Adds directives and operation entries to the schema's declaration, whether
++  it was written with a `schema` block or inferred. See `Absinthe.Schema.schema/1`.
++
++  ## Placement
++
++  #{Utils.placement_docs(@placement)}
++
++  ## Examples
++
++  ```
++  extend schema do
++    directive :feature, name: "catalog"
++    field :subscription, :subscription
++  end
++  ```
++  """
++  defmacro extend({:schema, _meta, nil}, do: block) do
++    __CALLER__
++    |> recordable!(:extend, @placement[:extend])
++    |> record_extend_schema_declaration!(block)
++  end
++
++  defmacro extend(:schema, do: block) do
++    __CALLER__
++    |> recordable!(:extend, @placement[:extend])
++    |> record_extend_schema_declaration!(block)
++  end
++
+   @placement {:deprecate, [under: [:field]]}
+   @doc """
+   Mark a field as deprecated
+@@ -477,7 +522,7 @@ defmodule Absinthe.Schema.Notation do
+   end
+ 
+   # FIELDS
+-  @placement {:field, [under: [:input_object, :interface, :object]]}
++  @placement {:field, [under: [:input_object, :interface, :object, :schema_declaration]]}
+   @doc """
+   Defines a GraphQL field
+ 
+@@ -933,7 +978,8 @@ defmodule Absinthe.Schema.Notation do
+                   :object,
+                   :scalar,
+                   :union,
+-                  :value
++                  :value,
++                  :schema_declaration
+                 ]
+               ]}
+ 
+@@ -1573,6 +1619,45 @@ defmodule Absinthe.Schema.Notation do
+     scoped_def(env, Schema.DirectiveDefinition, identifier, attrs, block)
+   end
+ 
++  @doc false
++  # Record a schema declaration, i.e. the contents of a `schema do ... end` block
++  def record_schema_declaration!(env, block) do
++    definition = %Schema.SchemaDeclaration{
++      module: env.module,
++      __reference__: build_reference(env)
++    }
++
++    ref = put_attr(env.module, definition)
++
++    push_stack(env.module, :absinthe_scope_stack, :schema_declaration)
++
++    [
++      get_desc(ref),
++      block,
++      quote(do: unquote(__MODULE__).close_scope())
++    ]
++  end
++
++  @doc false
++  # Record a `extend schema do ... end` extension of the schema declaration
++  def record_extend_schema_declaration!(caller, block) do
++    attrs =
++      []
++      |> Keyword.put(:module, caller.module)
++      |> put_reference(caller)
++
++    definition = struct!(Schema.TypeExtensionDefinition, attrs)
++
++    put_attr(caller.module, definition)
++
++    push_stack(caller.module, :absinthe_scope_stack, :extend)
++
++    [
++      record_schema_declaration!(caller, block),
++      quote(do: unquote(__MODULE__).close_scope())
++    ]
++  end
++
+   def record_extend!(caller, attrs, type_block, extend_block) do
+     attrs =
+       attrs
+diff --git a/lib/absinthe/schema/notation/sdl.ex b/lib/absinthe/schema/notation/sdl.ex
+index 52f5615..7f63ccf 100644
+--- a/lib/absinthe/schema/notation/sdl.ex
++++ b/lib/absinthe/schema/notation/sdl.ex
+@@ -46,6 +46,15 @@ defmodule Absinthe.Schema.Notation.SDL do
+     |> do_put_ref(ref, opts)
+   end
+ 
++  defp put_ref(%{field_definitions: field_definitions, directives: directives} = node, ref, opts) do
++    %{
++      node
++      | field_definitions: Enum.map(field_definitions, &put_ref(&1, ref, opts)),
++        directives: Enum.map(directives, &put_ref(&1, ref, opts))
++    }
++    |> do_put_ref(ref, opts)
++  end
++
+   defp put_ref(%{arguments: args, directives: directives} = node, ref, opts) do
+     %{
+       node
+diff --git a/lib/absinthe/schema/notation/sdl_render.ex b/lib/absinthe/schema/notation/sdl_render.ex
+index bacf1d2..ee933d4 100644
+--- a/lib/absinthe/schema/notation/sdl_render.ex
++++ b/lib/absinthe/schema/notation/sdl_render.ex
+@@ -44,7 +44,7 @@ defmodule Absinthe.Schema.Notation.SDL.Render do
+           query: Enum.find(type_definitions, &(&1.identifier == :query)),
+           mutation: Enum.find(type_definitions, &(&1.identifier == :mutation)),
+           subscription: Enum.find(type_definitions, &(&1.identifier == :subscription)),
+-          description: Enum.find(type_definitions, &(&1.identifier == :__schema)).description
++          description: nil
+         }
+ 
+     directive_definitions =
+diff --git a/lib/absinthe/schema/persistent_term.ex b/lib/absinthe/schema/persistent_term.ex
+index 528d697..a1e0e13 100644
+--- a/lib/absinthe/schema/persistent_term.ex
++++ b/lib/absinthe/schema/persistent_term.ex
+@@ -89,6 +89,12 @@ if Code.ensure_loaded?(:persistent_term) do
+       |> Map.fetch!(:__absinthe_interface_implementors__)
+     end
+ 
++    def __absinthe_schema_declaration__(schema_mod) do
++      schema_mod
++      |> get()
++      |> Map.fetch!(:__absinthe_schema_declaration__)
++    end
++
+     @dialyzer {:nowarn_function, [get: 1]}
+     defp get(schema) do
+       :persistent_term.get({__MODULE__, schema})
+@@ -108,6 +114,7 @@ else
+     def __absinthe_types__(_, _), do: raise(@error)
+     def __absinthe_directives__(_), do: raise(@error)
+     def __absinthe_interface_implementors__(_), do: raise(@error)
++    def __absinthe_schema_declaration__(_), do: raise(@error)
+     def __absinthe_prototype_schema__(), do: raise(@error)
+   end
+ end
+diff --git a/lib/absinthe/schema/provider.ex b/lib/absinthe/schema/provider.ex
+index b7ef2d5..6398bd9 100644
+--- a/lib/absinthe/schema/provider.ex
++++ b/lib/absinthe/schema/provider.ex
+@@ -25,4 +25,7 @@ defmodule Absinthe.Schema.Provider do
+   @callback __absinthe_directives__(schema_identifier) :: Absinthe.Type.Directive.t()
+ 
+   @callback __absinthe_interface_implementors__(schema_identifier) :: term
++
++  @callback __absinthe_schema_declaration__(schema_identifier) ::
++              nil | Absinthe.Blueprint.Schema.SchemaDeclaration.t()
+ end
+diff --git a/lib/absinthe/type/built_ins/introspection.ex b/lib/absinthe/type/built_ins/introspection.ex
+index 2ff90d1..be4fa65 100644
+--- a/lib/absinthe/type/built_ins/introspection.ex
++++ b/lib/absinthe/type/built_ins/introspection.ex
+@@ -8,7 +8,8 @@ defmodule Absinthe.Type.BuiltIns.Introspection do
+ 
+     field :description, :string do
+       resolve(fn _, %{schema: schema} ->
+-        {:ok, Absinthe.Schema.lookup_type(schema, :__schema).description}
++        declaration = schema.__absinthe_schema_declaration__()
++        {:ok, declaration && declaration.description}
+       end)
+     end
+ 
+diff --git a/test/absinthe/integration/execution/introspection/full_test.exs b/test/absinthe/integration/execution/introspection/full_test.exs
+index e4fa380..e4e2a26 100644
+--- a/test/absinthe/integration/execution/introspection/full_test.exs
++++ b/test/absinthe/integration/execution/introspection/full_test.exs
+@@ -5,7 +5,7 @@ defmodule Elixir.Absinthe.Integration.Execution.Introspection.FullTest do
+     result = Absinthe.Schema.introspect(Absinthe.Fixtures.ContactSchema)
+     {:ok, %{data: %{"__schema" => schema}}} = result
+ 
+-    assert schema["description"] == "Represents a schema"
++    assert schema["description"] == nil
+     assert schema["queryType"]
+     assert schema["mutationType"]
+     assert schema["subscriptionType"]
+diff --git a/test/absinthe/phase/schema/apply_declaration_test.exs b/test/absinthe/phase/schema/apply_declaration_test.exs
+new file mode 100644
+index 0000000..7b0ac99
+--- /dev/null
++++ b/test/absinthe/phase/schema/apply_declaration_test.exs
+@@ -0,0 +1,684 @@
++defmodule Absinthe.Phase.Schema.ApplyDeclarationTest do
++  @moduledoc """
++  Tests for schema declarations: the `schema` block (written in macro notation
++  or parsed from SDL), `extend schema` extensions, the inferred declaration,
++  and extending the root objects.
++  """
++
++  use Absinthe.Case, async: true
++
++  defmodule WithSchemaDirective do
++    use Absinthe.Schema.Prototype
++
++    directive :feature do
++      arg :name, :string
++
++      on [:schema, :object]
++    end
++  end
++
++  defmodule WithObjectDirective do
++    use Absinthe.Schema.Prototype
++
++    directive :object_only do
++      on [:object]
++    end
++  end
++
++  defp schema_description(schema_module) do
++    {:ok, %{data: %{"__schema" => %{"description" => description}}}} =
++      run("{ __schema { description } }", schema_module)
++
++    description
++  end
++
++  defp operation_types(schema_module) do
++    {:ok,
++     %{
++       data: %{
++         "__schema" => %{
++           "queryType" => query,
++           "mutationType" => mutation,
++           "subscriptionType" => subscription
++         }
++       }
++     }} =
++      run(
++        "{ __schema { queryType { name } mutationType { name } subscriptionType { name } } }",
++        schema_module
++      )
++
++    {query, mutation, subscription}
++  end
++
++  describe "macro schemas" do
++    test "a written declaration carries the description, directives and operation entries" do
++      defmodule MacroDeclaredSchema do
++        use Absinthe.Schema
++
++        @prototype_schema WithSchemaDirective
++
++        schema do
++          description "Catalog API"
++          directive :feature, name: "catalog"
++          field :query, :query
++          field :mutation, :mutation
++        end
++
++        query do
++          field :ping, :string
++        end
++
++        mutation name: "Writes" do
++          field :touch, :string
++        end
++      end
++
++      assert schema_description(MacroDeclaredSchema) == "Catalog API"
++
++      assert {
++               %{"name" => "RootQueryType"},
++               %{"name" => "Writes"},
++               nil
++             } = operation_types(MacroDeclaredSchema)
++
++      sdl = Absinthe.Schema.to_sdl(MacroDeclaredSchema)
++
++      # The declaration is the first thing rendered, preceded only by its
++      # description
++      assert String.starts_with?(sdl, "\"Catalog API\"\nschema @feature(name: \"catalog\") {")
++      assert sdl =~ ~s/query: RootQueryType/
++      assert sdl =~ ~s/mutation: Writes/
++      refute sdl =~ ~s/subscription:/
++
++      # Operations execute against the declared roots
++      assert {:ok, %{data: %{"ping" => "pong"}}} =
++               run("{ ping }", MacroDeclaredSchema, root_value: %{ping: "pong"})
++
++      assert {:ok, %{data: %{"touch" => "touched"}}} =
++               run("mutation { touch }", MacroDeclaredSchema, root_value: %{touch: "touched"})
++    end
++
++    test "a multi-line description is rendered as a block string" do
++      defmodule MacroMultiLineDescriptionSchema do
++        use Absinthe.Schema
++
++        schema do
++          description """
++          Line one
++          Line two
++          """
++          field :query, :query
++        end
++
++        query do
++          field :ping, :string
++        end
++      end
++
++      assert schema_description(MacroMultiLineDescriptionSchema) == "Line one\nLine two"
++
++      sdl = Absinthe.Schema.to_sdl(MacroMultiLineDescriptionSchema)
++
++      assert String.starts_with?(
++               sdl,
++               "\"\"\"\nLine one\nLine two\n\"\"\"\nschema {"
++             )
++    end
++
++    test "extend schema adds directives and operation entries to the declaration" do
++      defmodule MacroExtendedSchema do
++        use Absinthe.Schema
++
++        @prototype_schema WithSchemaDirective
++
++        schema do
++          description "Extended API"
++          field :query, :query
++        end
++
++        extend schema do
++          directive :feature, name: "one"
++          field :mutation, :mutation
++        end
++
++        extend schema do
++          directive :feature, name: "two"
++          field :subscription, :subscription
++        end
++
++        query do
++          field :ping, :string
++        end
++
++        mutation do
++          field :touch, :string
++        end
++
++        subscription do
++          field :tick, :string do
++            config fn _, _ -> {:ok, topic: "ticks"} end
++          end
++        end
++      end
++
++      # Extensions do not change the description
++      assert schema_description(MacroExtendedSchema) == "Extended API"
++
++      assert {
++               %{"name" => "RootQueryType"},
++               %{"name" => "RootMutationType"},
++               %{"name" => "RootSubscriptionType"}
++             } = operation_types(MacroExtendedSchema)
++
++      sdl = Absinthe.Schema.to_sdl(MacroExtendedSchema)
++
++      assert String.starts_with?(sdl, "\"Extended API\"\nschema ")
++      assert sdl =~ ~s/@feature(name: "one")/
++      assert sdl =~ ~s/@feature(name: "two")/
++      assert sdl =~ ~s/query: RootQueryType/
++      assert sdl =~ ~s/mutation: RootMutationType/
++      assert sdl =~ ~s/subscription: RootSubscriptionType/
++    end
++
++    test "extend schema can add operation entries to the inferred declaration" do
++      defmodule MacroInferredExtendedSchema do
++        use Absinthe.Schema
++
++        extend schema do
++          field :mutation, :mutation
++        end
++
++        query do
++          field :ping, :string
++        end
++
++        mutation do
++          field :touch, :string
++        end
++      end
++
++      assert schema_description(MacroInferredExtendedSchema) == nil
++
++      assert {
++               %{"name" => "RootQueryType"},
++               %{"name" => "RootMutationType"},
++               nil
++             } = operation_types(MacroInferredExtendedSchema)
++
++      sdl = Absinthe.Schema.to_sdl(MacroInferredExtendedSchema)
++
++      assert String.starts_with?(sdl, "schema {")
++      assert sdl =~ ~s/query: RootQueryType/
++      assert sdl =~ ~s/mutation: RootMutationType/
++    end
++
++    test "the inferred declaration lists every defined root without a description" do
++      defmodule MacroInferredSchema do
++        use Absinthe.Schema
++
++        query do
++          field :ping, :string
++        end
++
++        mutation do
++          field :touch, :string
++        end
++      end
++
++      assert schema_description(MacroInferredSchema) == nil
++
++      assert {
++               %{"name" => "RootQueryType"},
++               %{"name" => "RootMutationType"},
++               nil
++             } = operation_types(MacroInferredSchema)
++
++      sdl = Absinthe.Schema.to_sdl(MacroInferredSchema)
++
++      assert String.starts_with?(sdl, "schema {")
++      assert sdl =~ ~s/query: RootQueryType/
++      assert sdl =~ ~s/mutation: RootMutationType/
++      refute sdl =~ "Represents a schema"
++    end
++
++    test "root objects can be extended like any other object" do
++      defmodule MacroExtendedRootsSchema do
++        use Absinthe.Schema
++
++        @prototype_schema WithSchemaDirective
++
++        query do
++          field :ping, :string
++        end
++
++        extend object(:query) do
++          directive :feature, name: "root"
++          field :extra, :string
++        end
++
++        mutation do
++          field :touch, :string
++        end
++
++        extend object(:mutation) do
++          field :wipe, :string
++        end
++
++        subscription do
++          field :tick, :string do
++            config fn _, _ -> {:ok, topic: "ticks"} end
++          end
++        end
++
++        extend object(:subscription) do
++          field :tock, :string do
++            config fn _, _ -> {:ok, topic: "tocks"} end
++          end
++        end
++      end
++
++      assert {:ok, %{data: %{"extra" => "extra!"}}} =
++               run("{ extra }", MacroExtendedRootsSchema, root_value: %{extra: "extra!"})
++
++      sdl = Absinthe.Schema.to_sdl(MacroExtendedRootsSchema)
++      assert sdl =~ ~s/type RootQueryType @feature(name: "root") {/
++      assert sdl =~ ~s/extra: String/
++      assert sdl =~ ~s/wipe: String/
++      assert sdl =~ ~s/type RootSubscriptionType {/
++      assert sdl =~ ~s/tick: String/
++      assert sdl =~ ~s/tock: String/
++    end
++
++    test "a second declaration fails compilation" do
++      assert_raise Absinthe.Schema.Error, ~r/more than one schema declaration/i, fn ->
++        defmodule MacroTwoDeclarationsSchema do
++          use Absinthe.Schema
++
++          schema do
++            field :query, :query
++          end
++
++          schema do
++            field :query, :query
++          end
++
++          query do
++          end
++        end
++      end
++    end
++
++    test "directives on the declaration must be defined for the schema location" do
++      assert_raise Absinthe.Schema.Error, ~r/unknown directive/i, fn ->
++        defmodule MacroUnknownDirectiveSchema do
++          use Absinthe.Schema
++
++          @prototype_schema WithObjectDirective
++
++          schema do
++            directive :nonexistent
++            field :query, :query
++          end
++
++          query do
++          end
++        end
++      end
++
++      assert_raise Absinthe.Schema.Error, ~r/may not be used on SCHEMA/i, fn ->
++        defmodule MacroMisplacedDirectiveSchema do
++          use Absinthe.Schema
++
++          @prototype_schema WithObjectDirective
++
++          schema do
++            directive :object_only
++            field :query, :query
++          end
++
++          query do
++          end
++        end
++      end
++    end
++
++    test "operation entries must name defined types" do
++      assert_raise Absinthe.Schema.Error, ~r/is not defined in your schema/, fn ->
++        defmodule MacroUndefinedEntrySchema do
++          use Absinthe.Schema
++
++          schema do
++            field :query, :nope
++          end
++
++          query do
++          end
++        end
++      end
++    end
++
++    test "the schema declaration is only allowed toplevel" do
++      assert_raise Absinthe.Schema.Notation.Error, ~r/must only be used toplevel/, fn ->
++        defmodule MacroNestedDeclarationSchema do
++          use Absinthe.Schema
++
++          query do
++          end
++
++          object :thing do
++            schema do
++              field :query, :query
++            end
++          end
++        end
++      end
++    end
++
++    test "objects still cannot be created with reserved identifiers" do
++      assert_raise Absinthe.Schema.Notation.Error,
++                   ~r/cannot create an `object` with reserved identifier `query`/, fn ->
++        defmodule MacroReservedIdentifierSchema do
++          use Absinthe.Schema
++
++          query do
++          end
++
++          object :query do
++          end
++        end
++      end
++    end
++
++    test "extending a root object that is not defined fails compilation" do
++      assert_raise Absinthe.Schema.Error, ~r/not\s+defined in your schema/, fn ->
++        defmodule MacroUndefinedRootExtensionSchema do
++          use Absinthe.Schema
++
++          query do
++          end
++
++          extend object(:mutation) do
++            field :wipe, :string
++          end
++        end
++      end
++    end
++  end
++
++  describe "SDL schemas" do
++    test "a written declaration carries the description and directives" do
++      defmodule SdlDeclaredSchema do
++        use Absinthe.Schema
++
++        @prototype_schema WithSchemaDirective
++
++        """
++        "Catalog API"
++        schema @feature(name: "catalog") {
++          query: Query
++          mutation: Writes
++        }
++
++        type Query { ping: String }
++        type Writes { touch: String }
++        """
++        |> import_sdl
++
++        def hydrate(_node, _ancestors), do: []
++      end
++
++      assert schema_description(SdlDeclaredSchema) == "Catalog API"
++
++      assert {
++               %{"name" => "Query"},
++               %{"name" => "Writes"},
++               nil
++             } = operation_types(SdlDeclaredSchema)
++
++      sdl = Absinthe.Schema.to_sdl(SdlDeclaredSchema)
++
++      assert String.starts_with?(sdl, "\"Catalog API\"\nschema @feature(name: \"catalog\") {")
++      assert sdl =~ ~s/query: Query/
++      assert sdl =~ ~s/mutation: Writes/
++
++      assert {:ok, %{data: %{"ping" => "pong"}}} =
++               run("{ ping }", SdlDeclaredSchema, root_value: %{ping: "pong"})
++    end
++
++    test "extend schema adds directives and operation entries" do
++      defmodule SdlExtendedSchema do
++        use Absinthe.Schema
++
++        @prototype_schema WithSchemaDirective
++
++        """
++        "Extended API"
++        schema {
++          query: Query
++        }
++
++        type Query { ping: String }
++        type Writes { touch: String }
++
++        extend schema @feature(name: "extended") {
++          mutation: Writes
++        }
++
++        extend schema @feature(name: "twice")
++        """
++        |> import_sdl
++
++        def hydrate(_node, _ancestors), do: []
++      end
++
++      # Extensions do not change the description
++      assert schema_description(SdlExtendedSchema) == "Extended API"
++
++      assert {
++               %{"name" => "Query"},
++               %{"name" => "Writes"},
++               nil
++             } = operation_types(SdlExtendedSchema)
++
++      sdl = Absinthe.Schema.to_sdl(SdlExtendedSchema)
++
++      assert String.starts_with?(sdl, "\"Extended API\"\nschema ")
++      assert sdl =~ ~s/@feature(name: "extended")/
++      assert sdl =~ ~s/@feature(name: "twice")/
++      assert sdl =~ ~s/query: Query/
++      assert sdl =~ ~s/mutation: Writes/
++
++      # A type named by an extension is the operation's root
++      assert {:ok, %{data: %{"touch" => "touched"}}} =
++               run("mutation { touch }", SdlExtendedSchema, root_value: %{touch: "touched"})
++    end
++
++    test "extend schema can define the operation roots of an inferred declaration" do
++      defmodule SdlInferredExtendedSchema do
++        use Absinthe.Schema
++
++        @prototype_schema WithSchemaDirective
++
++        """
++        type Query { ping: String }
++        type Feed { tick: String }
++
++        extend schema @feature(name: "extended") {
++          subscription: Feed
++        }
++        """
++        |> import_sdl
++
++        def hydrate(_node, _ancestors), do: []
++      end
++
++      assert schema_description(SdlInferredExtendedSchema) == nil
++
++      assert {
++               %{"name" => "Query"},
++               nil,
++               %{"name" => "Feed"}
++             } = operation_types(SdlInferredExtendedSchema)
++
++      sdl = Absinthe.Schema.to_sdl(SdlInferredExtendedSchema)
++
++      assert String.starts_with?(sdl, "schema ")
++      assert sdl =~ ~s/@feature(name: "extended")/
++      assert sdl =~ ~s/query: Query/
++      assert sdl =~ ~s/subscription: Feed/
++      refute sdl =~ "Represents a schema"
++    end
++
++    test "the inferred declaration lists every root named by the SDL types" do
++      defmodule SdlInferredSchema do
++        use Absinthe.Schema
++
++        """
++        type Query { ping: String }
++        type Mutation { touch: String }
++        type Subscription { tick: String }
++        """
++        |> import_sdl
++
++        def hydrate(_node, _ancestors), do: []
++      end
++
++      assert schema_description(SdlInferredSchema) == nil
++
++      assert {
++               %{"name" => "Query"},
++               %{"name" => "Mutation"},
++               %{"name" => "Subscription"}
++             } = operation_types(SdlInferredSchema)
++
++      sdl = Absinthe.Schema.to_sdl(SdlInferredSchema)
++
++      assert String.starts_with?(sdl, "schema {")
++      assert sdl =~ ~s/query: Query/
++      assert sdl =~ ~s/mutation: Mutation/
++      assert sdl =~ ~s/subscription: Subscription/
++      refute sdl =~ "Represents a schema"
++    end
++
++    test "two schema definitions fail compilation" do
++      assert_raise Absinthe.Schema.Error, ~r/more than one schema declaration/i, fn ->
++        defmodule SdlTwoDeclarationsSchema do
++          use Absinthe.Schema
++
++          """
++          schema { query: Query }
++          schema { query: Query }
++          type Query { ping: String }
++          """
++          |> import_sdl
++
++          def hydrate(_node, _ancestors), do: []
++        end
++      end
++    end
++
++    test "directives on the declaration must be defined for the schema location" do
++      assert_raise Absinthe.Schema.Error, ~r/unknown directive/i, fn ->
++        defmodule SdlUnknownDirectiveSchema do
++          use Absinthe.Schema
++
++          @prototype_schema WithObjectDirective
++
++          """
++          schema @nonexistent { query: Query }
++          type Query { ping: String }
++          """
++          |> import_sdl
++
++          def hydrate(_node, _ancestors), do: []
++        end
++      end
++
++      assert_raise Absinthe.Schema.Error, ~r/may not be used on SCHEMA/i, fn ->
++        defmodule SdlMisplacedDirectiveSchema do
++          use Absinthe.Schema
++
++          @prototype_schema WithObjectDirective
++
++          """
++          schema @object_only { query: Query }
++          type Query { ping: String }
++          """
++          |> import_sdl
++
++          def hydrate(_node, _ancestors), do: []
++        end
++      end
++    end
++
++    test "operation entries must name defined types" do
++      assert_raise Absinthe.Schema.Error, ~r/is not defined in your schema/, fn ->
++        defmodule SdlUndefinedEntrySchema do
++          use Absinthe.Schema
++
++          """
++          schema { query: Query }
++          type Query { ping: String }
++
++          extend schema { mutation: Ghost }
++          """
++          |> import_sdl
++
++          def hydrate(_node, _ancestors), do: []
++        end
++      end
++    end
++  end
++
++  describe "schema providers" do
++    test "the PersistentTerm provider reports the declaration" do
++      defmodule PersistentTermDeclaredSchema do
++        use Absinthe.Schema
++
++        @schema_provider Absinthe.Schema.PersistentTerm
++        @prototype_schema WithSchemaDirective
++
++        schema do
++          description "Persistent API"
++          directive :feature, name: "persistent"
++          field :query, :query
++        end
++
++        query do
++          field :ping, :string
++        end
++      end
++
++      assert schema_description(PersistentTermDeclaredSchema) == "Persistent API"
++
++      assert {%{"name" => "RootQueryType"}, nil, nil} =
++               operation_types(PersistentTermDeclaredSchema)
++
++      sdl = Absinthe.Schema.to_sdl(PersistentTermDeclaredSchema)
++
++      assert String.starts_with?(sdl, "\"Persistent API\"\nschema @feature(name: \"persistent\") {")
++      assert sdl =~ ~s/query: RootQueryType/
++
++      assert {:ok, %{data: %{"ping" => "pong"}}} =
++               run("{ ping }", PersistentTermDeclaredSchema, root_value: %{ping: "pong"})
++    end
++  end
++
++  describe "introspection" do
++    test "the __Schema type keeps its own description" do
++      defmodule IntrospectionSchema do
++        use Absinthe.Schema
++
++        query do
++          field :ping, :string
++        end
++      end
++
++      {:ok, %{data: %{"__type" => type}}} =
++        run("{ __type(name: \"__Schema\") { name description } }", IntrospectionSchema)
++
++      assert type == %{"name" => "__Schema", "description" => "Represents a schema"}
++    end
++  end
++end
+diff --git a/test/absinthe/schema/notation_test.exs b/test/absinthe/schema/notation_test.exs
+index 87a40ac..86503e4 100644
+--- a/test/absinthe/schema/notation_test.exs
++++ b/test/absinthe/schema/notation_test.exs
+@@ -109,7 +109,7 @@ defmodule Absinthe.Schema.NotationTest do
+         """
+         field :foo, :string
+         """,
+-        "Invalid schema notation: `field` must only be used within `input_object`, `interface`, `object`. Was used in `schema`."
++        "Invalid schema notation: `field` must only be used within `input_object`, `interface`, `object`, `schema_declaration`. Was used in `schema`."
+       )
+     end
+   end
+diff --git a/test/absinthe/schema/sdl_render_test.exs b/test/absinthe/schema/sdl_render_test.exs
+index f9d27f3..a574136 100644
+--- a/test/absinthe/schema/sdl_render_test.exs
++++ b/test/absinthe/schema/sdl_render_test.exs
+@@ -240,7 +240,6 @@ defmodule Absinthe.Schema.SdlRenderTest do
+   test "Render SDL from blueprint defined with macros" do
+     assert Absinthe.Schema.to_sdl(MacroTestSchema) ==
+              """
+-             "Represents a schema"
+              schema {
+                query: RootQueryType
+              }
+diff --git a/test/absinthe/schema/type_system_directive_test.exs b/test/absinthe/schema/type_system_directive_test.exs
+index b244038..553b89c 100644
+--- a/test/absinthe/schema/type_system_directive_test.exs
++++ b/test/absinthe/schema/type_system_directive_test.exs
+@@ -179,7 +179,6 @@ defmodule Absinthe.Schema.TypeSystemDirectiveTest do
+   end
+ 
+   @macro_schema_sdl """
+-  "Represents a schema"
+   schema {
+     query: RootQueryType
+   }
+diff --git a/test/absinthe/schema_test.exs b/test/absinthe/schema_test.exs
+index 6f11ba8..557f53f 100644
+--- a/test/absinthe/schema_test.exs
++++ b/test/absinthe/schema_test.exs
+@@ -300,7 +300,7 @@ defmodule Absinthe.SchemaTest do
+   describe "to_sdl/1" do
+     test "return schema sdl" do
+       assert Schema.to_sdl(SourceSchema) == """
+-             \"Represents a schema\"\nschema {\n  query: RootQueryType\n}\n\ntype Foo {\n  name: String\n}\n\n\"can describe query\"\ntype RootQueryType {\n  foo: Foo\n}
++             schema {\n  query: RootQueryType\n}\n\ntype Foo {\n  name: String\n}\n\n\"can describe query\"\ntype RootQueryType {\n  foo: Foo\n}
+              """
+     end
+   end

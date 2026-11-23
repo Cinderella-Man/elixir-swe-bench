@@ -4,8 +4,9 @@ defmodule Eab.Series do
   through one harness on one case set. Runs join when their setup matches; hardware,
   endpoint, model file path, server build, slot count, seed, benchmark code version and
   Claude Code program version may differ. Each run of a model server draws its own random
-  seed (ADR 0025), and a seed counts once: the first run with a final score that has it.
-  Series published before then took seeds 101, 102 and 103 and keep them.
+  seed (ADR 0025). A seed does not make a run repeat, so a series takes its first three runs
+  with final scores whatever their seeds. Series published before then took seeds 101, 102
+  and 103 once each, and keep those runs.
   """
   alias Eab.{Cache, Inventory, ModelIdentity, Runner}
 
@@ -22,8 +23,8 @@ defmodule Eab.Series do
   def required, do: @required
 
   @doc """
-  A random seed for a run, none of `taken`. Machines that start runs of one model on their own
-  would otherwise pick the same seeds, and a seed counts once in a series (ADR 0025).
+  A random seed for a run, none of `taken`, so runs started on different machines record
+  different seeds (ADR 0025).
   """
   def random_seed(taken \\ []) do
     <<n::32>> = :crypto.strong_rand_bytes(4)
@@ -166,12 +167,11 @@ defmodule Eab.Series do
 
   def seeded?(run), do: is_integer(get_in(run, ["settings", "seed"]))
 
-  @doc "The runs that count, oldest first: the first three scored runs, one per seed."
+  @doc "The runs that count, oldest first: the first three scored runs, whatever their seeds."
   def counted(runs) do
     runs
     |> Enum.filter(&eligible?/1)
     |> Enum.sort_by(& &1["created_at"])
-    |> Enum.uniq_by(&if(seeded?(&1), do: get_in(&1, ["settings", "seed"]), else: &1["id"]))
     |> Enum.take(@required)
   end
 
@@ -300,46 +300,8 @@ defmodule Eab.Series do
             Enum.map_join(differences, ", ", &String.replace(&1, "_", " ")) <> " differ"
         )
 
-    filled = Enum.map(record["runs"], & &1["seed"])
-    seed = get_in(run, ["settings", "seed"])
-
-    cond do
-      length(record["runs"]) >= @required ->
-        raise "Run series #{String.slice(series_id, 0, 12)} already has #{@required} runs"
-
-      record["seeds"] && seed in filled ->
-        raise "Run series #{String.slice(series_id, 0, 12)} already has a run with seed " <>
-                "#{seed}; leave the seed empty to draw a new one"
-
-      true ->
-        :ok
-    end
-  end
-
-  @doc """
-  Checks a full run about to start for no series. A run joins the published series its setup
-  matches once it is added to the results page, so where such a series still takes runs, the
-  run's seed must be free there, or the run would be refused at publication. `records` are
-  the published series.
-  """
-  def fresh!(run, opts \\ []) do
-    seed = get_in(run, ["settings", "seed"])
-    records = Keyword.get_lazy(opts, :records, &Eab.Results.load!/0)
-
-    for record <- records,
-        is_nil(closed_reason(record)),
-        length(record["runs"]) < @required,
-        differences(record, run) == [],
-        not other_upload?(record, run) do
-      filled = Enum.map(record["runs"], & &1["seed"])
-
-      if is_integer(seed) and seed in filled do
-        raise "#{record["model"]["name"]} already has a run with seed #{seed} on the results " <>
-                "page (run series #{String.slice(record["series_id"], 0, 12)}, " <>
-                "#{length(filled)} of #{@required} runs), so this run could never be added. " <>
-                "Leave the seed empty to draw a new one."
-      end
-    end
+    if length(record["runs"]) >= @required,
+      do: raise("Run series #{String.slice(series_id, 0, 12)} already has #{@required} runs")
 
     :ok
   end
@@ -369,14 +331,6 @@ defmodule Eab.Series do
     for field <- Enum.sort(Map.keys(expected)),
         expected[field] != actual[field],
         do: field
-  end
-
-  # A declared source whose Hub lookup names other bytes than the series recorded is most
-  # likely a re-upload under the same name, which is another series (ADR 0018).
-  defp other_upload?(record, run) do
-    declared = get_in(run, ["model", "source", "lookup", "files"])
-    recorded = get_in(record, ["setup", "model", "sha256"])
-    is_list(declared) and is_list(recorded) and Enum.map(declared, & &1["sha256"]) != recorded
   end
 
   @doc false

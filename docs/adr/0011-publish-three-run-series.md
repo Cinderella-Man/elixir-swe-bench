@@ -1,6 +1,6 @@
 # Publish three-run series and keep runs valid across code changes
 
-Amended by [ADR 0025](0025-let-runs-from-several-machines-join-one-series.md): each run draws a random seed, and a series takes its first three runs with distinct seeds.
+Amended by [ADR 0025](0025-let-runs-from-several-machines-join-one-series.md): each run draws a random seed, and a series takes its first three runs with final scores, whatever their seeds.
 
 Repeated runs of one model with identical settings and seed give different case outcomes: sampling, GPU batching and the agent's own unseeded test output all vary, and subscription APIs offer no seed ([research](../research/run-to-run-variance-2026-10-26.md)). A published result is therefore a run series: three ordinary runs of one model artifact and quantization through one harness on one benchmark release, using seeds 101, 102 and 103 where the endpoint supports seeds. Its score is the mean of its runs' scores. Its ± covers rerun noise on the frozen cases only, computed from per-case pass counts as the Terminal-Bench leaderboard does, `sqrt(Σ pᵢ(1−pᵢ)/(k−1)) / n` shown as ±1.96·SE once two runs exist. Every series on a release gets the same number of runs; a much larger release may lower it. This amends [ADR 0003](0003-single-model-website.md) and replaces the rule that a published result is one run.
 

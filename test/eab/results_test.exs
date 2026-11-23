@@ -92,7 +92,7 @@ defmodule Eab.ResultsTest do
   test "public export uses exact artifact identity, outcomes and weight size, and omits private data" do
     result = Results.export!(run())
     assert Enum.map(entry(result)["cases"], & &1["passed"]) == [true, false]
-    assert entry(result)["seed"] == 101 and result["seeds"] == "distinct"
+    assert entry(result)["seed"] == 101 and result["seeds"] == "any"
     refute Map.has_key?(result["settings"], "seed")
     assert result["harness"] == %{"name" => "pi", "version" => "unknown"}
     assert result["series_id"] == Eab.Series.id(run())
@@ -249,7 +249,7 @@ defmodule Eab.ResultsTest do
     end
 
     record = Results.export!(timed.(run()))
-    assert record["schema_version"] == 13 and record["seeds"] == "distinct"
+    assert record["schema_version"] == 13 and record["seeds"] == "any"
 
     published =
       record
@@ -281,12 +281,12 @@ defmodule Eab.ResultsTest do
       |> timed.()
       |> Results.export!()
 
-    # Since schema 13 a series takes any seed it does not have yet; old runs keep theirs.
+    # Since schema 13 a series takes a run with any seed; old runs keep theirs.
     merged = Results.merge!(published, second)
-    assert merged["schema_version"] == 13 and merged["seeds"] == "distinct"
+    assert merged["schema_version"] == 13 and merged["seeds"] == "any"
     assert Enum.map(merged["runs"], & &1["seed"]) == [101, 1_734_026_581]
 
-    assert_raise ArgumentError, ~r/distinct seeds/, fn ->
+    assert_raise ArgumentError, ~r/runs with any seeds/, fn ->
       Results.validate!(Map.put(merged, "seeds", [101, 102, 103]))
     end
 

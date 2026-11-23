@@ -2665,7 +2665,7 @@ defmodule EabWeb.DashboardLive do
       <details class="case-inventory" id="run-series" open={not is_nil(@series)}>
         <summary>Run series</summary>
         <p class="fine-print">
-          A published result is a series of three runs with identical setup. Each local run draws a random seed and each seed counts once; subscription series take their first three scored runs. The score is the mean; ± is 1.96 standard errors of rerun noise on these cases, shown from two runs. Validation runs never join a series.
+          A published result is a series of three runs with identical setup. Each local run draws a random seed; a series takes its first three scored runs, whatever their seeds. The score is the mean; ± is 1.96 standard errors of rerun noise on these cases, shown from two runs. Validation runs never join a series.
         </p>
         <button class="secondary" phx-click="series">Load run series</button>
         <p :if={@series_error} class="notice error">{@series_error}</p>

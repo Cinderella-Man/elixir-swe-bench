@@ -1,0 +1,213 @@
+diff --git a/lib/livebook/live_markdown/import.ex b/lib/livebook/live_markdown/import.ex
+index af8a195..f5f958f 100644
+--- a/lib/livebook/live_markdown/import.ex
++++ b/lib/livebook/live_markdown/import.ex
+@@ -632,8 +632,9 @@ defmodule Livebook.LiveMarkdown.Import do
+ 
+     {stamp_verified?, notebook, messages} =
+       with %{"offset" => offset, "stamp" => stamp} <- stamp_data,
+-           {:ok, notebook_source} <- safe_binary_slice(notebook_source, 0, offset),
+-           {:ok, metadata} <- Livebook.Hubs.verify_notebook_stamp(hub, notebook_source, stamp) do
++           {:ok, signed_source} <- safe_binary_slice(notebook_source, 0, offset),
++           true <- stamp_directly_follows_signed_prefix?(notebook_source, stamp_data, offset),
++           {:ok, metadata} <- Livebook.Hubs.verify_notebook_stamp(hub, signed_source, stamp) do
+         notebook = apply_stamp_metadata(notebook, metadata)
+         {true, notebook, []}
+       else
+@@ -666,6 +667,78 @@ defmodule Livebook.LiveMarkdown.Import do
+     {:ok, binary_slice(binary, start, size)}
+   end
+ 
++  # The stamp is signed over the first `offset` bytes of the notebook
++  # only. To make sure that no content is added between the signed
++  # portion of the notebook and its stamp (which would leave the added
++  # content unsigned), we require the stamp comment to be the first
++  # non-blank line after the signed prefix.
++  defp stamp_directly_follows_signed_prefix?(notebook_source, stamp_data, offset) do
++    case stamp_comment_position(notebook_source, stamp_data) do
++      :not_found ->
++        false
++
++      position when position < offset ->
++        false
++
++      position ->
++        between = binary_part(notebook_source, offset, position - offset)
++        blank_lines_only?(between)
++    end
++  end
++
++  # Returns the byte position where the line containing the given stamp
++  # comment starts, or :not_found.
++  defp stamp_comment_position(markdown, stamp_data) do
++    lines = :binary.split(markdown, "\n", [:global])
++    stamp_comment_position(lines, stamp_data, 0)
++  end
++
++  defp stamp_comment_position([line | rest], stamp_data, position) do
++    if stamp_comment_line?(line, stamp_data) do
++      position
++    else
++      stamp_comment_position(rest, stamp_data, position + byte_size(line) + 1)
++    end
++  end
++
++  defp stamp_comment_position([], _stamp_data, _position), do: :not_found
++
++  defp stamp_comment_line?(line, stamp_data) do
++    prefix = ~s(<!-- livebook:)
++    suffix = ~s( -->)
++
++    cond do
++      not String.starts_with?(line, prefix) ->
++        false
++
++      not String.ends_with?(line, suffix) ->
++        false
++
++      true ->
++        json =
++          String.slice(
++            line,
++            byte_size(prefix),
++            byte_size(line) - byte_size(prefix) - byte_size(suffix)
++          )
++
++        case Jason.decode(json) do
++          {:ok, decoded} -> decoded == stamp_data
++          {:error, _} -> false
++        end
++    end
++  end
++
++  defp blank_lines_only?(binary) do
++    binary
++    |> :binary.split("\n", [:global])
++    |> Enum.all?(&blank_line?/1)
++  end
++
++  defp blank_line?(line) do
++    Enum.all?(:binary.bin_to_list(line), fn byte -> byte in [?\s, ?\t] end)
++  end
++
+   defp apply_stamp_metadata(notebook, metadata) do
+     Enum.reduce(metadata, notebook, fn
+       {:hub_secret_names, hub_secret_names}, notebook ->
+diff --git a/test/livebook/live_markdown/import_test.exs b/test/livebook/live_markdown/import_test.exs
+index 928fadc..88f9ebc 100644
+--- a/test/livebook/live_markdown/import_test.exs
++++ b/test/livebook/live_markdown/import_test.exs
+@@ -7,6 +7,8 @@ defmodule Livebook.LiveMarkdown.ImportTest do
+   alias Livebook.Notebook
+   alias Livebook.Notebook.Cell
+ 
++  @stamp_comment_prefix "<!-- livebook:{\"offset\""
++
+   test "acceptance" do
+     markdown = """
+     # My Notebook
+@@ -1274,6 +1276,79 @@ defmodule Livebook.LiveMarkdown.ImportTest do
+ 
+       Livebook.Hubs.delete_hub(hub.id)
+     end
++
++    test "does not verify the stamp when content is added between the signed content and the stamp" do
++      markdown = signed_personal_hub_notebook("My Notebook")
++
++      personal_hub_warning =
++        "this notebook can only access environment variables defined in this machine (the notebook was either authored in another machine or changed outside of Livebook)"
++
++      additions = [
++        # A new Elixir code cell
++        {"```elixir\nIO.puts(\"pwned\")\n```", ~s|IO.puts("pwned")|},
++        # A new Erlang code cell
++        {"```erlang\nio:format(\"pwned\").\n```", ~s|io:format("pwned").|},
++        # A markdown paragraph
++        {"Some extra text.", "Some extra text."},
++        # A new section
++        {"## Section 2\n\n```elixir\nIO.puts(\"pwned\")\n```", "Section 2"}
++      ]
++
++      for {addition, added_content} <- additions do
++        # Insert the new content between the signed portion and the stamp
++        altered =
++          String.replace(
++            markdown,
++            @stamp_comment_prefix,
++            addition <> "\n\n" <> @stamp_comment_prefix
++          )
++
++        {notebook, result} = Import.notebook_from_livemd(altered)
++
++        assert %{warnings: [^personal_hub_warning], stamp_verified?: false} = result
++        assert %Notebook{hub_secret_names: []} = notebook
++
++        # The added content is still imported
++        sources =
++          notebook
++          |> Notebook.cells_with_section()
++          |> Enum.map(fn {cell, _section} -> cell.source end)
++
++        names = Enum.map(notebook.sections, & &1.name)
++        assert Enum.any?(sources ++ names, &String.contains?(&1, added_content))
++      end
++    end
++
++    test "verifies the stamp of a freshly exported notebook, including one with a non-ASCII name" do
++      for name <- ["My Notebook", "Nötebök 📓"] do
++        markdown = signed_personal_hub_notebook(name)
++
++        {notebook, %{warnings: [], stamp_verified?: true}} =
++          Import.notebook_from_livemd(markdown)
++
++        assert %Notebook{name: ^name, hub_secret_names: ["DB_PASSWORD"]} = notebook
++      end
++    end
++
++    test "keeps the stamp valid when blank lines are added between the signed content and the stamp" do
++      markdown = signed_personal_hub_notebook("My Notebook")
++
++      blank_lines = [
++        "\n",
++        "\n\n",
++        "\n   \n\t\n \t \n"
++      ]
++
++      for blank_line <- blank_lines do
++        altered =
++          String.replace(markdown, @stamp_comment_prefix, blank_line <> @stamp_comment_prefix)
++
++        {notebook, %{warnings: [], stamp_verified?: true}} =
++          Import.notebook_from_livemd(altered)
++
++        assert %Notebook{hub_secret_names: ["DB_PASSWORD"]} = notebook
++      end
++    end
+   end
+ 
+   describe "file entries" do
+@@ -1403,4 +1478,24 @@ defmodule Livebook.LiveMarkdown.ImportTest do
+       assert notebook.quarantine_file_entry_names == MapSet.new(["document1.pdf"])
+     end
+   end
++
++  # Exports a notebook belonging to the personal hub (which is saved in
++  # test setup with a fixed secret key) and returns the signed Live
++  # Markdown source.
++  defp signed_personal_hub_notebook(name) do
++    notebook = %{Notebook.new() | name: name, hub_secret_names: ["DB_PASSWORD"]}
++
++    section = %{
++      Notebook.Section.new()
++      | name: "Section 1",
++        cells: [
++          %{Notebook.Cell.new(:code) | source: ~s|IO.puts("hey")|}
++        ]
++    }
++
++    notebook = %{notebook | sections: [section]}
++
++    {markdown, []} = Livebook.LiveMarkdown.Export.notebook_to_livemd(notebook)
++    markdown
++  end
+ end

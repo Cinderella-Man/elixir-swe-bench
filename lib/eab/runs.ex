@@ -798,19 +798,14 @@ defmodule Eab.Runs do
           List.duplicate(settings, count - 1)
       end
 
-    # A seed a series already has would only be refused hours later, at its run's start or
-    # when the run is added to the results page.
-    if later != [] do
+    # A contribution that does not match its series would only be refused hours later, at its
+    # run's start.
+    if opts[:series] do
       release = Release.freeze()
-      records = if is_nil(opts[:series]), do: Eab.Results.load!()
 
       for settings <- later do
         settings = Model.settings(endpoint, without_caps(endpoint, settings))
-        run = new_run(release, endpoint, settings)
-
-        if opts[:series],
-          do: Eab.Series.contribution!(run, opts[:series]),
-          else: Eab.Series.fresh!(run, records: records)
+        Eab.Series.contribution!(new_run(release, endpoint, settings), opts[:series])
       end
     end
 
@@ -846,7 +841,6 @@ defmodule Eab.Runs do
           Map.put(run, "series", opts[:series])
 
         true ->
-          Eab.Series.fresh!(run)
           run
       end
 

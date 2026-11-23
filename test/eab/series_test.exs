@@ -107,7 +107,7 @@ defmodule Eab.SeriesTest do
     assert Series.id(claude.("2.1.308")) == Series.id(claude.("2.1.311"))
   end
 
-  test "each seed counts once, errored and validation runs leave room" do
+  test "a series takes its first three scored runs whatever their seeds" do
     first = run("first", 101, [false], "2026-10-27T10:00:00Z")
     again = run("again", 101, [], "2026-10-27T11:00:00Z")
 
@@ -118,14 +118,12 @@ defmodule Eab.SeriesTest do
     validation = run("validation", 103, [], "2026-10-27T13:00:00Z") |> Map.put("validation", true)
     drawn = run("drawn", 1_734_026_581, [false, false], "2026-10-27T14:00:00Z")
 
+    # A repeated seed counts like any other: a seed does not make a run repeat.
     [series] = Series.group([again, errored, validation, drawn, first])
-    assert series["runs"] == ["first", "drawn"]
-    assert series["run_count"] == 2 and not series["complete"]
+    assert series["runs"] == ["first", "again", "drawn"] and series["complete"]
 
-    # Any three seeds fill a series: its first three scored runs with distinct seeds.
-    more = for n <- 1..2, do: run("more-#{n}", 2_000 + n, [], "2026-10-28T0#{n}:00:00Z")
-    [series] = Series.group([first, drawn, again | more])
-    assert series["runs"] == ["first", "drawn", "more-1"] and series["complete"]
+    [series] = Series.group([errored, validation, first])
+    assert series["runs"] == ["first"] and series["run_count"] == 1 and not series["complete"]
 
     seeds = for _ <- 1..200, do: Series.random_seed([5])
     assert Enum.all?(seeds, &(&1 in 1..2_147_483_647 and &1 != 5))
@@ -214,27 +212,25 @@ defmodule Eab.SeriesTest do
         do: assert(Map.keys(entry) |> Enum.sort() == ~w(reason release_id run_id))
   end
 
-  test "published series take each seed once and at most three runs", %{page: page} do
+  test "published series take three runs, a repeated seed too", %{page: page} do
     opts = [page_root: page]
     assert Results.publish!(run("first", 101, [false]), opts) == :added
-
-    assert_raise ArgumentError, ~r/Seed 101 already has a run/, fn ->
-      Results.publish!(run("again", 101, [], "2026-10-27T11:00:00Z"), opts)
-    end
+    assert Results.publish!(run("again", 101, [], "2026-10-27T11:00:00Z"), opts) == :added
 
     assert_raise ArgumentError, ~r/never published/, fn ->
       Results.publish!(Map.put(run("checked", 102, []), "validation", true), opts)
     end
 
-    for {id, seed} <- [{"second", 102}, {"third", 103}],
-        do:
-          assert(
-            Results.publish!(run(id, seed, [], "2026-10-28T00:00:0#{seed - 100}Z"), opts) ==
-              :added
-          )
+    assert Results.publish!(run("third", 1_734_026_581, [], "2026-10-28T00:00:01Z"), opts) ==
+             :added
+
+    assert_raise ArgumentError, ~r/already has 3 runs/, fn ->
+      Results.publish!(run("fourth", 102, [], "2026-10-28T00:00:02Z"), opts)
+    end
 
     [series] = Results.load!(Path.join(page, "results"))
-    assert Results.aggregate(series)["complete"]
+    assert Enum.map(series["runs"], & &1["seed"]) == [101, 101, 1_734_026_581]
+    assert series["seeds"] == "any" and Results.aggregate(series)["complete"]
   end
 
   # What the memory collector saw of the served file, with the maker its header names.
@@ -406,40 +402,6 @@ defmodule Eab.SeriesTest do
     assert Results.publish!(template, page_root: page, resources: nil) == :added
   end
 
-  test "a fresh run that would join a published series needs a seed it does not have yet",
-       %{page: page} do
-    first = hashed(run("first", 101, [false]), String.duplicate("d", 64))
-    Results.publish!(first, page_root: page, resources: nil)
-    id = Series.id(first)
-
-    error = assert_raise RuntimeError, fn -> Series.fresh!(run("again", 101, [])) end
-    assert error.message =~ "Swift-27B already has a run with seed 101 on the results page"
-    assert error.message =~ "(run series #{String.slice(id, 0, 12)}, 1 of 3 runs)"
-    assert error.message =~ "Leave the seed empty to draw a new one"
-
-    # Another seed joins the series once its run is added to the results page.
-    assert :ok = Series.fresh!(run("next", 1_734_026_581, []))
-
-    # A declared source that names other bytes is a re-upload: another series, any seed.
-    reupload =
-      put_in(run("reupload", 101, []), ["model", "source"], %{
-        "lookup" => %{"files" => [%{"sha256" => String.duplicate("e", 64)}]}
-      })
-
-    assert :ok = Series.fresh!(reupload)
-
-    # Any other setup, or a series that takes no more runs, leaves a fresh run alone.
-    template = put_in(run("template", 101, []), ["model", "profile", "chat_template"], "{{ x }}")
-    assert :ok = Series.fresh!(template)
-
-    for {run_id, seed} <- [{"second", 102}, {"third", 103}] do
-      next = run(run_id, seed, [], "2026-10-28T00:00:0#{seed - 100}Z") |> Map.put("series", id)
-      Results.publish!(hashed(next, String.duplicate("d", 64)), page_root: page, resources: nil)
-    end
-
-    assert :ok = Series.fresh!(run("fourth", 101, []))
-  end
-
   test "a local series made with a per-reply cap takes no more runs", %{page: page} do
     capped = put_in(run("first", 101, [false]), ["settings", "response_tokens"], 8192)
     Results.publish!(capped, page_root: page)
@@ -479,7 +441,7 @@ defmodule Eab.SeriesTest do
     refute Series.closed_reason(%{"setup" => Series.setup(hosted)})
   end
 
-  test "contributions must match the published setup and use a seed the series lacks", %{
+  test "contributions must match the published setup, with any seed", %{
     page: page
   } do
     first = run("first", 101, [false])
@@ -488,10 +450,7 @@ defmodule Eab.SeriesTest do
 
     assert :ok = Series.contribution!(run("next", 102, []), id)
 
-    assert_raise RuntimeError, ~r/already has a run with seed 101; leave the seed empty/, fn ->
-      Series.contribution!(run("next", 101, []), id)
-    end
-
+    assert :ok = Series.contribution!(run("next", 101, []), id)
     assert :ok = Series.contribution!(run("drawn", 1_734_026_581, []), id)
 
     assert_raise RuntimeError, ~r/chat template sha256, model differ/, fn ->
@@ -506,7 +465,7 @@ defmodule Eab.SeriesTest do
     record = Results.series!(id)
     assert Enum.map(record["runs"], & &1["seed"]) == [101, 102]
     built = Results.aggregate(record)
-    assert built["run_count"] == 2 and record["seeds"] == "distinct"
+    assert built["run_count"] == 2 and record["seeds"] == "any"
     assert is_float(built["interval_percent"])
 
     # A run started for one series cannot be filed under another.
