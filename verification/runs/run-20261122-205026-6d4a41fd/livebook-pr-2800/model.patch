@@ -1,0 +1,258 @@
+diff --git a/lib/livebook/runtime/evaluator.ex b/lib/livebook/runtime/evaluator.ex
+index 518e90c..dca3f48 100644
+--- a/lib/livebook/runtime/evaluator.ex
++++ b/lib/livebook/runtime/evaluator.ex
+@@ -747,11 +747,15 @@ defmodule Livebook.Runtime.Evaluator do
+   end
+ 
+   defp process_erlang_error(env, code, location, module, description) do
+-    line = :erl_anno.line(location)
++    {line, column} = error_location(location)
+ 
++    # The error description is a charlist of unicode codepoints, so we
++    # convert it into a UTF-8 encoded binary. Using
++    # :erlang.list_to_binary/1 would raise on codepoints above 255
++    # and would produce invalid UTF-8 otherwise
+     formatted =
+       module.format_error(description)
+-      |> :erlang.list_to_binary()
++      |> :unicode.characters_to_binary(:utf8, :utf8)
+ 
+     code_marker = %{
+       line: line,
+@@ -772,45 +776,37 @@ defmodule Livebook.Runtime.Evaluator do
+       error_cons.(
+         file: env.file,
+         line: line,
+-        column:
+-          case :erl_anno.column(location) do
+-            :undefined -> 1
+-            val -> val
+-          end,
++        column: column,
+         description: formatted,
+-        snippet: make_snippet(code, location)
++        snippet: make_snippet(code, line)
+       )
+ 
+     {{:error, :error, error, []}, filter_erlang_code_markers([code_marker])}
+   end
+ 
+-  defp make_snippet(code, location) do
+-    start_line = 1
+-    start_column = 1
+-    line = :erl_anno.line(location)
++  # Extracts line and column from a location returned by :erl_scan or
++  # :erl_parse. The location is either a bare line (e.g. 0 for empty
++  # source) or a {line, column} tuple
++  defp error_location(line) when is_integer(line), do: {line, 1}
+ 
+-    case :erl_anno.column(location) do
+-      :undefined ->
+-        nil
+-
+-      column ->
+-        lines = :string.split(code, "\n", :all)
+-        snippet = :lists.nth(line - start_line + 1, lines)
++  defp error_location({line, column}) when is_integer(line) and is_integer(column) do
++    {line, max(column, 1)}
++  end
+ 
+-        offset =
+-          if line == start_line do
+-            column - start_column
+-          else
+-            column - 1
+-          end
++  defp error_location(_location), do: {0, 1}
+ 
+-        case :string.trim(code, :leading) do
+-          [] -> nil
+-          _ -> %{content: snippet, offset: offset}
+-        end
++  # Returns the source line with the given number, which is displayed
++  # as the error snippet. Returns nil when the line is not available,
++  # e.g. when the source is empty
++  defp make_snippet(code, line) when is_integer(line) and line > 0 do
++    case String.split(code, "\n") |> Enum.at(line - 1) do
++      nil -> nil
++      line_content -> line_content
+     end
+   end
+ 
++  defp make_snippet(_code, _line), do: nil
++
+   defp elixir_to_erlang_var(name) do
+     name
+     |> :erlang.atom_to_binary()
+diff --git a/test/livebook/runtime/evaluator_test.exs b/test/livebook/runtime/evaluator_test.exs
+index e3541c7..e71712c 100644
+--- a/test/livebook/runtime/evaluator_test.exs
++++ b/test/livebook/runtime/evaluator_test.exs
+@@ -1372,23 +1372,158 @@ defmodule Livebook.Runtime.EvaluatorTest do
+     test "syntax and tokenizer errors are converted", %{evaluator: evaluator} do
+       # Incomplete input
+       Evaluator.evaluate_code(evaluator, :erlang, "X =", :code_1, [])
+-      assert_receive {:runtime_evaluation_response, :code_1, error(message), metadata()}
+-      assert "\e[31m** (TokenMissingError)" <> _ = message
++
++      assert_receive {:runtime_evaluation_response, :code_1, error(message),
++                      %{errored: true,
++                        code_markers: [
++                          %{line: 1, description: "erl_parse: syntax error before: ",
++                            severity: :error}
++                        ]}}
++
++      assert "\e[31m** (TokenMissingError) token missing on nofile:1:4:" <> _ = message
++      assert message =~ "error: syntax error before:"
++      assert message =~ "1 │ X ="
++      assert message =~ "└─ nofile:1:4"
++      refute message =~ "got ArgumentError"
+ 
+       # Parser error
+       Evaluator.evaluate_code(evaluator, :erlang, "X ==/== a.", :code_2, [])
+-      assert_receive {:runtime_evaluation_response, :code_2, error(message), metadata()}
+-      assert "\e[31m** (SyntaxError)" <> _ = message
++
++      assert_receive {:runtime_evaluation_response, :code_2, error(message),
++                      %{errored: true,
++                        code_markers: [
++                          %{line: 1, description: "erl_parse: syntax error before: /=",
++                            severity: :error}
++                        ]}}
++
++      assert "\e[31m** (SyntaxError) invalid syntax found on nofile:1:5:" <> _ = message
++      assert message =~ "error: syntax error before: /="
++      assert message =~ "1 │ X ==/== a."
++      assert message =~ "└─ nofile:1:5"
++      refute message =~ "got ArgumentError"
+ 
+       # Tokenizer error
+       Evaluator.evaluate_code(evaluator, :erlang, "$a$", :code_3, [])
+-      assert_receive {:runtime_evaluation_response, :code_3, error(message), metadata()}
+-      assert "\e[31m** (SyntaxError)" <> _ = message
++
++      assert_receive {:runtime_evaluation_response, :code_3, error(message),
++                      %{errored: true,
++                        code_markers: [
++                          %{line: 1, description: "erl_scan: unterminated character",
++                            severity: :error}
++                        ]}}
++
++      assert "\e[31m** (SyntaxError) invalid syntax found on nofile:1:3:" <> _ = message
++      assert message =~ "error: unterminated character"
++      assert message =~ "1 │ $a$"
++      assert message =~ "└─ nofile:1:3"
++      refute message =~ "got ArgumentError"
++
++      # Uses the file name that the evaluation was given
++      Evaluator.evaluate_code(evaluator, :erlang, "X =", :code_4, [], file: "file.erl")
++
++      assert_receive {:runtime_evaluation_response, :code_4, error(message), _}
++      assert "\e[31m** (TokenMissingError) token missing on file.erl:1:4:" <> _ = message
++      assert message =~ "└─ file.erl:1:4"
+ 
+       # Erlang exception
+-      Evaluator.evaluate_code(evaluator, :erlang, "list_to_binary(1).", :code_4, [])
+-      assert_receive {:runtime_evaluation_response, :code_4, error(message), metadata()}
++      Evaluator.evaluate_code(evaluator, :erlang, "list_to_binary(1).", :code_5, [])
++
++      assert_receive {:runtime_evaluation_response, :code_5, error(message),
++                      %{errored: true, code_markers: []}}
++
+       assert "\e[31mexception error: bad argument" <> _ = message
++      assert message =~ "in function  list_to_binary/1"
++      assert message =~ "called as list_to_binary(1)"
++    end
++
++    test "syntax and tokenizer errors with non-ASCII characters are converted",
++         %{evaluator: evaluator} do
++      # Parser error
++      Evaluator.evaluate_code(evaluator, :erlang, "X = 'ö' 'ü'.", :code_1, [])
++
++      assert_receive {:runtime_evaluation_response, :code_1, error(message),
++                      %{errored: true,
++                        code_markers: [
++                          %{line: 1, description: "erl_parse: syntax error before: 'ü'",
++                            severity: :error}
++                        ]}}
++
++      assert "\e[31m** (SyntaxError) invalid syntax found on nofile:1:9:" <> _ = message
++      assert message =~ "error: syntax error before: 'ü'"
++      assert message =~ "1 │ X = 'ö' 'ü'."
++      assert message =~ "└─ nofile:1:9"
++      refute message =~ "got ArgumentError"
++      refute message =~ "bad argument"
++
++      # Parser error
++      Evaluator.evaluate_code(evaluator, :erlang, "X = 'ł' 'ł'.", :code_2, [])
++
++      assert_receive {:runtime_evaluation_response, :code_2, error(message),
++                      %{errored: true,
++                        code_markers: [
++                          %{line: 1, description: "erl_parse: syntax error before: 'ł'",
++                            severity: :error}
++                        ]}}
++
++      assert "\e[31m** (SyntaxError) invalid syntax found on nofile:1:9:" <> _ = message
++      assert message =~ "error: syntax error before: 'ł'"
++      assert message =~ "1 │ X = 'ł' 'ł'."
++      assert message =~ "└─ nofile:1:9"
++      refute message =~ "got ArgumentError"
++      refute message =~ "bad argument"
++
++      # Tokenizer error
++      Evaluator.evaluate_code(evaluator, :erlang, "X = 'ł", :code_3, [])
++
++      assert_receive {:runtime_evaluation_response, :code_3, error(message),
++                      %{errored: true,
++                        code_markers: [
++                          %{line: 1,
++                            description: "erl_scan: unterminated atom starting with 'ł'",
++                            severity: :error}
++                        ]}}
++
++      assert "\e[31m** (SyntaxError) invalid syntax found on nofile:1:6:" <> _ = message
++      assert message =~ "error: unterminated atom starting with 'ł'"
++      assert message =~ "1 │ X = 'ł"
++      assert message =~ "└─ nofile:1:6"
++      refute message =~ "got ArgumentError"
++      refute message =~ "bad argument"
++    end
++
++    test "reports the offending line and column when the error is not on the first line",
++         %{evaluator: evaluator} do
++      # The error is indented on a later line, after a blank line
++      # and earlier lines of code
++      Evaluator.evaluate_code(evaluator, :erlang, "\na = 1\n\n    X =", :code_1, [])
++
++      assert_receive {:runtime_evaluation_response, :code_1, error(message),
++                      %{errored: true,
++                        code_markers: [
++                          %{line: 4, description: "erl_parse: syntax error before: X",
++                            severity: :error}
++                        ]}}
++
++      assert "\e[31m** (SyntaxError) invalid syntax found on nofile:4:5:" <> _ = message
++      assert message =~ "error: syntax error before: X"
++      # Only the offending line is shown in the snippet
++      assert message =~ "4 │     X ="
++      assert message =~ "└─ nofile:4:5"
++      refute message =~ "a = 1"
++
++      # The error is after a leading blank line
++      Evaluator.evaluate_code(evaluator, :erlang, "\nX =", :code_2, [])
++
++      assert_receive {:runtime_evaluation_response, :code_2, error(message),
++                      %{errored: true,
++                        code_markers: [
++                          %{line: 2, description: "erl_parse: syntax error before: ",
++                            severity: :error}
++                        ]}}
++
++      assert "\e[31m** (TokenMissingError) token missing on nofile:2:4:" <> _ = message
++      assert message =~ "2 │ X ="
++      assert message =~ "└─ nofile:2:4"
+     end
+   end
+ 
