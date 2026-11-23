@@ -102,7 +102,7 @@ defmodule Eab.Results do
       "settings" => parts.settings,
       "setup" => parts.setup,
       "case_fixtures" => parts.case_fixtures,
-      "seeds" => if(is_integer(parts.run["seed"]), do: Series.seeds()),
+      "seeds" => if(is_integer(parts.run["seed"]), do: "distinct"),
       "required_runs" => Series.required(),
       "runs" => [parts.run],
       "evidence_url" => opts[:evidence_url],
@@ -436,7 +436,9 @@ defmodule Eab.Results do
 
   # An older series takes the current schema when it takes another run. Its runs recorded
   # what they recorded: timing before schema 9, the machine before 10 and peak context before
-  # 12 are null. Before schema 11 a case's outcome was its patch's verdict.
+  # 12 are null. Before schema 11 a case's outcome was its patch's verdict. Before schema 13
+  # a seeded series took seeds 101, 102 and 103; its runs keep theirs, and it now takes any
+  # seed it does not have yet (ADR 0025).
   @doc false
   def upgrade(record) do
     runs =
@@ -455,7 +457,8 @@ defmodule Eab.Results do
         |> Map.put_new("machine", nil)
       end)
 
-    %{record | "schema_version" => Schema.current_version(), "runs" => runs}
+    seeds = if record["seeds"], do: "distinct"
+    %{record | "schema_version" => Schema.current_version(), "runs" => runs, "seeds" => seeds}
   end
 
   def load!(directory \\ Path.join(root(), "results")) do
@@ -844,10 +847,9 @@ defmodule Eab.Results do
       end
   end
 
-  @doc "A series with its mean score, interval, per-case passes, missing seeds and peak memory."
+  @doc "A series with its mean score, interval, per-case passes and peak memory."
   def aggregate(record) do
     summary = Series.summary(record["runs"])
-    filled = Enum.map(record["runs"], & &1["seed"])
 
     Map.merge(record, %{
       "run_count" => summary["run_count"],
@@ -856,7 +858,6 @@ defmodule Eab.Results do
       "interval_percent" => summary["interval_percent"],
       "total" => length(hd(record["runs"])["cases"]),
       "case_passes" => summary["case_passes"],
-      "missing_seeds" => if(record["seeds"], do: record["seeds"] -- filled, else: []),
       "resources" => Series.peak_resources(Enum.map(record["runs"], & &1["resources"])),
       # The score at each context size, for series whose attempts recorded their peak context.
       "by_context" => ContextSize.scores(record)

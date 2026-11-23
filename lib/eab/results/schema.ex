@@ -17,17 +17,19 @@ defmodule Eab.Results.Schema do
 
   # Fields each schema version adds to a run and to its cases: timing in 9 (ADR 0019), the
   # machine in 10 (ADR 0020), the patch's own verdict in 11 (ADR 0021), the attempt's peak
-  # context in 12 (ADR 0022). Series published earlier keep their files unchanged and are
-  # upgraded when they take another run.
+  # context in 12 (ADR 0022). In 13 a seeded series takes any seed it does not have yet
+  # (ADR 0025). Series published earlier keep their files unchanged and are upgraded when
+  # they take another run.
   @versions %{
     8 => {[], []},
     9 => {["timing"], ["timing"]},
     10 => {["timing", "machine"], ["timing"]},
     11 => {["timing", "machine"], ["timing", "patch_passed"]},
-    12 => {["timing", "machine"], ["timing", "patch_passed", "peak_context_tokens"]}
+    12 => {["timing", "machine"], ["timing", "patch_passed", "peak_context_tokens"]},
+    13 => {["timing", "machine"], ["timing", "patch_passed", "peak_context_tokens"]}
   }
   def versions, do: Map.keys(@versions)
-  def current_version, do: 12
+  def current_version, do: 13
 
   def validate!(r) do
     fields!(r, @fields, "Expected a public run series; export the original run.json with add")
@@ -40,10 +42,17 @@ defmodule Eab.Results.Schema do
     require!(is_map(r["setup"]) and map_size(r["setup"]) > 0, "The series setup is required")
     require!(r["required_runs"] === 3, "A run series has three runs")
 
-    require!(
-      is_nil(r["seeds"]) or r["seeds"] == [101, 102, 103],
-      "Local series use seeds 101, 102 and 103"
-    )
+    if r["schema_version"] >= 13,
+      do:
+        require!(
+          r["seeds"] in [nil, "distinct"],
+          "A seeded series takes runs with distinct seeds"
+        ),
+      else:
+        require!(
+          is_nil(r["seeds"]) or r["seeds"] == [101, 102, 103],
+          "Local series use seeds 101, 102 and 103"
+        )
 
     runs = r["runs"]
     require!(is_list(runs) and length(runs) in 1..3, "A series holds one to three runs")
@@ -182,6 +191,7 @@ defmodule Eab.Results.Schema do
 
     cond do
       opts[:any_seed] -> require!(is_nil(run["seed"]) or is_integer(run["seed"]), "Invalid seed")
+      r["seeds"] == "distinct" -> require!(is_integer(run["seed"]), "Each run needs a seed")
       r["seeds"] -> require!(run["seed"] in r["seeds"], "Each run needs one of the series seeds")
       true -> require!(is_nil(run["seed"]), "This series records no seed")
     end

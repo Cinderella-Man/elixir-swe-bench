@@ -21,8 +21,9 @@ if config_env() != :test do
 
   present = fn name -> System.get_env(name) |> then(&if(&1 not in [nil, ""], do: &1)) end
 
-  # Memory collection is on unless EAB_MEMORY=off. Without a target it reaches root on the
-  # model endpoint's own host; without a host list it samples only that host.
+  # Memory collection is on unless EAB_MEMORY=off, and a local model's run needs it (ADR 0025).
+  # Without a target it reaches root on the model endpoint's own host; without a host list it
+  # samples only that host.
   if System.get_env("EAB_MEMORY") not in ["off", "0", "false"] do
     config :eab, :memory_monitor,
       target: present.("EAB_MEMORY_SSH_TARGET"),

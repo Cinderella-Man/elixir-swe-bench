@@ -26,7 +26,7 @@ defmodule EabWeb.DashboardLive do
   # A local run has no generated-token setting: the context window is its only limit (ADR 0016).
   @defaults %{
     "window_tokens" => "",
-    "seed" => "101",
+    "seed" => "",
     "reasoning_effort" => ""
   }
   def mount(params, _, socket) do
@@ -223,7 +223,7 @@ defmodule EabWeb.DashboardLive do
       |> Map.take(~w(window_tokens max_tokens reasoning_effort))
       |> Map.reject(fn {_, value} -> is_nil(value) end)
       |> Map.new(fn {key, value} -> {key, to_string(value)} end)
-      |> Map.put("seed", to_string(List.first(series["missing_seeds"]) || ""))
+      |> Map.put("seed", "")
 
     assign(socket,
       contribution: series,
@@ -1826,7 +1826,7 @@ defmodule EabWeb.DashboardLive do
                         _ ->
                           [
                             {"window_tokens", "Context tokens (blank = automatic)"},
-                            {"seed", "Seed"}
+                            {"seed", "Seed (blank = random)"}
                           ]
                       end
                   }>{title}<input
@@ -1875,7 +1875,7 @@ defmodule EabWeb.DashboardLive do
                 />
               </label>
               <p class="fine-print">
-                Full runs made one after another, never at once. Each takes the next seed of its run series (101, 102, 103), so start from the first seed you still need. The runs not yet started are forgotten if the controller restarts.
+                Full runs made one after another, never at once. Each draws a random seed of its own. The runs not yet started are forgotten if the controller restarts.
               </p>
             </form>
             <form
@@ -1925,7 +1925,7 @@ defmodule EabWeb.DashboardLive do
             Contributing to run series <code>{String.slice(@contribution["series_id"], 0, 12)}</code>
             ({@contribution["model"]["name"]}, {@contribution["run_count"]}/{@contribution[
               "required_runs"
-            ]} runs<span :if={@contribution["missing_seeds"] != []}>, missing seeds {Enum.join(@contribution["missing_seeds"], ", ")}</span>).
+            ]} runs).
             The run starts only if this endpoint and these settings match its setup.
             <button class="secondary" phx-click="cancel_contribution">Cancel contribution</button>
           </div>
@@ -2665,14 +2665,14 @@ defmodule EabWeb.DashboardLive do
       <details class="case-inventory" id="run-series" open={not is_nil(@series)}>
         <summary>Run series</summary>
         <p class="fine-print">
-          A published result is a series of three runs with identical setup. Local runs use seeds 101, 102 and 103 and each seed counts once; subscription series take their first three scored runs. The score is the mean; ± is 1.96 standard errors of rerun noise on these cases, shown from two runs. Validation runs never join a series.
+          A published result is a series of three runs with identical setup. Each local run draws a random seed and each seed counts once; subscription series take their first three scored runs. The score is the mean; ± is 1.96 standard errors of rerun noise on these cases, shown from two runs. Validation runs never join a series.
         </p>
         <button class="secondary" phx-click="series">Load run series</button>
         <p :if={@series_error} class="notice error">{@series_error}</p>
         <table :if={@series && @series != []} aria-label="Local run series">
           <thead>
             <tr>
-              <th>Series</th><th>Runs</th><th>Score</th><th>Missing seeds</th>
+              <th>Series</th><th>Runs</th><th>Score</th>
             </tr>
           </thead>
           <tbody>
@@ -2691,7 +2691,6 @@ defmodule EabWeb.DashboardLive do
                 {series["score_percent"]}%{if series["interval_percent"],
                   do: " ± #{series["interval_percent"]}"}
               </td>
-              <td>{Enum.join(series["missing_seeds"], ", ")}</td>
             </tr>
           </tbody>
         </table>
@@ -2706,9 +2705,6 @@ defmodule EabWeb.DashboardLive do
               "harness"
             ]["name"]} · {series["run_count"]}/{series["required_runs"]} runs
           </h3>
-          <p :if={series["missing_seeds"] != []}>
-            Missing seeds: {Enum.join(series["missing_seeds"], ", ")}
-          </p>
           <details phx-mounted={keep_open()}>
             <summary>Required setup</summary>
             <pre>{Jason.encode!(series["setup"], pretty: true)}</pre>

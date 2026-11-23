@@ -92,7 +92,7 @@ defmodule Eab.ResultsTest do
   test "public export uses exact artifact identity, outcomes and weight size, and omits private data" do
     result = Results.export!(run())
     assert Enum.map(entry(result)["cases"], & &1["passed"]) == [true, false]
-    assert entry(result)["seed"] == 101 and result["seeds"] == [101, 102, 103]
+    assert entry(result)["seed"] == 101 and result["seeds"] == "distinct"
     refute Map.has_key?(result["settings"], "seed")
     assert result["harness"] == %{"name" => "pi", "version" => "unknown"}
     assert result["series_id"] == Eab.Series.id(run())
@@ -249,11 +249,11 @@ defmodule Eab.ResultsTest do
     end
 
     record = Results.export!(timed.(run()))
-    assert record["schema_version"] == 12
+    assert record["schema_version"] == 13 and record["seeds"] == "distinct"
 
     published =
       record
-      |> Map.put("schema_version", 8)
+      |> Map.merge(%{"schema_version" => 8, "seeds" => [101, 102, 103]})
       |> update_in(["runs"], fn [run] ->
         [
           run
@@ -277,12 +277,19 @@ defmodule Eab.ResultsTest do
     second =
       run()
       |> Map.merge(%{"id" => "test-run-2", "created_at" => "2026-10-18T12:00:00Z"})
-      |> put_in(["settings", "seed"], 102)
+      |> put_in(["settings", "seed"], 1_734_026_581)
       |> timed.()
       |> Results.export!()
 
+    # Since schema 13 a series takes any seed it does not have yet; old runs keep theirs.
     merged = Results.merge!(published, second)
-    assert merged["schema_version"] == 12
+    assert merged["schema_version"] == 13 and merged["seeds"] == "distinct"
+    assert Enum.map(merged["runs"], & &1["seed"]) == [101, 1_734_026_581]
+
+    assert_raise ArgumentError, ~r/distinct seeds/, fn ->
+      Results.validate!(Map.put(merged, "seeds", [101, 102, 103]))
+    end
+
     [first, added] = merged["runs"]
     assert first["timing"] == nil and Enum.all?(first["cases"], &is_nil(&1["timing"]))
     assert first["machine"] == nil
@@ -441,7 +448,7 @@ defmodule Eab.ResultsTest do
 
   test "a speed run publishes its speed cases' times and its machine, apart from any series" do
     speed = Results.export_speed!(speed_run(), speed_cases: ["case-b"])
-    assert speed["kind"] == "speed_run" and speed["schema_version"] == 12
+    assert speed["kind"] == "speed_run" and speed["schema_version"] == 13
     assert speed["series_id"] == Eab.Series.id(with_machine(run()))
     assert speed["run"]["run_id"] == "test-run"
     assert Enum.map(speed["run"]["cases"], & &1["id"]) == ["case-b"]
@@ -506,7 +513,7 @@ defmodule Eab.ResultsTest do
     assert Path.wildcard(Path.join(page, "results/*.json")) == []
 
     payload = Results.read!(Path.join(page, "dist/results.json"))
-    assert payload["schema_version"] == 12
+    assert payload["schema_version"] == 13
     release = Enum.find(payload["releases"], & &1["current"])
     assert release["speed_cases"] == cases
     assert [%{"run" => %{"run_id" => "speed-run"}}] = release["speed_runs"]
@@ -1073,7 +1080,7 @@ defmodule Eab.ResultsTest do
     [built] = built(Path.join(output, "results.json"))
     assert built["score_percent"] == 100.0 and built["run_count"] == 1
     assert built["total"] == length(source["cases"])
-    assert built["interval_percent"] == nil and built["missing_seeds"] == [102, 103]
+    assert built["interval_percent"] == nil
     assert Enum.map(entry(built)["cases"], & &1["id"]) == source["cases"]
     refute File.read!(Path.join(output, "results.js")) =~ "<img"
 
@@ -1144,7 +1151,7 @@ defmodule Eab.ResultsTest do
     assert Enum.sort(Enum.map(tasks, &Task.await/1)) == [:added, :added, :already_added]
     [series] = built(Path.join(page, "dist/results.json"))
     assert Enum.map(series["runs"], & &1["run_id"]) == ["test-run", "second-run"]
-    assert series["run_count"] == 2 and series["missing_seeds"] == [103]
+    assert series["run_count"] == 2
     assert length(Path.wildcard(Path.join(page, "results/*.json"))) == 1
   end
 
@@ -1304,7 +1311,7 @@ defmodule Eab.ResultsTest do
       })
 
     record = Results.export!(source)
-    assert record["schema_version"] == 12
+    assert record["schema_version"] == 13
     assert record["setup"]["allowance"]["tokens"] == %{"case-a" => 80_000, "case-b" => 80_000}
     assert record["series_id"] != Results.export!(run())["series_id"]
 

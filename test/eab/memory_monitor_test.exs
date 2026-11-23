@@ -232,22 +232,30 @@ defmodule Eab.MemoryMonitorTest do
 
     # A host list still limits which endpoints are sampled; EAB_MEMORY=off configures nothing.
     Application.put_env(:eab, :memory_monitor, known_hosts: known, hosts: ["rig.example"])
-    assert MemoryMonitor.configuration_label(other) =~ "add other.example"
+
+    assert MemoryMonitor.configuration_label(other) =~
+             "other.example is added to EAB_MEMORY_HOSTS"
+
     Application.delete_env(:eab, :memory_monitor)
     assert MemoryMonitor.configuration_label(rig) =~ "EAB_MEMORY is off"
   end
 
-  test "API endpoints and other hosts are excluded, previously monitored resumes require configuration" do
-    assert MemoryMonitor.configuration(%{"url" => "http://other:8414", "backend" => "strata"}) ==
-             nil
+  test "a local model runs only while its memory is collected; an API endpoint runs without" do
+    other = put_in(run(), ["model", "url"], "http://other:8414")
+    assert MemoryMonitor.configuration(other["model"]) == nil
 
-    assert MemoryMonitor.configuration(%{
-             "url" => "http://fixture:8414",
-             "backend" => "openai_subscription"
-           }) == nil
+    assert MemoryMonitor.start(other) ==
+             {:error,
+              "other is not in EAB_MEMORY_HOSTS. A local model's runs need memory collection."}
+
+    api = put_in(run(), ["model", "backend"], "openai_subscription")
+    assert MemoryMonitor.configuration(api["model"]) == nil
+    assert {:ok, nil, nil} = MemoryMonitor.start(api)
+    # A resume of a run that was monitored needs its collector back.
+    assert {:error, _} = MemoryMonitor.start(Map.put(api, "memory", %{}))
 
     Application.delete_env(:eab, :memory_monitor)
-    assert {:ok, nil, nil} = MemoryMonitor.start(run())
-    assert {:error, _} = MemoryMonitor.start(Map.put(run(), "memory", %{}))
+    assert {:error, message} = MemoryMonitor.start(run())
+    assert message =~ "EAB_MEMORY is off"
   end
 end

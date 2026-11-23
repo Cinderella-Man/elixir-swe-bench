@@ -28,7 +28,7 @@
   }
   // An older controller's payload (schema 8 or 9) simply has no timing or machines; before 11, no patch verdicts;
   // before 12, no context sizes.
-  if (!data || ![8, 9, 10, 11, 12].includes(data.schema_version) || !Array.isArray(data.releases) || data.releases.length === 0) {
+  if (!data || ![8, 9, 10, 11, 12, 13].includes(data.schema_version) || !Array.isArray(data.releases) || data.releases.length === 0) {
     $("chart").append(node("p", "empty", "Results could not be loaded. Please reload."));
     return;
   }
@@ -74,7 +74,7 @@
   const harness = r => r.harness.name === "claude_code" ? `Claude Code ${r.harness.version}` : `Pi ${r.harness.version}`;
   const scoreText = r => `${r.score_percent.toFixed(1)}%` + (r.interval_percent == null ? "" : ` ± ${r.interval_percent.toFixed(1)}`);
   const runsText = r => r.complete ? `${r.run_count} runs` :
-    `Provisional · ${r.run_count}/${r.required_runs} runs` + (r.missing_seeds.length ? ` · missing seed ${r.missing_seeds.join(", ")}` : "");
+    `Provisional · ${r.run_count}/${r.required_runs} runs`;
   const thinking = r => ({unknown: "Not reported", on: "On (no level)", off: "Off",
     default: "Server/provider default", unsupported: "Not supported"})[r.settings.reasoning_effort] ||
     r.settings.reasoning_effort || "Not recorded";

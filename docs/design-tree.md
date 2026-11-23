@@ -17,7 +17,7 @@ Current inventory update, 2026-10-15: v4 contains nine cases with two reviewed A
 | Interface | Local website |
 | Context | Detected capacity, capped at 262,144 tokens by default |
 | Budgets | Unlimited model/tool calls and generated tokens on local servers: the context window is the only limit ([ADR 0016](adr/0016-limit-local-attempts-by-the-context-window-only.md)). Hosted models keep a 262,144 generated-token threshold |
-| Attempts | One per case, seed 101 by default; advanced settings available |
+| Attempts | One per case, a random seed per run by default; advanced settings available |
 | History | Persist model details, settings, logs, exchanges, patches and results |
 | Interruption | Explicit identity-bound resume; preserve completed outcomes and earlier generations |
 | Scoring | Equal case weight; executable checks; incomplete runs have no final score |

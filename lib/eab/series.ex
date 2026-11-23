@@ -3,13 +3,15 @@ defmodule Eab.Series do
   Run series (ADR 0011): up to three ordinary runs of one model artifact and quantization
   through one harness on one case set. Runs join when their setup matches; hardware,
   endpoint, model file path, server build, slot count, seed, benchmark code version and
-  Claude Code program version may differ. Each seed counts once: the first run with a final
-  score fills it.
+  Claude Code program version may differ. Each run of a model server draws its own random
+  seed (ADR 0025), and a seed counts once: the first run with a final score that has it.
+  Series published before then took seeds 101, 102 and 103 and keep them.
   """
   alias Eab.{Cache, Inventory, ModelIdentity, Runner}
 
-  @seeds [101, 102, 103]
   @required 3
+  # Model servers take a seed of at most 31 bits (Model.settings), so ten digits at most.
+  @seed_max 2_147_483_647
   # llama.cpp's default sampler parameters; other /props fields describe the deployment.
   @sampling ~w(temperature dynatemp_range dynatemp_exponent top_k top_p min_p top_n_sigma
     xtc_probability xtc_threshold typical_p repeat_last_n repeat_penalty presence_penalty
@@ -17,8 +19,17 @@ defmodule Eab.Series do
     dry_sequence_breakers mirostat mirostat_tau mirostat_eta samplers min_keep)
   @api_backends ~w(openai_subscription anthropic claude_code)
 
-  def seeds, do: @seeds
   def required, do: @required
+
+  @doc """
+  A random seed for a run, none of `taken`. Machines that start runs of one model on their own
+  would otherwise pick the same seeds, and a seed counts once in a series (ADR 0025).
+  """
+  def random_seed(taken \\ []) do
+    <<n::32>> = :crypto.strong_rand_bytes(4)
+    seed = rem(n, @seed_max) + 1
+    if seed in taken, do: random_seed(taken), else: seed
+  end
 
   @doc "Everything that must match for a run to join a series."
   def setup(run) do
@@ -155,23 +166,13 @@ defmodule Eab.Series do
 
   def seeded?(run), do: is_integer(get_in(run, ["settings", "seed"]))
 
-  @doc "The runs that count, oldest first: the first scored run per seed, or the first three."
+  @doc "The runs that count, oldest first: the first three scored runs, one per seed."
   def counted(runs) do
-    runs = runs |> Enum.filter(&eligible?/1) |> Enum.sort_by(& &1["created_at"])
-
-    if Enum.any?(runs, &seeded?/1) do
-      for seed <- @seeds,
-          run = Enum.find(runs, &(get_in(&1, ["settings", "seed"]) == seed)),
-          do: run
-    else
-      Enum.take(runs, @required)
-    end
-  end
-
-  def missing_seeds(runs) do
-    if runs != [] and Enum.all?(runs, &seeded?/1),
-      do: @seeds -- Enum.map(runs, &get_in(&1, ["settings", "seed"])),
-      else: []
+    runs
+    |> Enum.filter(&eligible?/1)
+    |> Enum.sort_by(& &1["created_at"])
+    |> Enum.uniq_by(&if(seeded?(&1), do: get_in(&1, ["settings", "seed"]), else: &1["id"]))
+    |> Enum.take(@required)
   end
 
   @doc "Groups local runs into series and summarizes each (dashboard view)."
@@ -185,8 +186,7 @@ defmodule Eab.Series do
       Map.merge(summary(Enum.map(counted, &outcomes/1)), %{
         "id" => id,
         "setup" => setup(hd(counted)),
-        "runs" => Enum.map(counted, & &1["id"]),
-        "missing_seeds" => missing_seeds(counted)
+        "runs" => Enum.map(counted, & &1["id"])
       })
     end)
     |> Enum.sort_by(&{-&1["score_percent"], &1["id"]})
@@ -284,11 +284,8 @@ defmodule Eab.Series do
 
   def closed_reason(_), do: nil
 
-  @doc """
-  Checks a run about to start as a contribution to a published series. `collector: false`
-  says the run's memory collector cannot reach the model host.
-  """
-  def contribution!(run, series_id, opts \\ []) do
+  @doc "Checks a run about to start as a contribution to a published series."
+  def contribution!(run, series_id) do
     record = Eab.Results.series!(series_id)
 
     if reason = closed_reason(record),
@@ -310,21 +307,20 @@ defmodule Eab.Series do
       length(record["runs"]) >= @required ->
         raise "Run series #{String.slice(series_id, 0, 12)} already has #{@required} runs"
 
-      record["seeds"] && seed not in (record["seeds"] -- filled) ->
-        raise "Choose one of the series' missing seeds: #{Enum.join(record["seeds"] -- filled, ", ")}"
+      record["seeds"] && seed in filled ->
+        raise "Run series #{String.slice(series_id, 0, 12)} already has a run with seed " <>
+                "#{seed}; leave the seed empty to draw a new one"
 
       true ->
-        measurable!(record, Keyword.get(opts, :collector, true))
+        :ok
     end
   end
 
   @doc """
   Checks a full run about to start for no series. A run joins the published series its setup
   matches once it is added to the results page, so where such a series still takes runs, the
-  run's seed must be free there, and a series that records its files' hashes or maker needs
-  a run whose memory collector reads them. Otherwise the run is refused at publication, or
-  shown beside the series as another model. `collector: false` says the run's memory
-  collector cannot reach the model host; `records` are the published series.
+  run's seed must be free there, or the run would be refused at publication. `records` are
+  the published series.
   """
   def fresh!(run, opts \\ []) do
     seed = get_in(run, ["settings", "seed"])
@@ -338,15 +334,11 @@ defmodule Eab.Series do
       filled = Enum.map(record["runs"], & &1["seed"])
 
       if is_integer(seed) and seed in filled do
-        free = (record["seeds"] || @seeds) -- filled
-
         raise "#{record["model"]["name"]} already has a run with seed #{seed} on the results " <>
                 "page (run series #{String.slice(record["series_id"], 0, 12)}, " <>
                 "#{length(filled)} of #{@required} runs), so this run could never be added. " <>
-                "Contribute to that series with seed #{Enum.join(free, " or ")} instead."
+                "Leave the seed empty to draw a new one."
       end
-
-      measurable!(record, Keyword.get(opts, :collector, true))
     end
 
     :ok
@@ -385,24 +377,6 @@ defmodule Eab.Series do
     declared = get_in(run, ["model", "source", "lookup", "files"])
     recorded = get_in(record, ["setup", "model", "sha256"])
     is_list(declared) and is_list(recorded) and Enum.map(declared, & &1["sha256"]) != recorded
-  end
-
-  # Only the memory collector reads the served files' hashes and maker on the model host. A
-  # run without it lacks them, so its setup no longer matches a series that records them.
-  defp measurable!(record, collector?) do
-    measured = Map.take(record["setup"]["model"], ~w(sha256 quantized_by))
-
-    if measured != %{} and not collector?,
-      do:
-        raise(
-          "Run series #{String.slice(record["series_id"], 0, 12)} (#{record["model"]["name"]}) " <>
-            "records its model files' #{measured_words(measured)}, which only the memory " <>
-            "collector reads on the model host, and this controller does not collect memory " <>
-            "from this model's host. Start the run from a controller whose memory collector " <>
-            "reaches the model host."
-        )
-
-    :ok
   end
 
   @doc false

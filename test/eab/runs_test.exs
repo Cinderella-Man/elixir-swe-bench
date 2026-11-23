@@ -316,6 +316,7 @@ defmodule Eab.RunsTest do
   test "a case of a published series runs again without the run in this history" do
     parent = self()
     Runs.subscribe()
+    collect_memory("model-host")
     page = Path.join(System.tmp_dir!(), "eab-rerun-page-#{System.unique_integer([:positive])}")
     File.mkdir_p!(page)
 
@@ -600,21 +601,23 @@ defmodule Eab.RunsTest do
     end
   end
 
-  test "runs in a row start one after another, each with the next seed" do
+  test "runs in a row start one after another, each with a random seed of its own" do
     stub_runner()
     Runs.subscribe()
 
-    assert {:ok, first} =
-             Runs.start(endpoint(), "", %{"seed" => "101"}, runs: 3, pause_seconds: 0)
+    assert {:ok, first} = Runs.start(endpoint(), "", %{"seed" => ""}, runs: 3, pause_seconds: 0)
 
     assert_receive {:started, worker, run}, 3000
-    assert run["id"] == first and run["settings"]["seed"] == 101
+    assert run["id"] == first and is_integer(run["settings"]["seed"])
+    [second_seed, third_seed] = Runs.snapshot().queue["seeds"]
+    seeds = [run["settings"]["seed"], second_seed, third_seed]
+    assert length(Enum.uniq(seeds)) == 3 and Enum.all?(seeds, &(&1 in 1..2_147_483_647))
 
     assert Runs.snapshot().queue == %{
              "total" => 3,
              "started" => 1,
              "remaining" => 2,
-             "seeds" => [102, 103],
+             "seeds" => [second_seed, third_seed],
              "pause_seconds" => 0,
              "next_at" => nil,
              "backend" => nil
@@ -625,13 +628,13 @@ defmodule Eab.RunsTest do
 
     send(worker, {:finish, :ok, [finished(run)]})
     assert_receive {:started, worker, run}, 3000
-    assert run["id"] != first and run["settings"]["seed"] == 102
-    assert %{"started" => 2, "remaining" => 1, "seeds" => [103]} = Runs.snapshot().queue
+    assert run["id"] != first and run["settings"]["seed"] == second_seed
+    assert %{"started" => 2, "remaining" => 1, "seeds" => [^third_seed]} = Runs.snapshot().queue
 
     # A run that ended with an evaluation error still measured a case: the row goes on.
     send(worker, {:finish, {:error, "One case could not be evaluated"}, [finished(run)]})
     assert_receive {:started, worker, run}, 3000
-    assert run["settings"]["seed"] == 103
+    assert run["settings"]["seed"] == third_seed
     assert %{"started" => 3, "remaining" => 0, "seeds" => []} = Runs.snapshot().queue
 
     send(worker, {:finish, :ok, [finished(run)]})
@@ -641,7 +644,11 @@ defmodule Eab.RunsTest do
     await_cleanup()
 
     assert Store.runs() |> Enum.map(&{&1["settings"]["seed"], &1["status"]}) |> Enum.sort() ==
-             [{101, "completed"}, {102, "error"}, {103, "completed"}]
+             Enum.sort([
+               {hd(seeds), "completed"},
+               {second_seed, "error"},
+               {third_seed, "completed"}
+             ])
   end
 
   test "a pause separates runs in a row, nothing else starts in it, and the rest can be cancelled" do
@@ -706,9 +713,6 @@ defmodule Eab.RunsTest do
     stub_runner()
 
     for {settings, opts, message} <- [
-          {%{"seed" => "103"}, [runs: 2], "seed 103 leaves room for 1, not 2"},
-          {%{"seed" => "102"}, [runs: 3], "seed 102 leaves room for 2, not 3"},
-          {%{"seed" => "7"}, [runs: 2], "take the seeds 101, 102, 103 in turn"},
           {%{}, [runs: 4], "Runs in a row must be a whole number from 1 to 3"},
           {%{}, [runs: 0], "Runs in a row must be a whole number from 1 to 3"},
           {%{}, [runs: 2, pause_seconds: -1], "The pause between runs must be"},
@@ -733,7 +737,7 @@ defmodule Eab.RunsTest do
              Runs.snapshot().queue
   end
 
-  test "a run that could not join the published series of its setup is refused before it starts" do
+  test "a local run needs its memory collected and a seed its published series does not have" do
     stub_runner()
     Runs.subscribe()
     page = Path.join(System.tmp_dir!(), "eab-fresh-page-#{System.unique_integer([:positive])}")
@@ -744,8 +748,6 @@ defmodule Eab.RunsTest do
 
     previous = Application.get_env(:eab, :results_page_root)
     Application.put_env(:eab, :results_page_root, page)
-    # This controller collects no memory from the model host.
-    Application.delete_env(:eab, :memory_monitor)
 
     on_exit(fn ->
       if previous,
@@ -772,7 +774,23 @@ defmodule Eab.RunsTest do
       }
     }
 
-    # A seed-102 run of this setup, made elsewhere with a collector that read its files.
+    # Without memory collection on its host, a local model's run does not start.
+    Application.delete_env(:eab, :memory_monitor)
+
+    assert Runs.start(model, "", %{}) ==
+             {:error,
+              "Memory collection could not start: EAB_MEMORY is off. " <>
+                "A local model's runs need memory collection."}
+
+    collect_memory("model-host")
+    config = Application.get_env(:eab, :memory_monitor)
+    Application.put_env(:eab, :memory_monitor, Keyword.put(config, :hosts, ["other"]))
+    assert {:error, error} = Runs.start(model, "", %{})
+    assert error =~ "model-host is not in EAB_MEMORY_HOSTS"
+    refute_receive {:started, _, _}, 100
+    collect_memory("model-host")
+
+    # A seed-102 run of this setup, whose collector read its files' hashes and maker.
     assert {:ok, id} = Runs.start(model, "", %{"seed" => "102"})
     assert_receive {:started, worker, run}, 3000
     send(worker, {:finish, :ok, [finished(run)]})
@@ -807,9 +825,9 @@ defmodule Eab.RunsTest do
 
     for {settings, opts, message} <- [
           {%{"seed" => "102"}, [], "already has a run with seed 102 on the results page"},
-          {%{"seed" => "101"}, [runs: 2], "already has a run with seed 102 on the results page"},
-          {%{"seed" => "101"}, [], "does not collect memory from this model's host"},
-          {%{"seed" => "101"}, [series: series], "does not collect memory from this model's host"}
+          {%{"seed" => "102"}, [runs: 2], "already has a run with seed 102 on the results page"},
+          {%{"seed" => "102"}, [series: series], "already has a run with seed 102; leave the"},
+          {%{}, [series: series, runs: 3], "needs 2 more runs, not 3"}
         ] do
       assert {:error, error} = Runs.start(model, "", settings, opts)
       assert error =~ message
@@ -817,6 +835,27 @@ defmodule Eab.RunsTest do
 
     refute_receive {:started, _, _}, 100
     assert Runs.snapshot().active == nil and Runs.snapshot().queue == nil
+
+    # A blank seed draws a new one, which the series takes.
+    assert {:ok, id} = Runs.start(model, "", %{"seed" => ""}, series: series)
+    assert_receive {:started, worker, run}, 3000
+    assert run["series"] == series and run["settings"]["seed"] not in [102, nil]
+    send(worker, {:finish, :ok, [finished(run)]})
+    await_terminal(id)
+    await_cleanup()
+  end
+
+  # A stand-in collector for the model host; a local model's run needs one.
+  defp collect_memory(host) do
+    Application.put_env(:eab, :memory_monitor,
+      hosts: [host],
+      target: host,
+      collector: "fixture",
+      known_hosts: "fixture",
+      executable:
+        if(File.exists?("/opt/pi/node"), do: "/opt/pi/node", else: System.find_executable("node")),
+      args: ["test/support/memory_collector.mjs", "normal"]
+    )
   end
 
   test "restart marks persisted active work interrupted without resuming" do

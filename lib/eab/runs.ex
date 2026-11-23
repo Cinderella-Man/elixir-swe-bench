@@ -27,9 +27,9 @@ defmodule Eab.Runs do
   `speed: true` runs only the benchmark's speed cases, one at a time, on a local model server:
   a speed run is published for its times and machine and never scored (ADR 0020).
 
-  `runs: n` (1 to 3, default 1) makes n full runs in a row: each starts `pause_seconds`
-  (default 60) after the one before ends, with the next seed of a run series where the
-  endpoint takes seeds. The runs still to start are held in memory only.
+  A model server's run without a seed draws a random one (ADR 0025). `runs: n` (1 to 3,
+  default 1) makes n full runs in a row: each starts `pause_seconds` (default 60) after the
+  one before ends, with a seed of its own. The runs still to start are held in memory only.
   """
   def start(endpoint, key, settings, opts \\ []),
     do: GenServer.call(__MODULE__, {:start, endpoint, key, settings, opts}, 30_000)
@@ -202,6 +202,7 @@ defmodule Eab.Runs do
       do: {:reply, {:error, "Container cleanup needs attention: #{error}"}, state}
 
   def handle_call({:start, endpoint, key, settings, opts}, _from, state) do
+    settings = seeded(endpoint, settings)
     {opts, later, pause} = plan!(endpoint, settings, opts)
 
     case begin_run(endpoint, key, settings, opts, %{state | queue_note: nil}) do
@@ -352,6 +353,12 @@ defmodule Eab.Runs do
     if run["cleanup_pending"] == true, do: raise("Container cleanup must finish before resume")
     # A local run's caps are no longer a choice (ADRs 0015 and 0016); a resumed run keeps its own.
     settings = Map.merge(settings, Map.take(run["settings"], caps(endpoint)))
+    # Its seed was drawn at random (ADR 0025): a blank seed field means the run's own.
+    settings =
+      if settings["seed"] in [nil, ""],
+        do: Map.put(settings, "seed", run["settings"]["seed"]),
+        else: settings
+
     Checkpoints.validate_run!(run, endpoint, Model.settings(endpoint, settings))
     plan = Checkpoints.plan(run)
 
@@ -741,8 +748,16 @@ defmodule Eab.Runs do
     }
   end
 
+  # Each run of a model server gets a seed. Two machines starting runs of one model would
+  # otherwise pick the same seeds, and a run series takes one run per seed (ADR 0025).
+  defp seeded(endpoint, settings) do
+    if Model.local?(endpoint) and (settings || %{})["seed"] in [nil, ""],
+      do: Map.put(settings || %{}, "seed", Eab.Series.random_seed()),
+      else: settings
+  end
+
   # The settings of the runs that follow the first of `runs: n` in a row, and the pause
-  # between them. A run series takes one run per seed, so each run takes the next seed.
+  # between them. A run series takes one run per seed, so each run draws a seed of its own.
   defp plan!(endpoint, settings, opts) do
     {count, opts} = Keyword.pop(opts, :runs, 1)
     {pause, opts} = Keyword.pop(opts, :pause_seconds, 60)
@@ -756,34 +771,37 @@ defmodule Eab.Runs do
     if count > 1 and (opts[:check] || opts[:speed] || opts[:validation]),
       do: raise("Runs in a row are for full runs; start this kind of run one at a time")
 
+    if opts[:series] && count > 1 do
+      record = Eab.Results.series!(opts[:series])
+      needed = Eab.Series.required() - length(record["runs"])
+
+      if count > needed,
+        do:
+          raise(
+            "Run series #{String.slice(opts[:series], 0, 12)} needs #{needed} more " <>
+              "run#{if needed == 1, do: "", else: "s"}, not #{count}"
+          )
+    end
+
     later =
-      if count == 1 do
-        []
-      else
-        case Model.settings(endpoint, without_caps(endpoint, settings))["seed"] do
-          seed when is_integer(seed) ->
-            seeds = Eab.Series.seeds()
-            following = seeds |> Enum.drop_while(&(&1 != seed)) |> Enum.drop(1)
+      case Model.settings(endpoint, without_caps(endpoint, settings))["seed"] do
+        seed when is_integer(seed) ->
+          {later, _} =
+            Enum.map_reduce(2..count//1, [seed], fn _, taken ->
+              next = Eab.Series.random_seed(taken)
+              {Map.put(settings, "seed", next), [next | taken]}
+            end)
 
-            if length(following) < count - 1,
-              do:
-                raise(
-                  "Runs in a row take the seeds #{Enum.join(seeds, ", ")} in turn: " <>
-                    "seed #{seed} leaves room for #{length(following) + 1}, not #{count}"
-                )
+          later
 
-            for next <- Enum.take(following, count - 1), do: Map.put(settings, "seed", next)
-
-          _ ->
-            List.duplicate(settings, count - 1)
-        end
+        _ ->
+          List.duplicate(settings, count - 1)
       end
 
     # A seed a series already has would only be refused hours later, at its run's start or
     # when the run is added to the results page.
     if later != [] do
       release = Release.freeze()
-      collector = collector?(endpoint)
       records = if is_nil(opts[:series]), do: Eab.Results.load!()
 
       for settings <- later do
@@ -791,17 +809,13 @@ defmodule Eab.Runs do
         run = new_run(release, endpoint, settings)
 
         if opts[:series],
-          do: Eab.Series.contribution!(run, opts[:series], collector: collector),
-          else: Eab.Series.fresh!(run, collector: collector, records: records)
+          do: Eab.Series.contribution!(run, opts[:series]),
+          else: Eab.Series.fresh!(run, records: records)
       end
     end
 
     {opts, later, pause}
   end
-
-  # Whether a memory collector will sample the endpoint's model host, and so read its files'
-  # hashes and maker (ADR 0018).
-  defp collector?(endpoint), do: not is_nil(MemoryMonitor.configuration(endpoint))
 
   defp begin_run(endpoint, key, settings, opts, state) do
     release = Release.freeze()
@@ -828,11 +842,11 @@ defmodule Eab.Runs do
           speed(run, endpoint, settings, release)
 
         opts[:series] ->
-          Eab.Series.contribution!(run, opts[:series], collector: collector?(endpoint))
+          Eab.Series.contribution!(run, opts[:series])
           Map.put(run, "series", opts[:series])
 
         true ->
-          Eab.Series.fresh!(run, collector: collector?(endpoint))
+          Eab.Series.fresh!(run)
           run
       end
 

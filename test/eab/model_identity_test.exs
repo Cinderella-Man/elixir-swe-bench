@@ -136,7 +136,7 @@ defmodule Eab.ModelIdentityTest do
       connection = %{"connection" => %{"url" => "http://rig.example.ts.net:8410", "key" => ""}}
       render_submit(view, "connect", connection)
       render_async(view)
-      assert has_element?(view, "#memory-collection-status", "RAM/VRAM will not be recorded")
+      assert has_element?(view, "#memory-collection-status", "No run can start")
       assert has_element?(view, "#memory-collection-status", "rig.example.ts.net")
       assert has_element?(view, "#memory-collection-status", "EAB_MEMORY_HOSTS")
 
@@ -174,7 +174,7 @@ defmodule Eab.ModelIdentityTest do
       Application.delete_env(:eab, :memory_monitor)
       render_submit(view, "connect", connection)
       render_async(view)
-      assert has_element?(view, "#memory-collection-status", "RAM/VRAM will not be recorded")
+      assert has_element?(view, "#memory-collection-status", "No run can start")
       assert has_element?(view, "#memory-collection-status", "EAB_MEMORY is off")
     end
   end

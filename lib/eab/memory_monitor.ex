@@ -14,14 +14,20 @@ defmodule Eab.MemoryMonitor do
   defp gb(nil), do: "—"
   defp gb(bytes), do: "#{Float.round(bytes / 1_000_000_000, 1)} GB"
 
+  @doc """
+  Starts sampling the run's model host. A model served by llama.cpp, Strata or Project Maya is
+  never run unsampled: without its memory and its files' hashes and maker, a run can join no
+  series that has them, and it is easy not to notice a collector that is off. Only a model
+  whose memory cannot be sampled, such as a subscription API, runs without a collector.
+  """
   def start(run, key \\ "") do
-    case configuration(run["model"]) do
-      nil ->
+    case configuration_status(run["model"]) do
+      :unsupported ->
         if run["memory"],
           do: {:error, "Restore memory collector configuration before resuming this run"},
           else: {:ok, nil, nil}
 
-      config ->
+      {:configured, config} ->
         config = Keyword.put(config, :api_key, key)
 
         {:ok, pid} =
@@ -31,6 +37,9 @@ defmodule Eab.MemoryMonitor do
           {:ok, summary} -> {:ok, pid, summary}
           {:error, message} -> {:error, message}
         end
+
+      unconfigured ->
+        {:error, missing(unconfigured) <> ". A local model's runs need memory collection."}
     end
   catch
     :exit, _ -> {:error, "Memory collector stopped before its first sample"}
@@ -83,18 +92,22 @@ defmodule Eab.MemoryMonitor do
         "RAM/VRAM collection is configured. The collector must connect before the run can start."
 
       :disabled ->
-        "RAM/VRAM will not be recorded: EAB_MEMORY is off."
+        "No run can start: memory collection is required and EAB_MEMORY is off."
 
       {:untrusted, host} ->
-        "RAM/VRAM will not be recorded until #{host}'s SSH host key is trusted below."
+        "No run can start until #{host}'s SSH host key is trusted below: memory collection is required."
 
       {:unlisted_host, host} ->
-        "RAM/VRAM will not be recorded: add #{host} to EAB_MEMORY_HOSTS."
+        "No run can start until #{host} is added to EAB_MEMORY_HOSTS: memory collection is required."
 
       :unsupported ->
         "RAM/VRAM collection is unavailable for this model source."
     end
   end
+
+  defp missing(:disabled), do: "EAB_MEMORY is off"
+  defp missing({:untrusted, host}), do: "#{host}'s SSH host key is not trusted yet"
+  defp missing({:unlisted_host, host}), do: "#{host} is not in EAB_MEMORY_HOSTS"
 
   @doc "The model host whose SSH key must be trusted before memory can be collected, or nil."
   def untrusted_host(endpoint) do
